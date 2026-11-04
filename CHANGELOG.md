@@ -4,7 +4,7 @@
 
 First release: a dedicated runtime that reads Strata's default model file (ISTA-DASLab GSQ-RCO IQ3_S GGUF of Qwen3.8-Flash-Next) unchanged and runs it faster than Strata on the same M5 Max 128GB, with the same weights and FP16 compute.
 
-Same-weights comparison against Strata (three alternating rounds, medians, tok/s): prose decode 110.5 vs 84.0, new code 126.3 vs 123.1, code edits 173.9 vs 148.2, decode after 10.7K 93.0 vs 79.7, after 47K 84.3 vs 77.9, prefill 10.7K 1519 vs 1217, 47K 1520 vs 1231. qwental's top-1 matches Strata's at every one of 600 positions of Strata's own outputs.
+Same-weights comparison against Strata (three alternating rounds, medians, tok/s): prose decode 110.5 vs 84.0, new code 126.3 vs 123.1, code edits 173.9 vs 148.2, decode after 10.7K 93.0 vs 79.7, after 47K 84.3 vs 77.9, prefill 10.7K 1519 vs 1217, 47K 1520 vs 1231. Qwental's top-1 matches Strata's at every one of 600 positions of Strata's own outputs.
 
 ### GGUF profile
 - `--gguf DIR` / `QW_GGUF`: loads the model's GGUF directly (raw ggml blocks), selectable per part (`QW_GGUF_PARTS`).

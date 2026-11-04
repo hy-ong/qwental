@@ -1,4 +1,4 @@
-# vs_strata_lp.py 的延伸：qwental 的分布照 Strata 的取樣規則（top_k 20、top_p 0.95）截斷再正規化後，與 Strata 回報的 logprob 比較
+# vs_strata_lp.py 的延伸：Qwental 的分布照 Strata 的取樣規則（top_k 20、top_p 0.95）截斷再正規化後，與 Strata 回報的 logprob 比較
 import json, sys, os, numpy as np
 from mlx_lm.utils import load_tokenizer
 from pathlib import Path

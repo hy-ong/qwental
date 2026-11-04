@@ -1,4 +1,4 @@
-# qwental
+# Qwental
 
 **English** | [繁體中文](README.zh-TW.md)
 
@@ -6,9 +6,9 @@ A Metal inference engine for **Qwen3.8-Flash-Next** on an **Apple M5 Max (128 GB
 
 ## Performance
 
-qwental runs Strata's default model file, the ISTA-DASLab GSQ-RCO **IQ3_S GGUF**, unchanged: same weights, FP16 compute. Measured against Strata on the same machine (`bench/vs_iq3s.sh 3`, medians of three alternating rounds, tokens/s):
+Qwental runs Strata's default model file, the ISTA-DASLab GSQ-RCO **IQ3_S GGUF**, unchanged: same weights, FP16 compute. Measured against Strata on the same machine (`bench/vs_iq3s.sh 3`, medians of three alternating rounds, tokens/s):
 
-| | Strata | qwental |
+| | Strata | Qwental |
 |---|---|---|
 | Decode: prose | 84.0 | **110.5** (+31.5%) |
 | Decode: new code | 123.1 | **126.3** (+2.6%) |
@@ -17,7 +17,7 @@ qwental runs Strata's default model file, the ISTA-DASLab GSQ-RCO **IQ3_S GGUF**
 | Decode after a 47K prompt | 77.9 | **84.3** (+8.2%) |
 | Prefill, 10.7K / 47K | 1217 / 1231 | **1519 / 1520** (+24%) |
 
-The output is the same model: over 600 positions of Strata's own output, qwental's top-1 token matches Strata's every time (`bench/vs_strata_*.py`). Speculative decoding output is identical to greedy output.
+The output is the same model: over 600 positions of Strata's own output, Qwental's top-1 token matches Strata's every time (`bench/vs_strata_*.py`). Speculative decoding output is identical to greedy output.
 
 ## Quick start
 

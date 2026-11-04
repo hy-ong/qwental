@@ -1,4 +1,4 @@
-// qwental GPU 介面：所有 Metal 呼叫都藏在 gpu_metal.m 裡，其他部分只用這個 C API。
+// Qwental GPU 介面：所有 Metal 呼叫都藏在 gpu_metal.m 裡，其他部分只用這個 C API。
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

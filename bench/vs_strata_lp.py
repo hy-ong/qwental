@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# 逐位置對照：把 Strata 生成的文字（gc_strata.json）接在同一個 chat prompt 後面，qwental 逐 token 算 logits（QW_PPL_DUMP），
-# 在每個輸出位置比較 Strata 回報的 top-5 logprob 與 qwental 的 log softmax。
+# 逐位置對照：把 Strata 生成的文字（gc_strata.json）接在同一個 chat prompt 後面，Qwental 逐 token 算 logits（QW_PPL_DUMP），
+# 在每個輸出位置比較 Strata 回報的 top-5 logprob 與 Qwental 的 log softmax。
 # 用法：bench/vs_strata_lp.py prep <name>（寫 build/lp_<name>.ids 與對齊資訊）；bench/vs_strata_lp.py cmp <name>
 import json, sys, os, numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))

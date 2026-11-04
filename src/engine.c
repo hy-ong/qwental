@@ -1,4 +1,4 @@
-// qwental 推論 engine：decode 路徑（一次一個 token）
+// Qwental 推論 engine：decode 路徑（一次一個 token）
 // 每一步把 48 層的所有 kernel 編進同一個 command buffer（serial dispatch，依序執行），最後等一次。
 // 參考實作：mlx-lm PR #1788 的模型實作。
 #include "engine.h"

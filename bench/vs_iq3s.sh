@@ -1,5 +1,5 @@
 #!/bin/sh
-# 同一份權重對照：Strata IQ3_S + DFlash2 與 qwental（GGUF profile，同一個 IQ3_S GGUF），兩個模型不能同時載入。
+# 同一份權重對照：Strata IQ3_S + DFlash2 與 Qwental（GGUF profile，同一個 IQ3_S GGUF），兩個模型不能同時載入。
 # 順序交錯（S Q、Q S、S Q…）以排除溫度與先後的影響。用法：lockf build/gpu.lock bench/vs_iq3s.sh [輪數]；ONLY=prose,code… 只跑部分 prompt
 cd "$(dirname "$0")/.."
 S=${STRATA_DIR:-$HOME/.local/share/Strata} # Strata 的安裝目錄（有 run-iq3_s.sh 等啟動腳本）

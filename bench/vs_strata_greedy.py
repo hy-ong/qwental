@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 同一份權重的 greedy 輸出對照：Strata（OpenAI 端點，附 top-5 logprobs）與 qwental（Anthropic 端點），thinking 關閉、temperature 0。
+# 同一份權重的 greedy 輸出對照：Strata（OpenAI 端點，附 top-5 logprobs）與 Qwental（Anthropic 端點），thinking 關閉、temperature 0。
 # 用法：bench/vs_strata_greedy.py collect <url> <openai|anthropic> <輸出.json>；bench/vs_strata_greedy.py compare <strata.json> <qwental.json>
 import json, os, sys, urllib.request
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -38,7 +38,7 @@ def compare(a, b):
         s, q = A[name]["text"], B[name]["text"]
         i = next((k for k in range(min(len(s), len(q))) if s[k] != q[k]), min(len(s), len(q)))
         same = i == len(s) == len(q)
-        line = "%-6s Strata %d 字元、qwental %d 字元：%s" % (name, len(s), len(q), "完全相同" if same else "第 %d 個字元起不同" % i)
+        line = "%-6s Strata %d 字元、Qwental %d 字元：%s" % (name, len(s), len(q), "完全相同" if same else "第 %d 個字元起不同" % i)
         lp = A[name].get("lp") or []
         if not same and lp: # 找出分歧點所在的 Strata token，看前兩名的差距
             pos = 0
@@ -50,7 +50,7 @@ def compare(a, b):
                     break
                 pos += len(t)
         print(line)
-        if not same: print("   Strata ：%r\n   qwental：%r" % (s[max(0, i - 40):i + 40], q[max(0, i - 40):i + 40]))
+        if not same: print("   Strata ：%r\n   Qwental：%r" % (s[max(0, i - 40):i + 40], q[max(0, i - 40):i + 40]))
 
 if sys.argv[1] == "collect": collect(sys.argv[2], sys.argv[3], sys.argv[4])
 else: compare(sys.argv[2], sys.argv[3])

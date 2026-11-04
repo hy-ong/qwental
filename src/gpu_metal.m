@@ -1,4 +1,4 @@
-// qwental 的 Metal 實作。整個專案只有這個檔案直接碰 Objective-C / Metal。
+// Qwental 的 Metal 實作。整個專案只有這個檔案直接碰 Objective-C / Metal。
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <mach/mach_time.h>

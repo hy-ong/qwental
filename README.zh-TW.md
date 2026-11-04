@@ -1,4 +1,4 @@
-# qwental
+# Qwental
 
 [English](README.md) | **繁體中文**
 
@@ -6,9 +6,9 @@
 
 ## 效能
 
-qwental 直接執行 Strata 預設的模型檔 ISTA-DASLab GSQ-RCO **IQ3_S GGUF**，不轉格式：權重相同、同樣以 FP16 運算。在同一台機器上與 Strata 對照（`bench/vs_iq3s.sh 3`，順序交錯三輪取中位數，tok/s）：
+Qwental 直接執行 Strata 預設的模型檔 ISTA-DASLab GSQ-RCO **IQ3_S GGUF**，不轉格式：權重相同、同樣以 FP16 運算。在同一台機器上與 Strata 對照（`bench/vs_iq3s.sh 3`，順序交錯三輪取中位數，tok/s）：
 
-| | Strata | qwental |
+| | Strata | Qwental |
 |---|---|---|
 | 解碼：英文文章 | 84.0 | **110.5**（+31.5%） |
 | 解碼：寫新程式碼 | 123.1 | **126.3**（+2.6%） |
@@ -17,7 +17,7 @@ qwental 直接執行 Strata 預設的模型檔 ISTA-DASLab GSQ-RCO **IQ3_S GGUF*
 | 47K prompt 之後的解碼 | 77.9 | **84.3**（+8.2%） |
 | Prefill 10.7K / 47K | 1217 / 1231 | **1519 / 1520**（+24%） |
 
-輸出是同一個模型：在 Strata 自己生成的 600 個位置上，qwental 的第一名全部與 Strata 相同（`bench/vs_strata_*.py`）。推測解碼的輸出與 greedy 完全一致。
+輸出是同一個模型：在 Strata 自己生成的 600 個位置上，Qwental 的第一名全部與 Strata 相同（`bench/vs_strata_*.py`）。推測解碼的輸出與 greedy 完全一致。
 
 ## 快速上手
 

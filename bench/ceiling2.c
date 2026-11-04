@@ -366,7 +366,7 @@ int main(int argc, char **argv) {
     if (!g) die("找不到 Metal 裝置");
     char pw[256], err[4096];
     qw_power_desc(pw, sizeof pw);
-    printf("# qwental 補充量測\n\n- GPU：%s\n- %s\n", qw_gpu_name(g), pw);
+    printf("# Qwental 補充量測\n\n- GPU：%s\n- %s\n", qw_gpu_name(g), pw);
     if (!qw_gpu_compile(g, mem_src, sizeof mem_src, err, sizeof err)) die(err);
     if (bench_split_flag) { bench_split(); qw_gpu_close(g); return 0; }
     if (bench_chunk_flag) { bench_chunk(); qw_gpu_close(g); return 0; }

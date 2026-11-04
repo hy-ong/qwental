@@ -1,4 +1,4 @@
-// qwental HTTP server：Anthropic Messages API（/v1/messages，含串流）與 OpenAI Chat Completions（/v1/chat/completions）
+// Qwental HTTP server：Anthropic Messages API（/v1/messages，含串流）與 OpenAI Chat Completions（/v1/chat/completions）
 // 一次處理一個請求（單一使用者）。
 // 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--version]
 // --gguf：整個模型改用該目錄的 GGUF（Strata 的 IQ3_S 等；等同 QW_GGUF=目錄 QW_GGUF_PARTS=all）
@@ -506,7 +506,7 @@ int main(int argc, char **argv) {
         qw_gen g = {.temperature = 0, .max_tokens = 4, .stop = NULL, .nstop = 0, .spec = !getenv("QW_NO_SPEC")};
         qw_engine_generate_ex(E, w, 4, &g, NULL, NULL, NULL);
     }
-    fprintf(stderr, "qwental %s：模型載入與預熱 %.1f 秒，context %d%s%s，監聽 http://%s:%d\n", QW_VERSION, qw_now() - t0, ctx,
+    fprintf(stderr, "Qwental %s：模型載入與預熱 %.1f 秒，context %d%s%s，監聽 http://%s:%d\n", QW_VERSION, qw_now() - t0, ctx,
             getenv("QW_GGUF") ? "，GGUF " : "", getenv("QW_GGUF") ? getenv("QW_GGUF") : "", host, port);
     const int ls = socket(AF_INET, SOCK_STREAM, 0);
     const int one = 1;
@@ -529,7 +529,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(method, "POST") && !strcmp(path, "/v1/chat/completions")) handle_chat(&c, body, blen, true);
             else if (!strcmp(method, "POST") && !strcmp(path, "/v1/messages/count_tokens")) handle_count(&c, body, blen);
             else if (!strcmp(method, "GET") && (!strcmp(path, "/v1/models") || !strcmp(path, "/models"))) {
-                const char *m = "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.8-flash-next\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"Qwen3.8 Flash Next (qwental)\"}]}";
+                const char *m = "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.8-flash-next\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"Qwen3.8 Flash Next (Qwental)\"}]}";
                 respond(&c, 200, "application/json", m, strlen(m));
             } else if (!strcmp(path, "/health")) respond(&c, 200, "application/json", "{\"ok\":true}", 11);
             else respond_err(&c, 404, "not found");

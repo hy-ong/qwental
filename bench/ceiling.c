@@ -439,7 +439,7 @@ int main(int argc, char **argv) {
     }
     g = qw_gpu_open();
     if (!g) die("找不到 Metal 裝置");
-    printf("# qwental 硬體上限量測\n\n");
+    printf("# Qwental 硬體上限量測\n\n");
     printf("- GPU：%s\n", qw_gpu_name(g));
     printf("- 建議最大工作記憶體：%.1f GiB\n", qw_gpu_max_working_set(g) / GiB);
     char pw[256];

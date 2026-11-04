@@ -1,4 +1,4 @@
-# DFlash2 drafter 的 numpy 參考實作（對照 Strata tools/dflash2/dflash2_ref.py，MIT），用來離線驗證 qwental 的特徵（taps）是否正確：
+# DFlash2 drafter 的 numpy 參考實作（對照 Strata tools/dflash2/dflash2_ref.py，MIT），用來離線驗證 Qwental 的特徵（taps）是否正確：
 #   ref/venv/bin/python tools/dflash2_ref.py <drafter .pack> <taps 檔（build/run 的 QW_TAPS）> <prompt 長度>
 # 對每個生成位置 s 猜一塊（anchor = 位置 s 的 token），和實際的 greedy 序列比對，印出平均猜中長度。
 import json, struct, sys
