@@ -1,0 +1,53 @@
+Below is a Python module, followed by the same module after renaming the class `Inventory` to `Stock` and the method `add_item` to `put`. Everything else is unchanged.
+
+```python
+import json
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Item:
+    name: str
+    price: float
+    quantity: int = 0
+
+    def total(self) -> float:
+        return self.price * self.quantity
+
+
+@dataclass
+class Inventory:
+    items: dict = field(default_factory=dict)
+
+    def add_item(self, name: str, price: float, quantity: int = 1) -> Item:
+        if name in self.items:
+            self.items[name].quantity += quantity
+        else:
+            self.items[name] = Item(name, price, quantity)
+        return self.items[name]
+
+    def remove(self, name: str, quantity: int = 1) -> None:
+        item = self.items.get(name)
+        if item is None:
+            raise KeyError(f"unknown item: {name}")
+        item.quantity -= quantity
+        if item.quantity <= 0:
+            del self.items[name]
+
+    def value(self) -> float:
+        return sum(item.total() for item in self.items.values())
+
+    def to_json(self) -> str:
+        return json.dumps({k: [v.price, v.quantity] for k, v in self.items.items()})
+
+    @classmethod
+    def from_json(cls, text: str) -> "Inventory":
+        inv = cls()
+        for name, (price, quantity) in json.loads(text).items():
+            inv.add_item(name, price, quantity)
+        return inv
+```
+
+After renaming:
+
+```python

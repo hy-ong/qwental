@@ -1,0 +1,11 @@
+build/
+docs/
+.DS_Store
+results/
+.claude/
+.clangd
+models/
+ref/
+cache/
+__pycache__/
+*.pyc
