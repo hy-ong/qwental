@@ -20,7 +20,7 @@ Qwental runs Strata's default model file, the ISTA-DASLab GSQ-RCO **IQ3_S GGUF**
 
 `--int8` does not change decode. Without INT8 flags the output is the same model: over 600 positions of Strata's own output, Qwental's top-1 token matches Strata's every time (`bench/vs_strata_*.py`), and speculative decoding output is identical to greedy output.
 
-Against oMLX 0.7.4 on the same MLX weights (mixed 4/8-bit, Qwental without `--gguf`):
+Against oMLX 0.7.4.dev1 on the same MLX weights (mixed 4/8-bit, Qwental without `--gguf`):
 
 | | oMLX | Qwental | Qwental `--int8` / `--int8-qk` |
 |---|---|---|---|

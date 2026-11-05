@@ -4,7 +4,7 @@
 
 INT8 prefill behind flags, faster long prompts, and a same-weights comparison against oMLX. Without the new flags the output is bit-identical to 1.0.0 on both the GGUF and the MLX profile.
 
-Same-weights results (two alternating rounds, mean): against Strata, decode +3–17%, prefill 10.7K / 47K 1473 / 1461 → 1728 / 1747 tok/s by default and 2750 / 2541 with `--int8` (2671 at 47K with `--int8-qk`); against oMLX 0.7.4 on the MLX weights, decode +33–72%, prefill 1884 / 2072 → 2456 / 2526 with `--int8`.
+Same-weights results (two alternating rounds, mean): against Strata, decode +3–17%, prefill 10.7K / 47K 1473 / 1461 → 1728 / 1747 tok/s by default and 2750 / 2541 with `--int8` (2671 at 47K with `--int8-qk`); against oMLX 0.7.4.dev1 on the MLX weights, decode +33–72%, prefill 1884 / 2072 → 2456 / 2526 with `--int8`.
 
 ### INT8 prefill (opt-in)
 - `--int8` / `QW_INT8=1`: routed experts run INT8 × INT8 (IQ blocks decoded straight to int8 with per-128-K rescaling on GGUF, per-slice requantization on MLX); on GGUF, dense DeltaNet, attention and shared-expert projections also use a per-row INT8 copy made at load time (+3 GB). Decode is unchanged.

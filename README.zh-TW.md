@@ -20,7 +20,7 @@ Qwental 直接執行 Strata 預設的模型檔 ISTA-DASLab GSQ-RCO **IQ3_S GGUF*
 
 `--int8` 不影響解碼。不加 INT8 旗標時輸出是同一個模型：在 Strata 自己生成的 600 個位置上，Qwental 的第一名全部與 Strata 相同（`bench/vs_strata_*.py`），推測解碼的輸出也與 greedy 完全一致。
 
-與 oMLX 0.7.4 對照，用同一份 MLX 權重（mixed 4/8-bit，Qwental 不加 `--gguf`）：
+與 oMLX 0.7.4.dev1 對照，用同一份 MLX 權重（mixed 4/8-bit，Qwental 不加 `--gguf`）：
 
 | | oMLX | Qwental | Qwental `--int8`／`--int8-qk` |
 |---|---|---|---|
