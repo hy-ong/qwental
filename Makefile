@@ -56,8 +56,8 @@ $(BUILD)/gdn_decode: bench/gdn_decode.c $(BUILD)/gpu_metal.o kernels/gdn_decode.
 $(BUILD)/modelcheck: tools/modelcheck.c src/model.c src/model.h src/st.c src/st.h src/gguf.c src/gguf.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/modelcheck.c src/model.c src/st.c src/gguf.c -o $@
 
-ENGINE_SRC := src/engine.c src/model.c src/st.c src/tok.c src/json.c src/requant.c src/dflash.c src/gguf.c
-ENGINE_DEP := $(ENGINE_SRC) src/engine.h src/model.h src/st.h src/gpu.h kernels/engine.metal kernels/qmv.metal kernels/moe_decode.metal kernels/gdn_decode.metal kernels/qsa.metal kernels/qsa_pf.metal kernels/qmm_a8.metal kernels/qmm_i8.metal kernels/moe_iq.metal kernels/iq_tables.metal kernels/prefill.metal kernels/qmm.metal kernels/gdn.metal kernels/moe_prefill.metal kernels/qmvb.metal kernels/qmvb_tc.metal kernels/moe_tc.metal kernels/qmv_gg.metal kernels/gg_ple.metal kernels/hyper_gg.metal src/tok.c src/tok.h src/json.c src/json.h src/unicode_tab.h src/requant.h src/dflash.h src/gguf.h kernels/dflash.metal kernels/df_q4.metal kernels/dn_proj.metal kernels/qmv_ggm.metal kernels/moe_gg.metal
+ENGINE_SRC := src/engine.c src/model.c src/st.c src/tok.c src/json.c src/requant.c src/dflash.c src/gguf.c src/ggml_dq.c
+ENGINE_DEP := $(ENGINE_SRC) src/engine.h src/model.h src/st.h src/gpu.h kernels/engine.metal kernels/qmv.metal kernels/moe_decode.metal kernels/gdn_decode.metal kernels/qsa.metal kernels/qsa_pf.metal kernels/qmm_a8.metal kernels/qmm_i8.metal kernels/moe_iq.metal kernels/iq_tables.metal kernels/prefill.metal kernels/qmm.metal kernels/gdn.metal kernels/moe_prefill.metal kernels/qmvb.metal kernels/qmvb_tc.metal kernels/moe_tc.metal kernels/qmv_gg.metal kernels/gg_ple.metal kernels/hyper_gg.metal src/tok.c src/tok.h src/json.c src/json.h src/unicode_tab.h src/requant.h src/dflash.h src/gguf.h src/ggml_dq.h kernels/dflash.metal kernels/df_q4.metal kernels/dn_proj.metal kernels/qmv_ggm.metal kernels/moe_gg.metal
 
 $(BUILD)/run: tools/run.c $(ENGINE_DEP) $(BUILD)/gpu_metal.o | $(BUILD)
 	$(CC) $(CFLAGS) tools/run.c $(ENGINE_SRC) $(BUILD)/gpu_metal.o -o $@ $(LDLIBS)
@@ -82,3 +82,9 @@ $(BUILD)/ggmtest: tools/ggmtest.c $(BUILD)/gpu_metal.o kernels/qmv_ggm.metal ker
 
 $(BUILD)/moe_bw: bench/moe_bw.c $(BUILD)/gpu_metal.o kernels/moe_bw.metal src/gpu.h | $(BUILD)
 	$(CC) $(CFLAGS) bench/moe_bw.c $(BUILD)/gpu_metal.o -o $@ $(LDLIBS)
+
+$(BUILD)/dqcpu: tools/dqcpu.c src/ggml_dq.c src/ggml_dq.h | $(BUILD)
+	$(CC) $(CFLAGS) tools/dqcpu.c src/ggml_dq.c -o $@
+
+$(BUILD)/qmm_i8: bench/qmm_i8.c $(BUILD)/gpu_metal.o kernels/qmm_i8.metal src/gpu.h | $(BUILD)
+	$(CC) $(CFLAGS) bench/qmm_i8.c $(BUILD)/gpu_metal.o -o $@ $(LDLIBS)

@@ -297,6 +297,39 @@ kernel void p_idx_q_f(device const half *iqk [[buffer(0)]], device const float *
     idx_q_body<float>(iqk, qn, iq, pos0, t, tid, tmp, v);
 }
 
+// 同 p_idx_q，RoPE 的 (cos, sin) 查 p_rope_tab 的表 rcs [T][32]（結果逐位元相同，位置大時快很多）
+template <typename NT>
+inline void idx_q_tab_body(device const half *iqk, device const NT *qn, device half *iq, device const float2 *rcs, uint t, uint tid,
+                           threadgroup float *tmp, threadgroup float *v) {
+    constexpr uint ID = 128, IH = 4, RD = 64;
+    const float2 cs = tid < RD / 2 ? rcs[t * (RD / 2) + tid] : float2(0);
+    for (uint h = 0; h < IH; h++) {
+        const float x = float(iqk[(ulong)t * 640 + h * ID + tid]);
+        const float r = rsqrt(tg_sum(x * x, tmp, tid, ID) / ID + EPS);
+        v[tid] = x * r * float(qn[tid]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < RD / 2) {
+            const float c = cs.x, s = cs.y;
+            const float x1 = v[tid], x2 = v[tid + RD / 2];
+            v[tid] = fma(x1, c, -(x2 * s)); // 同 prefill.metal 的 rope_cs（與 rope_pair 逐位元相同）
+            v[tid + RD / 2] = fma(x1, s, x2 * c);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        iq[(ulong)t * 512 + h * ID + tid] = half(v[tid]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+kernel void p_idx_q_t(device const half *iqk [[buffer(0)]], device const bfloat *qn [[buffer(1)]], device half *iq [[buffer(2)]],
+                      device const float2 *rcs [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float tmp[32], v[128];
+    idx_q_tab_body<bfloat>(iqk, qn, iq, rcs, t, tid, tmp, v);
+}
+kernel void p_idx_q_tf(device const half *iqk [[buffer(0)]], device const float *qn [[buffer(1)]], device half *iq [[buffer(2)]],
+                       device const float2 *rcs [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float tmp[32], v[128];
+    idx_q_tab_body<float>(iqk, qn, iq, rcs, t, tid, tmp, v);
+}
+
 // 多個 token：一個 threadgroup 依序處理（區塊 key 會用到同一批前面 token 的 raw_k）。iqk [nt][640]、iq [nt][512]
 #define IDX_PREP_KB(NAME, NT)                                                                                                        \
     kernel void NAME(device const half *iqk [[buffer(0)]], device const NT *qn [[buffer(1)]], device const NT *kn [[buffer(2)]],      \

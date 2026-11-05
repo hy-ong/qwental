@@ -628,4 +628,157 @@ kernel void ghp_down(device half *X [[buffer(0)]], device const bfloat *Wd [[buf
         }
 }
 #endif
+
+// ---------------------------------------------------------------- INT8 版（QW_INT8 清單含 hyper；會改變精度，預設集合不含）
+// 只有 mix_down 走 INT8：量化格式同 kernels/qmm_i8.metal（xu = Qa + 128、Qa = rint(y / sa)、sa = max|y| / 127、asum = ΣQa），
+// 權重是 requant.c 的 INT8 影子，矩陣乘直接用 qmm_i8（K = 10240、N = 320）。
+//   ghp_hc_in8：殘差（可選）+ 分流 RMSNorm + inject 部分和，正規化結果直接量化成 uint8（每個 token 一個 scale，4 條流共用），
+//               不寫 FP16 的 yh。一個 threadgroup 一個 token（D / 4 個執行緒，每個執行緒每條流 4 個元素）
+//   ghp_silu：SiLU(d / HC) → FP16（給原本的 ghp_up）
+// mix_up 不走 INT8：量過 SiLU 之後的 d（320 維）有離群值，每個 token 一個 scale 時 KL 約為 INT8=1 的 6 倍
+// （每 64 個一個 scale 仍約 4 倍），所以 ghp_up 照舊（FP16 × BF16、h 從 FP32 重算）。
+#define HC_NT (D / 4)
+#define HC_NSG (HC_NT / 32)
+static_assert(HC_NT % 32 == 0 && HC_NT <= 1024, "ghp_hc_in8：D / 4 個執行緒");
+// grid：T × D / 4
+kernel void ghp_hc_in8(device float *h [[buffer(0)]], device const half *out [[buffer(1)]], device const float *injp_in [[buffer(2)]],
+                       device const float *w [[buffer(3)]], device uint8_t *xu [[buffer(4)]], device float *rs [[buffer(5)]],
+                       constant uint &apply [[buffer(6)]], device const bfloat *injW [[buffer(7)]], device float *injp_out [[buffer(8)]],
+                       constant uint &want_inj [[buffer(9)]], device float *sa [[buffer(10)]], device int *asum [[buffer(11)]],
+                       uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tss[HC * HC_NSG], tmx[HC_NSG], tinj[HC * HC * HC_NSG];
+    threadgroup int tis[HC_NSG];
+    const uint i = tid * 4;
+    device float *ht = h + (ulong)t * HCD + i;
+    float4 x[HC];
+#pragma unroll
+    for (uint s = 0; s < HC; s++) x[s] = *(device const float4 *)(ht + s * D);
+    if (apply) {
+        const float4 o = float4(*(device const half4 *)(out + (ulong)t * D + i));
+#pragma unroll
+        for (uint s = 0; s < HC; s++) {
+            x[s] = fma(o, gh_inj(injp_in + t * HC * HC, s), x[s]);
+            *(device float4 *)(ht + s * D) = x[s];
+        }
+    }
+#pragma unroll
+    for (uint s = 0; s < HC; s++) {
+        const float v = simd_sum(dot(x[s], x[s]));
+        if (lane == 0) tss[s * HC_NSG + sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 y[HC];
+    float m = 0;
+#pragma unroll
+    for (uint s = 0; s < HC; s++) {
+        float a = 0;
+        for (uint k = 0; k < HC_NSG; k++) a += tss[s * HC_NSG + k];
+        const float r = rsqrt(a / D + EPS);
+        if (tid == 0) rs[t * HC + s] = r;
+        y[s] = x[s] * r * *(device const float4 *)(w + s * D + i);
+        const float4 ay = fabs(y[s]);
+        m = max(m, max(max(ay.x, ay.y), max(ay.z, ay.w)));
+    }
+    m = simd_max(m);
+    if (lane == 0) tmx[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float amax = 0;
+    for (uint k = 0; k < HC_NSG; k++) amax = max(amax, tmx[k]);
+    const float sc = amax > 0 ? amax / 127.0f : 1.0f, inv = 1.0f / sc;
+    int qs = 0;
+    device uchar4 *dst = (device uchar4 *)(xu + (ulong)t * HCD + i);
+#pragma unroll
+    for (uint s = 0; s < HC; s++) {
+        const int4 q = int4(clamp(rint(y[s] * inv), -127.0f, 127.0f));
+        dst[s * (D / 4)] = uchar4(q + 128);
+        qs += q.x + q.y + q.z + q.w;
+    }
+    qs = simd_sum(qs);
+    if (lane == 0) tis[sg] = qs;
+    if (want_inj) {
+#pragma unroll
+        for (uint s = 0; s < HC; s++)
+#pragma unroll
+            for (uint q = 0; q < HC; q++) {
+                const uint2 u = *(device const uint2 *)(injW + (ulong)q * HCD + s * D + i);
+                const float v = simd_sum(dot(float4(bf_lo(u.x), bf_hi(u.x), bf_lo(u.y), bf_hi(u.y)), y[s]));
+                if (lane == 0) tinj[(s * HC + q) * HC_NSG + sg] = v;
+            }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (want_inj && tid < HC * HC) { // tid = s·HC + q
+        float v = 0;
+        for (uint k = 0; k < HC_NSG; k++) v += tinj[tid * HC_NSG + k];
+        injp_out[t * HC * HC + tid] = v;
+    }
+    if (tid == HC * HC) {
+        int a = 0;
+        for (uint k = 0; k < HC_NSG; k++) a += tis[k];
+        sa[t] = sc;
+        asum[t] = a;
+    }
+}
+
+// ghp_hc_in 的「一個 token 一個 threadgroup」版（GH_HCT，預設開）：4 條流一起讀寫，歸約一次做完（屏障 3 次，原本每條流 2 + 2·HC 次）。
+// 執行緒對應與原本相同（第 tid 個執行緒管每條流的第 tid·4 個元素），SIMD 內加總、跨 SIMD group 的加總也照原本的順序
+// （lane < NSG 讀部分和再 simd_sum），所以 r、y、inject 部分和與原本逐位元相同。grid：T × D / 4
+kernel void ghp_hc_in_t(device float *h [[buffer(0)]], device const half *out [[buffer(1)]], device const float *injp_in [[buffer(2)]],
+                        device const float *w [[buffer(3)]], device half *yh [[buffer(4)]], device float *rs [[buffer(5)]],
+                        constant uint &apply [[buffer(6)]], device const bfloat *injW [[buffer(7)]], device float *injp_out [[buffer(8)]],
+                        constant uint &want_inj [[buffer(9)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tss[HC * HC_NSG], tinj[HC * HC * HC_NSG];
+    const uint i = tid * 4;
+    device float *ht = h + (ulong)t * HCD + i;
+    float4 x[HC];
+#pragma unroll
+    for (uint s = 0; s < HC; s++) x[s] = *(device const float4 *)(ht + s * D);
+    if (apply) {
+        const float4 o = float4(*(device const half4 *)(out + (ulong)t * D + i));
+#pragma unroll
+        for (uint s = 0; s < HC; s++) {
+            x[s] = fma(o, gh_inj(injp_in + t * HC * HC, s), x[s]);
+            *(device float4 *)(ht + s * D) = x[s];
+        }
+    }
+#pragma unroll
+    for (uint s = 0; s < HC; s++) {
+        const float v = simd_sum(dot(x[s], x[s]));
+        if (lane == 0) tss[s * HC_NSG + sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 y[HC];
+#pragma unroll
+    for (uint s = 0; s < HC; s++) {
+        const float ps = simd_sum(lane < HC_NSG ? tss[s * HC_NSG + lane] : 0.0f);
+        const float r = rsqrt(ps / D + EPS);
+        y[s] = x[s] * r * *(device const float4 *)(w + s * D + i);
+        *(device half4 *)(yh + (ulong)t * HCD + s * D + i) = half4(y[s]);
+        if (tid == 0) rs[t * HC + s] = r;
+    }
+    if (!want_inj) return;
+#pragma unroll
+    for (uint s = 0; s < HC; s++)
+#pragma unroll
+        for (uint q = 0; q < HC; q++) {
+            const uint2 u = *(device const uint2 *)(injW + (ulong)q * HCD + s * D + i);
+            const float4 wq = float4(bf_lo(u.x), bf_hi(u.x), bf_lo(u.y), bf_hi(u.y));
+            const float v = simd_sum(dot(wq, y[s]));
+            if (lane == 0) tinj[(s * HC + q) * HC_NSG + sg] = v;
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0)
+#pragma unroll
+        for (uint k = 0; k < HC * HC; k++) {
+            const float v = simd_sum(lane < HC_NSG ? tinj[k * HC_NSG + lane] : 0.0f);
+            if (lane == 0) injp_out[t * HC * HC + k] = v;
+        }
+}
+
+// SiLU(d / HC)：qmm_i8 的 FP16 輸出 → ghp_up 的輸入。grid：T × LR
+kernel void ghp_silu(device const half *d [[buffer(0)]], device half *y [[buffer(1)]], uint t [[threadgroup_position_in_grid]],
+                     uint j [[thread_index_in_threadgroup]]) {
+    y[(ulong)t * LR + j] = half(gh_silu(float(d[(ulong)t * LR + j]) / HC));
+}
 #endif // GH_PF

@@ -28,7 +28,7 @@ for t, (fn, name, dims, off, d0) in sorted(pick.items()):
     raw = np.fromfile(fn, dtype=np.uint8, count=rows * rb, offset=d0 + off)
     with tempfile.TemporaryDirectory() as td:
         open(td + '/in', 'wb').write(raw.tobytes())
-        r = subprocess.run(['build/dqtest', str(t), str(K), str(rows), td + '/in', td + '/out'], capture_output=True, text=True)
+        r = subprocess.run([os.environ.get('DQ_BIN', 'build/dqtest'), str(t), str(K), str(rows), td + '/in', td + '/out'], capture_output=True, text=True)
         if r.returncode: print(t, '失敗', r.stderr[:300]); ok = False; continue
         gpu = np.fromfile(td + '/out', dtype=np.float32).reshape(rows, K)
     if t == 42:

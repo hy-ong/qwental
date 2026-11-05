@@ -271,3 +271,90 @@ kernel void df_q6tc(device const uchar *W [[buffer(0)]], device const half *x [[
         y[(ulong)m * N + n0 + n] = YT(v);
     }
 }
+
+// ---------------------------------------------------------------- 主模型 lm_head（Q6_K、248320 列）：矩陣單元版，K 方向一次 128 個值
+// 同 df_q6tc（每個 threadgroup 32 列 × 8 列輸入、權重 d·sc·(q − 32) 在 FP32 算好再捨入成 FP16），但 KT = 128 剛好是 Q6_K 的半個超區塊：
+// 照右運算元的排列（M5；主程式先用 df_q6b_layout 核對），lane 的 32 組（每組 4 個連續 k）是 4 列 × 位置 l、l + 16 × r = 0…3，
+// 同一列、同一個 l 的 4 個 r 共用 ql 的兩個 word 與 qh 的一個 word（df_q6tc 每 4 個值各讀一次：讀取指令多 4 倍）。
+// 各列輸入互不影響：decode（NB = 1）與驗證（NB 個 token）每個 token 的算式相同。grid：ceil(N / 32) × 32·Q6B_NSG
+#ifndef Q6B_NSG
+#define Q6B_NSG 4
+#endif
+#define Q6B_KT 128
+static_assert(K % (Q6B_KT * Q6B_NSG) == 0, "df_q6tcb：K 必須是 128·Q6B_NSG 的倍數");
+inline uint q6b_ld4(device const uchar *p) { // 4 位元組，只保證 2 位元組對齊（Q6_K 區塊 210 B）
+    device const ushort *u = (device const ushort *)p;
+    return uint(u[0]) | (uint(u[1]) << 16);
+}
+// 核對右運算元的排列：lane l 的第 g 組在 k = 4·(l % 2) + 8·((l / 8) % 2) + 16·(g / 4)、n = (l % 8) / 2 + 4·(l / 16) + 8·(g % 4)。
+// out[0] = 不符的元素數（0 = 符合）。grid：1 × 32
+kernel void df_q6b_layout(device atomic_uint *out [[buffer(0)]], uint lane [[thread_index_in_simdgroup]]) {
+    constexpr auto desc = matmul2d_descriptor(MT, NT, Q6B_KT, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto rh = op.get_right_input_cooperative_tensor<half, half, float>();
+    uint bad = rh.get_capacity() == Q6B_KT ? 0 : 1;
+    for (uint16_t i = 0; i < rh.get_capacity(); i++) {
+        const auto ix = rh.get_multidimensional_index(i);
+        const uint g = i / 4;
+        bad += uint(ix[0]) != 4 * (lane % 2) + 8 * ((lane / 8) % 2) + 16 * (g / 4) + i % 4 || uint(ix[1]) != (lane % 8) / 2 + 4 * (lane / 16) + 8 * (g % 4);
+    }
+    atomic_fetch_add_explicit(out, bad, memory_order_relaxed);
+}
+kernel void df_q6tcb(device const uchar *W [[buffer(0)]], device const half *x [[buffer(8)]], device YT *y [[buffer(9)]],
+                     constant df_q4_args &a [[buffer(13)]], uint tg [[threadgroup_position_in_grid]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float part[Q6B_NSG][MT][NT];
+    const uint n0 = tg * NT, N = a.N[0], lane = tid % 32;
+    using T2 = dextents<int32_t, 2>;
+    tensor<device half, T2, tensor_inline> tX((device half *)x, T2(K, MT));
+    constexpr auto desc = matmul2d_descriptor(MT, NT, Q6B_KT, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto rh = op.get_right_input_cooperative_tensor<half, half, float>();
+    auto x0 = tX.slice<Q6B_KT, MT>(0, 0);
+    auto acc = op.get_destination_cooperative_tensor<__tensor_ops_detail::__remove_addrspace_t<decltype(x0)>,
+                                                     __tensor_ops_detail::__remove_addrspace_t<decltype(rh)>, float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) acc[i] = 0;
+    const uint c = 4 * (lane % 2) + 8 * ((lane / 8) % 2), nb = (lane % 8) / 2 + 4 * (lane / 16);
+    device const uchar *wr[4];
+#pragma clang loop unroll(full)
+    for (uint q = 0; q < 4; q++) wr[q] = W + (ulong)min(n0 + nb + 8 * q, N - 1) * Q6RB; // 超出的列讀最後一列、不寫出
+    for (uint k0 = sg * Q6B_KT; k0 < K; k0 += Q6B_KT * Q6B_NSG) {
+        const uint hn = (k0 % 256) / 128;
+#pragma clang loop unroll(full)
+        for (uint q = 0; q < 4; q++) {
+            device const uchar *b = wr[q] + (k0 / 256) * 210;
+            const float d = float(*(device const half *)(b + 208));
+#pragma clang loop unroll(full)
+            for (uint hl = 0; hl < 2; hl++) {
+                const uint l = c + 16 * hl;
+                const uint ql0 = q6b_ld4(b + 64 * hn + l), ql1 = q6b_ld4(b + 64 * hn + 32 + l), qh = q6b_ld4(b + 128 + 32 * hn + l);
+#pragma clang loop unroll(full)
+                for (uint r = 0; r < 4; r++) {
+                    const uint qv = (((r % 2 ? ql1 : ql0) >> (4 * (r / 2))) & 0x0f0f0f0fu) | (((qh >> (2 * r)) & 0x03030303u) << 4);
+                    const float sc = float(((device const char *)b)[192 + 8 * hn + 2 * r + hl]);
+                    const half4 h = half4(d * sc * (float4(as_type<uchar4>(qv)) - 32.0f)); // 同 q6_deq4 的算式
+                    const uint i = 4 * (4 * (2 * r + hl) + q); // 第 g = 4·j + q 組，j = 2r + hl（k = l + 32r）
+                    rh[i] = h.x;
+                    rh[i + 1] = h.y;
+                    rh[i + 2] = h.z;
+                    rh[i + 3] = h.w;
+                }
+            }
+        }
+        auto xs = tX.slice<Q6B_KT, MT>(k0, 0);
+        op.run(xs, rh, acc);
+    }
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i)) {
+            const auto ix = acc.get_multidimensional_index(i);
+            part[sg][ix[1]][ix[0]] = acc[i];
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = tid; t < NB * NT; t += 32 * Q6B_NSG) {
+        const uint m = t / NT, n = t % NT;
+        if (n0 + n >= N) continue;
+        float v = 0;
+        for (uint s = 0; s < Q6B_NSG; s++) v += part[s][m][n];
+        y[(ulong)m * N + n0 + n] = YT(v);
+    }
+}

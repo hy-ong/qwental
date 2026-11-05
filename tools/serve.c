@@ -1,7 +1,11 @@
 // Qwental HTTP server：Anthropic Messages API（/v1/messages，含串流）與 OpenAI Chat Completions（/v1/chat/completions）
 // 一次處理一個請求（單一使用者）。
-// 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--version]
+// 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--version]
 // --gguf：整個模型改用該目錄的 GGUF（Strata 的 IQ3_S 等；等同 QW_GGUF=目錄 QW_GGUF_PARTS=all）
+// --fast-head：GGUF 的 Q6_K lm_head 走矩陣單元（權重捨入成 FP16，同 llama.cpp 的 mul_mm；輸出與預設略有差異；等同 QW_LM_TC=2）
+// --int8：INT8 prefill（routed expert 走 INT8 × INT8，GGUF 另外加上 dense 投影；decode 不變；等同 QW_INT8=1）
+// --int8-qk：再加上 attention 的 Q·Kᵀ（indexer 打分與稀疏核心）走 INT8；--int8-hyper：再加上 GGUF hyper-connection 的 mix_down 走 INT8。
+//   兩者都隱含 --int8，各自會讓輸出再多一點差異（等同 QW_INT8=lin,attn,shared,moe[,qk][,hyper]）
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -480,7 +484,13 @@ int main(int argc, char **argv) {
     const char *host = "127.0.0.1", *cache_dir = "cache"; // 持久化前綴快取（SSD），"" = 不用
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--version")) { printf("qwental %s\n", QW_VERSION); return 0; }
-    for (int i = 1; i + 1 < argc; i += 2) {
+    bool i8 = false, i8qk = false, i8hy = false;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--int8")) { i8 = true; continue; }
+        if (!strcmp(argv[i], "--int8-qk")) { i8qk = true; continue; }
+        if (!strcmp(argv[i], "--int8-hyper")) { i8hy = true; continue; }
+        if (!strcmp(argv[i], "--fast-head")) { setenv("QW_LM_TC", "2", 1); continue; }
+        if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "--gguf")) { setenv("QW_GGUF", argv[i + 1], 1); setenv("QW_GGUF_PARTS", "all", 0); }
         else if (!strcmp(argv[i], "--port")) port = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--ctx")) ctx = atoi(argv[i + 1]);
@@ -488,7 +498,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--model")) MODEL_DIR = argv[i + 1];
         else if (!strcmp(argv[i], "--slots")) setenv("QW_SLOTS", argv[i + 1], 1);
         else if (!strcmp(argv[i], "--cache-dir")) cache_dir = argv[i + 1];
+        i++;
     }
+    if (i8qk || i8hy) { // 類別清單：QW_INT8=1 的預設集合再加上 qk / hyper
+        char l[64];
+        snprintf(l, sizeof l, "lin,attn,shared,moe%s%s", i8qk ? ",qk" : "", i8hy ? ",hyper" : "");
+        setenv("QW_INT8", l, 1);
+    } else if (i8) setenv("QW_INT8", "1", 1);
     signal(SIGPIPE, SIG_IGN);
     char err[1024];
     TK = qw_tok_open(MODEL_DIR, err, sizeof err);
@@ -506,8 +522,11 @@ int main(int argc, char **argv) {
         qw_gen g = {.temperature = 0, .max_tokens = 4, .stop = NULL, .nstop = 0, .spec = !getenv("QW_NO_SPEC")};
         qw_engine_generate_ex(E, w, 4, &g, NULL, NULL, NULL);
     }
-    fprintf(stderr, "Qwental %s：模型載入與預熱 %.1f 秒，context %d%s%s，監聽 http://%s:%d\n", QW_VERSION, qw_now() - t0, ctx,
-            getenv("QW_GGUF") ? "，GGUF " : "", getenv("QW_GGUF") ? getenv("QW_GGUF") : "", host, port);
+    fprintf(stderr, "Qwental %s：模型載入與預熱 %.1f 秒，context %d%s%s%s，監聽 http://%s:%d\n", QW_VERSION, qw_now() - t0, ctx,
+            getenv("QW_GGUF") ? "，GGUF " : "", getenv("QW_GGUF") ? getenv("QW_GGUF") : "",
+            getenv("QW_INT8") && strcmp(getenv("QW_INT8"), "0") ? "，INT8 prefill" : "", host, port);
+    if (i8qk || i8hy) fprintf(stderr, "INT8 prefill 另外包含：%s%s\n", i8qk ? "attention Q·Kᵀ（--int8-qk）" : "", i8hy ? (i8qk ? "、hyper mix_down（--int8-hyper）" : "hyper mix_down（--int8-hyper）") : "");
+    if (getenv("QW_LM_TC") && atoi(getenv("QW_LM_TC"))) fprintf(stderr, "lm_head：矩陣單元版（--fast-head）\n");
     const int ls = socket(AF_INET, SOCK_STREAM, 0);
     const int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);

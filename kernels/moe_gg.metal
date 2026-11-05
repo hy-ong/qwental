@@ -661,7 +661,7 @@ kernel void moe_cmb_gg(device const float *Psh [[buffer(1)]], device const gg_se
         out[(ulong)t * D + row] = half(o);
     }
 }
-#elif GG_PART == 5
+#elif GG_PART == 5 || GG_PART == 6 // 6：INT8 版（在檔尾），共用下面的查表解碼
 // ---------------------------------------------------------------- prefill：routed expert 的 grouped GEMM（同 qmm.metal 的 MOE = 1，解碼換成上面的查表版）
 // Y [P][N] = X [P][KD] · W_eᵀ。X 依 expert 排好，tiles[tg.y] = {expert, 起始列, 結束列}；權重 [E][N][每列位元組]（格式 PFF）。
 // 每個 K 段（KC 個值）先把 TN 列解碼成 half（已乘 scale）放進 threadgroup memory，再用 tensor 單元累加。grid：(N / TN, 區塊數) × 32·SG
@@ -756,6 +756,7 @@ template <> struct pfq<21> { // IQ3_S（同 dqf<21>）
     }
 };
 
+#if GG_PART == 5 // （GG_PART 6 的 MLX 格式沒有 dqf）
 // 權重 tile 的 TN 列 × KC 個值（從第 k0 個起）解碼成 half（已乘 scale）放進 Wt [TN][KC]：每個執行緒一次一個單位（16 個值）
 template <uint NT> inline void pf_dq(DP W, uint RB, uint n0, uint k0, uint tid, threadgroup half *Wt, TABP tab, threadgroup const uint *gt) {
     for (uint q = tid; q < TN * (KC / 16); q += NT) {
@@ -835,5 +836,572 @@ kernel void moe_pf_gg(device half *X [[buffer(0)]], device const uchar *W [[buff
             if (mm < m_end) Y[(ulong)mm * a.N + n] = half(acc[i]);
         }
 }
+#else // GG_PART == 6
+// ---------------------------------------------------------------- prefill 的 INT8 版（QW_INT8）：同 moe_pf_gg 的條帶版（PFS 1），兩個運算元都是 INT8
+//   輸入每列（token）一個 scale（pf_i8q）：xq = rint(x / sx)、sx = max|x| / 127
+//   權重解碼成 grid 的整數值（INT8，不乘 scale）放進 threadgroup memory，每 RK 個 K 一個 scale（超區塊 d × sub-block scale）。
+//   RK 段裡各單位的 scale 不同時（IQ2_S 每 16 個值一個 scale，或 RK 大於格式的 sub-block）折成同一個：
+//   q = rint(w · FF · d / dm)、scale = dm / FF（dm = 段內最大 |d|，FF = floor(127 / grid 最大值)；d = dm 的單位不失真）
+//   每 RK 個 K 跑一次 INT8 tensor 運算（INT32，mode multiply），再 c += float(acc) · scale[n]；最後 y = sx[m] · c
+// 主程式另外注入：RK（重新縮放的 K 段：32、64…，KC 的因數）
+#ifndef RK
+#define RK 32
+#endif
+// PFF 100：MLX affine 4-bit（group 64）的 routed expert（moe_pf_i8m，權重另有 S、Z）；scatter、SiLU 的量化 kernel 與 GGUF 共用
+#define I8_MLX (PFF == 100)
+static_assert(PFF == 22 || PFF == 18 || PFF == 21 || PFF == 23 || PFF == 20 || PFF == 42 || I8_MLX, "moe_pf_i8：不支援的格式");
+static_assert(KC % RK == 0 && RK % 32 == 0 && RK <= 512, "moe_pf_i8：RK");
+static_assert(PFS == 1, "moe_pf_i8：只有條帶版");
+static_assert(KD % 4 == 0, "pf_i8q：KD");
+constexpr uint i8_sb(int F) { return F == 22 ? 16 : F == 42 ? 64 : 32; } // 每個 sub-block scale 管幾個值
+constexpr uint i8_gmax(int F) { return F == 22 ? 43 : F == 18 ? 62 : F == 21 ? 15 : F == 42 ? 2 : 127; } // |grid| 最大值
+#define I8_FOLD (RK > i8_sb(PFF))
+#define I8_FF (I8_FOLD ? 127 / i8_gmax(PFF) : 1)
+
+// 一列（KD 個值）的 max|x| → scale；NT 個執行緒（32 的倍數），part 是 threadgroup 的暫存 [NT / 32]
+template <uint NT> inline float i8_rowscale(float m, threadgroup float *part, uint tid) {
+    m = simd_max(m);
+    if (tid % 32 == 0) part[tid / 32] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float amax = 0;
+    for (uint k = 0; k < NT / 32; k++) amax = max(amax, part[k]);
+    return amax > 0 ? amax / 127.0f : 1.0f;
+}
+
+// moe_scatter（moe_prefill.metal）的 INT8 版：第 p 個（token p / TOPK 的第 p % TOPK 個 expert）排到 cursor 的位置，
+// 直接寫量化後的列（同 pf_i8q 的算式），不寫 half 的 Xs。grid：P × 256（KD = D）
+kernel void moe_scatter_i8(device const half *X [[buffer(0)]], device const uint *ids [[buffer(1)]], device atomic_uint *cursor [[buffer(2)]],
+                           device char *Xq [[buffer(3)]], device uint *pos_of [[buffer(4)]], device float *sx [[buffer(5)]],
+                           uint p [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint pos;
+    threadgroup float part[8];
+    if (tid == 0) {
+        pos = atomic_fetch_add_explicit(&cursor[ids[p]], 1u, memory_order_relaxed);
+        pos_of[p] = pos;
+    }
+    device const half4 *src = (device const half4 *)(X + (ulong)(p / TOPK) * KD);
+    float m = 0;
+    for (uint i = tid; i < KD / 4; i += 256) {
+        const float4 v = fabs(float4(src[i]));
+        m = max(m, max(max(v.x, v.y), max(v.z, v.w)));
+    }
+    const float sc = i8_rowscale<256>(m, part, tid), inv = 1.0f / sc; // 裡面的 barrier 也讓 pos 可見
+    device char4 *dst = (device char4 *)(Xq + (ulong)pos * KD);
+    for (uint i = tid; i < KD / 4; i += 256) dst[i] = char4(clamp(rint(float4(src[i]) * inv), -127.0f, 127.0f));
+    if (tid == 0) sx[pos] = sc;
+}
+
+// moe_scatter_i8 的另一版：px 已由 dense INT8 的 i8_quant（qmm_i8.metal）量化成 Xu = Qa + 128、sa（shared expert 共用），
+// 只把整數列搬到排好的位置（Qa = Xu − 128）。i8_quant 與上面的算式相同（max|x| / 127、rint、±127），所以 Xq、sx 逐位元相同。
+// grid：P × 256（KD = D）
+kernel void moe_scatter_i8u(device const uchar *Xu [[buffer(0)]], device const uint *ids [[buffer(1)]], device atomic_uint *cursor [[buffer(2)]],
+                            device char *Xq [[buffer(3)]], device uint *pos_of [[buffer(4)]], device float *sx [[buffer(5)]],
+                            device const float *sa [[buffer(6)]], uint p [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint pos;
+    if (tid == 0) {
+        pos = atomic_fetch_add_explicit(&cursor[ids[p]], 1u, memory_order_relaxed);
+        pos_of[p] = pos;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const uchar4 *src = (device const uchar4 *)(Xu + (ulong)(p / TOPK) * KD);
+    device char4 *dst = (device char4 *)(Xq + (ulong)pos * KD);
+    for (uint i = tid; i < KD / 4; i += 256) dst[i] = char4(int4(src[i]) - 128);
+    if (tid == 0) sx[pos] = sa[p / TOPK];
+}
+
+// p_act2（prefill.metal）的 INT8 版：H = SiLU(G)·U 直接量化成 int8（不寫 half 的 H）。每列一個 threadgroup、KD / 4 個執行緒。grid：P × KD / 4
+static_assert((KD / 4) % 32 == 0 && KD / 4 <= 1024, "p_act2_i8：一列 KD / 4 個執行緒");
+kernel void p_act2_i8(device const half *G [[buffer(0)]], device const half *U [[buffer(1)]], device char *Hq [[buffer(2)]],
+                      device float *sx [[buffer(3)]], uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float part[KD / 4 / 32];
+    const ulong o = (ulong)r * (KD / 4) + tid;
+    const float4 g = float4(((device const half4 *)G)[o]), u = float4(((device const half4 *)U)[o]);
+    const float4 h = g / (1.0f + exp(-g)) * u;
+    const float4 a = fabs(h);
+    const float sc = i8_rowscale<KD / 4>(max(max(a.x, a.y), max(a.z, a.w)), part, tid);
+    ((device char4 *)Hq)[o] = char4(clamp(rint(h * (1.0f / sc)), -127.0f, 127.0f));
+    if (tid == 0) sx[r] = sc;
+}
+
+// 每列一個 threadgroup（256）：x [P][KD] half → xq [P][KD] int8、sx [P]。grid：P × 256
+kernel void pf_i8q(device const half *x [[buffer(0)]], device char *xq [[buffer(1)]], device float *sx [[buffer(2)]], constant uint &P [[buffer(3)]],
+                   uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                   uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8];
+    if (r >= P) return;
+    device const half4 *xr = (device const half4 *)(x + (ulong)r * KD);
+    float m = 0;
+    for (uint i = tid; i < KD / 4; i += 256) {
+        const float4 v = fabs(float4(xr[i]));
+        m = max(m, max(max(v.x, v.y), max(v.z, v.w)));
+    }
+    m = simd_max(m);
+    if (lane == 0) part[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float amax = 0;
+    for (uint k = 0; k < 8; k++) amax = max(amax, part[k]);
+    const float sc = amax > 0 ? amax / 127.0f : 1.0f, inv = 1.0f / sc;
+    device char4 *qr = (device char4 *)(xq + (ulong)r * KD);
+    for (uint i = tid; i < KD / 4; i += 256) qr[i] = char4(clamp(rint(float4(xr[i]) * inv), -127.0f, 127.0f));
+    if (tid == 0) sx[r] = sc;
+}
+
+// 直接解成 INT8（不經 half），16 個值打包成 uint4（順序同 dqf 的 w[0..3]），d 是這個單位的 scale：
+//   grid 格式（IQ2_S / IQ3_XXS / IQ3_S，PFT 的 threadgroup 表）：mag = 無號的 grid byte、sg = 16 個 sign 位元（第 j 位元是第 j 個值）
+//   IQ4（NL / XS）：threadgroup 的 t4 表（一個 byte → 低、高 nibble 的 kvalues，ushort 的低、高 byte），c 已帶符號
+// 折 scale（I8_FOLD）用 SWAR 定點乘法：每個 uint 拆成兩個 16 位元的 lane（byte 0、2 與 1、3），q = (v·R + 128) >> 8，R = round(256·FF·|d / dm|)
+#define I8_GRID (PFF == 22 || PFF == 18 || PFF == 21)
+#define I8_T4 (PFF == 20 || PFF == 23)
+// I8_GC：grid 表直接從 constant 位址空間讀（不放 threadgroup memory；主程式只在 PFT 關掉時注入），值相同、結果逐位元相同。
+// 量過（M5 Max，4096 個 token）：IQ2_S（8 KB 的表、一次讀 8 個 byte）gate+up 快約 6%（只看 IQ2_S 的層）；
+// IQ3_XXS、IQ3_S（1、2 KB 的表）反而慢 2–4%，維持 threadgroup 表。把 IQ2_S 的表壓成 2 KB 放 threadgroup memory 則沒有變快
+#ifndef I8_GC
+#define I8_GC 0
+#endif
+#ifndef I8_PAIR
+#define I8_PAIR 0 // 2 / 4：每個執行緒一次解 2 / 4 個相鄰單位（pf_dq8p）；0：一次一個（pf_dq8）
+#endif
+#define I8_GCON (I8_GC && I8_GRID && !PFT_ON)
+#define I8_FAST ((PFDBG == 0 || PFDBG == 3) && /* PFDBG 5：強制走 half 解碼（對照用） */ (((PFT_ON || I8_GCON) && I8_GRID) || I8_T4))
+// grid 表的一筆：threadgroup 表（PFT）或 constant 表（I8_GC）
+inline uint2 i8_g2(threadgroup const uint *g, uint i) {
+    if (I8_GCON) {
+        const ulong v = iq2s_grid[i];
+        return uint2(uint(v), uint(v >> 32));
+    }
+    return ((threadgroup const uint2 *)g)[i];
+}
+inline uint i8_g1(threadgroup const uint *g, uint i) {
+    if (I8_GCON) return PFF == 18 ? iq3xxs_grid[i] : iq3s_grid[i];
+    return g[i];
+}
+// 帶符號：−g = (g ^ 0xff) + 1（grid 的值都 > 0，不會進位到下一個 byte）
+inline uint i8_sg(uint g, uint s) {
+    const uint m = ((s & 15) * 0x00204081u & 0x01010101u) * 0xffu; // 4 個 sign 位元 → 4 個 byte 的遮罩
+    return (g ^ m) + (m & 0x01010101u);
+}
+// grid 的折法：m 的每個 byte ≤ grid 最大值（m·R ≤ 127·256，16 位元 lane 不溢位），s 是 4 個 sign 位元。
+// 負號在 16 位元 lane 裡做：(a ^ 0xff) + 1 = 256 − a（a = 0 時進位到同一個 lane 的第 8 位元，遮掉）
+inline uint i8_fold(uint m, uint R, uint s) {
+    uint a = (((m & 0x00ff00ffu) * R + 0x00800080u) >> 8) & 0x00ff00ffu;
+    uint b = ((((m >> 8) & 0x00ff00ffu) * R + 0x00800080u) >> 8) & 0x00ff00ffu;
+    const uint ma = ((s & 1) | ((s & 4) << 14)) * 0xffu, mb = (((s >> 1) & 1) | (((s >> 3) & 1) << 16)) * 0xffu;
+    a = ((a ^ ma) + (ma & 0x00010001u)) & 0x00ff00ffu;
+    b = ((b ^ mb) + (mb & 0x00010001u)) & 0x00ff00ffu;
+    return a | (b << 8);
+}
+// IQ4 的折法（FF = 1，R 是偶數、≤ 256）：x = v + 128（0…255），q = ((x·R + 128) >> 8) − R / 2 = floor(v·R / 256 + 0.5)。
+// neg：先把每個 byte 換成 −v + 128 = 256 − x（kvalues ≥ −127，x ≥ 1，不會進位）
+inline uint i8_fold4(uint c, uint R, bool neg) {
+    uint x = c ^ 0x80808080u;
+    if (neg) x = ~x + 0x01010101u;
+    const uint h = (0x100u - R / 2) * 0x00010001u;
+    const uint a = (((((x & 0x00ff00ffu) * R + 0x00800080u) >> 8) & 0x00ff00ffu) + h) & 0x00ff00ffu;
+    const uint b = (((((x >> 8) & 0x00ff00ffu) * R + 0x00800080u) >> 8) & 0x00ff00ffu) + h;
+    return a | ((b & 0x00ff00ffu) << 8);
+}
+template <int F> struct dq8 {
+    static inline void run(DP, uint, threadgroup const uint *, threadgroup const ushort *, thread uint4 &, thread uint &, thread float &) {}
+};
+template <> struct dq8<22> { // IQ2_S（同 pfq<22>）
+    static inline void run(DP W, uint u, threadgroup const uint *g, threadgroup const ushort *, thread uint4 &c, thread uint &sg, thread float &d) {
+        DP b = W + (u >> 4) * 82;
+        const uint ib = (u >> 1) & 7, hh = u & 1;
+        const uint qs = ldu16(b + 2 + 4 * ib + 2 * hh);
+        sg = ldu16(b + 34 + 4 * ib + 2 * hh);
+        const uint qh = b[66 + ib], sc = (b[74 + ib] >> (4 * hh)) & 15;
+        d = ldf16(b) * (0.5f + float(sc)) * 0.25f;
+        const uint2 e0 = i8_g2(g, (qs & 255) | ((qh << (8 - 4 * hh)) & 0x300)), e1 = i8_g2(g, (qs >> 8) | ((qh << (6 - 4 * hh)) & 0x300));
+        c = uint4(e0.x, e0.y, e1.x, e1.y);
+    }
+};
+template <> struct dq8<18> { // IQ3_XXS（同 pfq<18>）
+    static inline void run(DP W, uint u, threadgroup const uint *g, threadgroup const ushort *, thread uint4 &c, thread uint &sg, thread float &d) {
+        DP b = W + (u >> 4) * 98;
+        const uint ib = (u >> 1) & 7, hh = u & 1;
+        const uint q0 = ldu16(b + 2 + 8 * ib + 4 * hh), q1 = ldu16(b + 4 + 8 * ib + 4 * hh);
+        const uint aux = ldu16(b + 66 + 4 * ib) | (ldu16(b + 68 + 4 * ib) << 16);
+        d = ldf16(b) * (0.5f + float(aux >> 28)) * 0.5f;
+        const uint a0 = (aux >> (14 * hh)) & 127, a1 = (aux >> (14 * hh + 7)) & 127;
+        sg = (a0 | ((popcount(a0) & 1) << 7)) | ((a1 | ((popcount(a1) & 1) << 7)) << 8);
+        c = uint4(i8_g1(g, q0 & 255), i8_g1(g, q0 >> 8), i8_g1(g, q1 & 255), i8_g1(g, q1 >> 8));
+    }
+};
+template <> struct dq8<21> { // IQ3_S（同 pfq<21>）
+    static inline void run(DP W, uint u, threadgroup const uint *g, threadgroup const ushort *, thread uint4 &c, thread uint &sg, thread float &d) {
+        DP b = W + (u >> 4) * 110;
+        const uint ib = (u >> 1) & 7, hh = u & 1;
+        const uint q0 = ldu16(b + 2 + 8 * ib + 4 * hh), q1 = ldu16(b + 4 + 8 * ib + 4 * hh);
+        const uint qh = uint(b[66 + ib]) >> (4 * hh);
+        sg = ldu16(b + 74 + 4 * ib + 2 * hh);
+        d = ldf16(b) * float(1 + 2 * ((b[106 + ib / 2] >> (4 * (ib & 1))) & 15));
+        c = uint4(i8_g1(g, (q0 & 255) | ((qh << 8) & 256)), i8_g1(g, (q0 >> 8) | ((qh << 7) & 256)), i8_g1(g, (q1 & 255) | ((qh << 6) & 256)),
+                  i8_g1(g, (q1 >> 8) | ((qh << 5) & 256)));
+    }
+};
+// IQ4 的 8 個 byte → 低 nibble 的 8 個值（c.xy）、高 nibble 的 8 個值（c.zw）
+inline void i8_iq4(DP q8, threadgroup const ushort *t4, thread uint4 &c) {
+    uint lo[2] = {0, 0}, hi[2] = {0, 0};
+    for (uint i = 0; i < 4; i++) {
+        const uint v = ldu16(q8 + 2 * i), e0 = t4[v & 255], e1 = t4[v >> 8], sh = 16 * (i & 1);
+        lo[i >> 1] |= ((e0 & 255) | ((e1 & 255) << 8)) << sh;
+        hi[i >> 1] |= ((e0 >> 8) | ((e1 >> 8) << 8)) << sh;
+    }
+    c = uint4(lo[0], lo[1], hi[0], hi[1]);
+}
+template <> struct dq8<20> { // IQ4_NL
+    static inline void run(DP W, uint u, threadgroup const uint *, threadgroup const ushort *t4, thread uint4 &c, thread uint &, thread float &d) {
+        DP b = W + (u >> 1) * 18;
+        d = ldf16(b);
+        i8_iq4(b + 2 + 8 * (u & 1), t4, c);
+    }
+};
+template <> struct dq8<23> { // IQ4_XS
+    static inline void run(DP W, uint u, threadgroup const uint *, threadgroup const ushort *t4, thread uint4 &c, thread uint &, thread float &d) {
+        DP b = W + (u >> 4) * 136;
+        const uint ib = (u >> 1) & 7, hh = u & 1;
+        const uint sh = ldu16(b + 2);
+        const int ls = int(((b[4 + ib / 2] >> (4 * (ib & 1))) & 15) | (((sh >> (2 * ib)) & 3) << 4));
+        d = ldf16(b) * float(ls - 32);
+        i8_iq4(b + 8 + 16 * ib + 8 * hh, t4, c);
+    }
+};
+
+#if !I8_MLX
+// 權重 tile 的 TN 列 × KC 個值（從第 k0 個起）→ Wt [TN][KC]（int8）、sS [KC / RK][TN]（每段的 scale）。每個執行緒一次一個單位（16 個值）；
+// 同一段的 RK / 16 個單位在相鄰的 lane（折 scale 時用 shuffle 取最大值，整個 SIMD group 的迴圈次數一樣）
+template <uint NT> inline void pf_dq8(DP W, uint RB, uint n0, uint k0, uint tid, threadgroup uint *Wt, threadgroup float4 (*sS)[TN / 4], TABP tab,
+                                      threadgroup const uint *gt, threadgroup const ushort *t4) {
+    static_assert((TN * (KC / 16)) % NT == 0 && NT % 32 == 0 && (KC / 16) % (RK / 16) == 0 && RK / 16 <= 32, "pf_dq8：單位的分配");
+    for (uint q = tid; q < TN * (KC / 16); q += NT) {
+        const uint n = q / (KC / 16), u = k0 / 16 + q % (KC / 16);
+        uint4 c;
+        float d, sc;
+        if (I8_FAST) {
+            uint sg = 0;
+            dq8<PFF>::run(W + (ulong)(n0 + n) * RB, u, gt, t4, c, sg, d);
+            sc = d;
+            if (I8_FOLD) {
+                float dm = fabs(d);
+                for (ushort o = 1; o < RK / 16; o <<= 1) dm = max(dm, simd_shuffle_xor(dm, o));
+                const float r = dm > 0 ? fabs(d) / dm : 0.0f;
+                sc = dm / float(I8_FF);
+                if (I8_GRID) {
+                    const uint R = uint(rint(r * float(256 * I8_FF))), s = d < 0 ? ~sg : sg;
+                    for (uint i = 0; i < 4; i++) c[i] = i8_fold(c[i], R, s >> (4 * i));
+                } else {
+                    const uint R = 2 * uint(rint(r * 128.0f));
+                    for (uint i = 0; i < 4; i++) c[i] = i8_fold4(c[i], R, d < 0);
+                }
+            } else if (I8_GRID)
+                for (uint i = 0; i < 4; i++) c[i] = i8_sg(c[i], sg >> (4 * i));
+        } else {
+            half4 w[4];
+            float m = 0;
+            if (PFDBG == 1) {
+                w[0] = w[1] = w[2] = w[3] = half4(half(n & 3));
+                d = 1;
+            } else if (PFT_ON)
+                pfq<PFF>::run(W + (ulong)(n0 + n) * RB, u, gt, w, d);
+            else
+                dqf<PFF>::run(gref<DP>{W + (ulong)(n0 + n) * RB, nullptr, nullptr, tab}, u, w, d, m);
+            sc = d;
+            float r = 1;
+            if (I8_FOLD) {
+                float dm = fabs(d);
+                for (ushort o = 1; o < RK / 16; o <<= 1) dm = max(dm, simd_shuffle_xor(dm, o));
+                r = dm > 0 ? float(I8_FF) * d / dm : 0.0f;
+                sc = dm / float(I8_FF);
+            }
+            for (uint i = 0; i < 4; i++) c[i] = as_type<uint>(char4(I8_FOLD ? rint(float4(w[i]) * r) : float4(w[i])));
+        }
+        const uint p0 = (gf_spl(PFF) ? 32 * (u >> 1) + 8 * (u & 1) : 16 * u) - k0, p1 = p0 + (gf_spl(PFF) ? 16 : 8);
+        threadgroup uint *d0 = Wt + (n * KC + p0) / 4, *d1 = Wt + (n * KC + p1) / 4;
+        d0[0] = c.x;
+        d0[1] = c.y;
+        d1[0] = c.z;
+        d1[1] = c.w;
+        if ((u * 16) % RK == 0) ((threadgroup float *)sS)[(u * 16 - k0) / RK * TN + n] = sc; // 逐個 float 寫（寫 float4 的一個分量可能整個讀改寫，相鄰執行緒會互蓋）
+    }
+}
+
+// 單位的折法（同 pf_dq8 的 I8_FAST 分支）：c、sg、d 是 dq8 的輸出，dm 是段內最大 |d|
+inline uint4 i8_apply(uint4 c, uint sg, float d, float dm) {
+    if (I8_FOLD) {
+        const float r = dm > 0 ? fabs(d) / dm : 0.0f;
+        if (I8_GRID) {
+            const uint R = uint(rint(r * float(256 * I8_FF))), s = d < 0 ? ~sg : sg;
+            for (uint i = 0; i < 4; i++) c[i] = i8_fold(c[i], R, s >> (4 * i));
+        } else {
+            const uint R = 2 * uint(rint(r * 128.0f));
+            for (uint i = 0; i < 4; i++) c[i] = i8_fold4(c[i], R, d < 0);
+        }
+    } else if (I8_GRID)
+        for (uint i = 0; i < 4; i++) c[i] = i8_sg(c[i], sg >> (4 * i));
+    return c;
+}
+// I8_PAIR（UP = 2 或 4）：pf_dq8 的 I8_FAST 版，每個執行緒一次 UP 個相鄰單位（UP = 2 是一個 32 值的 sub-block：同一個區塊、
+// 同一組 qh / scale 位元組），位址與共用欄位只算一次；段內最大 |d| 先在執行緒內取，再 shuffle（RK / (16·UP) 個 lane）；
+// 16·UP 個連續 byte 用 uint4 寫。整數值、scale 與 pf_dq8 完全相同（max 的順序不影響結果）
+#if I8_PAIR
+template <uint NT> inline void pf_dq8p(DP W, uint RB, uint n0, uint k0, uint tid, threadgroup uint *Wt, threadgroup float4 (*sS)[TN / 4],
+                                       threadgroup const uint *gt, threadgroup const ushort *t4) {
+    constexpr uint UP = I8_PAIR, NQ = KC / (16 * UP); // 每列每段 K 的執行緒數
+    // NT 不必整除工作數：q 的上限（TN·NQ）是 32 的倍數，每個 SIMD group 整個在迴圈裡或整個不在（shuffle 安全）
+    static_assert((UP == 2 || UP == 4) && KC % (16 * UP) == 0 && (TN * NQ) % 32 == 0 && NT % 32 == 0, "pf_dq8p：單位的分配");
+    static_assert(!I8_FOLD || (RK % (16 * UP) == 0 && RK / (16 * UP) <= 32), "pf_dq8p：一個執行緒的單位要在同一段");
+    for (uint q = tid; q < TN * NQ; q += NT) {
+        const uint n = q / NQ, u = k0 / 16 + UP * (q % NQ);
+        DP w = W + (ulong)(n0 + n) * RB;
+        uint4 c[UP];
+        uint sg[UP];
+        float d[UP];
+        float dm = 0;
+#pragma unroll
+        for (uint i = 0; i < UP; i++) {
+            sg[i] = 0;
+            dq8<PFF>::run(w, u + i, gt, t4, c[i], sg[i], d[i]);
+            dm = max(dm, fabs(d[i]));
+        }
+        if (I8_FOLD)
+            for (ushort o = 1; o < RK / (16 * UP); o <<= 1) dm = max(dm, simd_shuffle_xor(dm, o));
+        threadgroup uint4 *dst = (threadgroup uint4 *)(Wt + (n * KC + 16 * u - k0) / 4); // 16·UP 個值，對齊 16 byte
+#pragma unroll
+        for (uint i = 0; i < UP; i += 2) {
+            const uint4 a = i8_apply(c[i], sg[i], d[i], dm), b = i8_apply(c[i + 1], sg[i + 1], d[i + 1], dm);
+            if (gf_spl(PFF)) { // u：第 0–7、16–23 個值；u + 1：第 8–15、24–31 個
+                dst[i] = uint4(a.x, a.y, b.x, b.y);
+                dst[i + 1] = uint4(a.z, a.w, b.z, b.w);
+            } else {
+                dst[i] = a;
+                dst[i + 1] = b;
+            }
+        }
+#pragma unroll
+        for (uint i = 0; i < UP; i++)
+            if (((u + i) * 16) % RK == 0) ((threadgroup float *)sS)[((u + i) * 16 - k0) / RK * TN + n] = I8_FOLD ? dm / float(I8_FF) : d[i];
+    }
+}
+#endif
+
+// grid：(N / TN, 區塊數) × 32·SG（同 moe_pf_gg）；Xq、sx 由 pf_i8q 產生
+kernel void moe_pf_i8(device const char *Xq [[buffer(0)]], device const uchar *W [[buffer(1)]], device half *Y [[buffer(4)]],
+                      constant gg_qmm_args &a [[buffer(5)]], device const uint4 *tiles [[buffer(6)]], TABQ const uchar *tab [[buffer(7)]],
+                      device const float *sx [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint NT = 32 * SG, RB = RBY(PFF, KD), TS = TM / SG, CAP = TS * TN / 32;
+    static_assert(TM % SG == 0 && TS % 8 == 0 && TN % 32 == 0, "moe_pf_i8：條帶形狀");
+    const uint4 tile = tiles[tg.y];
+    const uint m0 = tile.y, m_end = tile.z;
+    if (m_end <= m0) return; // 沒用到的區塊
+    W += (ulong)tile.x * a.N * RB;
+    const uint n0 = tg.x * TN;
+    threadgroup uint Wt[TN * KC / 4]; // int8 [TN][KC]（以 uint 宣告：4 位元組對齊）
+    threadgroup float4 sS[KC / RK][TN / 4]; // 每段、每欄的 scale（float4：rescale 時一次讀 4 欄）
+#if PFT_ON
+    threadgroup uint gt[pft_words(PFF)];
+    static_assert(TN * KC + KC / RK * TN * 4 + pft_words(PFF) * 4 <= 32768, "moe_pf_i8：threadgroup memory");
+    pft_fill<NT>(gt, tid);
+#else
+    threadgroup uint *gt = nullptr;
+    static_assert(TN * KC + KC / RK * TN * 4 + 512 <= 32768, "moe_pf_i8：threadgroup memory");
+#endif
+#if I8_T4
+    threadgroup ushort t4[256];
+    for (uint i = tid; i < 256; i += NT) t4[i] = ushort(uchar(kvalues_iq4nl[i & 15])) | ushort(uchar(kvalues_iq4nl[i >> 4]) << 8);
+#else
+    threadgroup ushort *t4 = nullptr;
+#endif
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    using T2 = dextents<int32_t, 2>;
+    tensor<device int8_t, T2, tensor_inline> tX((device int8_t *)Xq, T2(KD, a.M));
+    tensor<threadgroup int8_t, T2, tensor_inline> tW((threadgroup int8_t *)Wt, T2(KC, TN));
+    const uint r0 = m0 + tid / 32 * TS; // 這個 SIMD group 的條帶
+    const bool live = r0 < m_end;
+    constexpr auto desc = matmul2d_descriptor(TS, TN, RK, false, true, false, matmul2d_descriptor::mode::multiply);
+    matmul2d<desc, execution_simdgroups<1>> op;
+    auto x0 = tX.slice(0, r0);
+    auto acc = op.get_destination_cooperative_tensor<decltype(x0), decltype(tW), int32_t>();
+    float c[CAP];
+    ushort nl[CAP];
+#pragma unroll
+    for (uint16_t i = 0; i < CAP; ++i) {
+        c[i] = 0;
+        nl[i] = (ushort)acc.get_multidimensional_index(i)[0];
+    }
+    // M5 上 16 × 64 的累加器：每個 lane 的第 i 個元素在第 nl[0] + i % 4 + 16·(i / 8) 欄（(i / 4) 的奇偶是列 +8）。
+    // 是這個排列時，每 8 個元素的 scale 一次讀一個 float4，否則逐一讀（PFDBG 3：強制逐一讀，對照用）
+    threadgroup const float *sf = (threadgroup const float *)sS;
+    bool lay = CAP % 8 == 0 && TN % 4 == 0 && nl[0] % 4 == 0 && nl[0] + 16 * (CAP / 8 - 1) + 3 < TN && PFDBG != 3;
+#pragma unroll
+    for (uint16_t i = 0; i < CAP; ++i) lay = lay && nl[i] == nl[0] + (i & 3) + 16 * (i >> 3);
+    for (uint k0 = 0; k0 < KD; k0 += KC) {
+#if I8_PAIR && I8_FAST && PFDBG == 0
+        pf_dq8p<NT>(W, RB, n0, k0, tid, Wt, sS, gt, t4);
+#else
+        pf_dq8<NT>(W, RB, n0, k0, tid, Wt, sS, tab, gt, t4);
+#endif
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (live)
+            for (uint j = 0; j < KC / RK; j++) {
+                auto xs = tX.slice(k0 + j * RK, r0);
+                auto ws = tW.slice(j * RK, 0);
+                op.run(xs, ws, acc);
+                if (PFDBG == 2) {
+#pragma unroll
+                    for (uint16_t i = 0; i < CAP; ++i) c[i] += float(acc[i]);
+                } else if (lay) {
+#pragma unroll
+                    for (uint16_t i = 0; i < CAP; ++i) c[i] = fma(float(acc[i]), sf[j * TN + nl[0] + (i & 3) + 16 * (i >> 3)], c[i]);
+                } else {
+#pragma unroll
+                    for (uint16_t i = 0; i < CAP; ++i) c[i] = fma(float(acc[i]), sf[j * TN + nl[i]], c[i]);
+                }
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!live) return;
+#pragma unroll
+    for (uint16_t i = 0; i < CAP; ++i)
+        if (acc.is_valid_element(i)) {
+            auto ix = acc.get_multidimensional_index(i);
+            const uint n = n0 + ix[0], mm = r0 + ix[1];
+            if (mm < m_end) Y[(ulong)mm * a.N + n] = half(c[i] * sx[mm]);
+        }
+}
+#else // I8_MLX
+// ---------------------------------------------------------------- MLX affine 4-bit（group 64）的 INT8 版：w = q·s + z（q 0…15）
+// 每列每 RK 個 K 重新量化成對稱 INT8：σ = dm / 127（dm = 段內各組 max(|z|, |15s + z|)，w 對 q 是線性的，極值在兩端），
+// w8 = rint(w / σ)。z 直接併進整數值：不需要每組 Σx 的校正，rescale 與 GGUF 版相同（每 RK 個 K 一次 c += acc · σ[n]）。
+// 誤差：4-bit 本身的步長是 s（≈ 範圍 / 15），重新量化的步長是 σ（≤ 範圍 / 127），多出的雜訊小一個數量級。
+// 解碼用 SWAR：每個 uint 拆成兩個 16 位元的 lane（第 i 與 i + 4 個 nibble），t = q·A + C，
+//   A = rint(256·s/σ)、C = rint(256·z/σ) + 128·256 + 128，w8 = (t >> 8) − 128。
+//   |q·s + z| ≤ dm ⇒ |256·(q·s + z)/σ| ≤ 32512，A、C 的捨入最多再差 8：t 在 [384, 65416]，lane 之間不會進位
+//   （C ≥ 0，lane 的結果 < 65536 時乘積本身也 < 65536）。結果與 rint(w / σ) 偶爾差 1（捨入邊界），PFDBG 5 走精確的 float 版對照。
+// s < 0 時改用 q' = 15 − q（nibble 全部 xor 15）、s' = −s、z' = z + 15s，A 一定 ≥ 0
+static_assert(KD % 64 == 0, "moe_pf_i8m：K 要是 group 64 的倍數");
+// 一個 uint（8 個 nibble，k 從低位起）→ 8 個 int8（兩個 uint，k 的順序不變）
+inline uint2 i8m_swar(uint w, uint A, uint C2) {
+    uint r[4];
+#pragma unroll
+    for (uint i = 0; i < 4; i++) r[i] = ((((w >> (4 * i)) & 0x000f000fu) * A + C2) >> 8) & 0x00ff00ffu; // byte 0：第 i 個、byte 2：第 i + 4 個
+    const uint a = r[0] | (r[1] << 8), b = r[2] | (r[3] << 8);                                          // a = [0 1 4 5]、b = [2 3 6 7]
+    return uint2((a & 0xffffu) | (b << 16), (a >> 16) | (b & 0xffff0000u)) ^ 0x80808080u;
+}
+inline uint i8m_exact(uint w, float s, float z, float inv) { // 低 16 位元的 4 個 nibble → 4 個 int8（精確的 rint）
+    const float4 q = float4(w & 15, (w >> 4) & 15, (w >> 8) & 15, (w >> 12) & 15);
+    return as_type<uint>(char4(clamp(rint(fma(q, s, z) * inv), -127.0f, 127.0f)));
+}
+
+// 權重 tile 的 TN 列 × KC 個值（從第 k0 個起）→ Wt [TN][KC]（int8）、sf [KC / RK][TN]（每段的 σ）。每個執行緒一次一個單位（16 個值、兩個 uint）；
+// 同一段的 RK / 16 個單位在相鄰的 lane（段內 max 用 shuffle，整個 SIMD group 的迴圈次數一樣）。
+// 量過（M5 Max，4096 個 token）：不讀權重（PFDBG 1）時 GEMM 少約 35%，不做 SWAR（PFDBG 6）幾乎不變——時間在讀取延遲，不在解碼運算；
+// 但下一段先讀進暫存器再跑 tensor 運算（含 Wt 兩份輪流、每段一次 barrier）反而慢 7–10%；TN 128、TM 128 × 8 個 SIMD group 也較慢
+template <uint NT> inline void pf_dq8m(device const uint *W, device const bfloat *S, device const bfloat *Z, uint n0, uint k0, uint tid,
+                                       threadgroup uint *Wt, threadgroup float *sf) {
+    static_assert((TN * (KC / 16)) % NT == 0 && NT % 32 == 0 && (KC / 16) % (RK / 16) == 0 && RK / 16 <= 32, "pf_dq8m：單位的分配");
+    for (uint q = tid; q < TN * (KC / 16); q += NT) {
+        const uint n = q / (KC / 16), u = k0 / 16 + q % (KC / 16);
+        const ulong row = n0 + n;
+        uint2 wq;
+        float s, z;
+        if (PFDBG == 1) { // 量測用：不讀權重（看 tensor 運算、解碼運算與 rescale 的時間）
+            wq = uint2(0x11111111u * (n & 3));
+            s = 1;
+            z = 0;
+        } else {
+            device const uint *wr = W + row * (KD / 8) + 2 * u; // 兩個 uint 分開讀（safetensors 的資料只保證 4 位元組對齊）
+            wq = uint2(wr[0], wr[1]);
+            s = float(S[row * (KD / 64) + u / 4]);
+            z = float(Z[row * (KD / 64) + u / 4]);
+        }
+        if (s < 0) {
+            wq = ~wq;
+            z = fma(15.0f, s, z);
+            s = -s;
+        }
+        float dm = max(fabs(z), fabs(fma(15.0f, s, z)));
+        for (ushort o = 1; o < RK / 16; o <<= 1) dm = max(dm, simd_shuffle_xor(dm, o));
+        const float inv = dm > 0 ? 127.0f / dm : 0.0f;
+        uint4 c;
+        if (PFDBG == 6) // 量測用：讀權重與 scale，不做 SWAR（結果不對）
+            c = uint4(wq.x, wq.y, wq.x ^ as_type<uint>(dm), wq.y);
+        else if (PFDBG == 5)
+            c = uint4(i8m_exact(wq.x, s, z, inv), i8m_exact(wq.x >> 16, s, z, inv), i8m_exact(wq.y, s, z, inv), i8m_exact(wq.y >> 16, s, z, inv));
+        else {
+            const uint A = uint(rint(256.0f * s * inv)), C2 = uint(int(rint(256.0f * z * inv)) + 32896) * 0x00010001u;
+            c = uint4(i8m_swar(wq.x, A, C2), i8m_swar(wq.y, A, C2));
+        }
+        *(threadgroup uint4 *)(Wt + (n * KC + 16 * u - k0) / 4) = c;
+        if ((u * 16) % RK == 0) sf[(u * 16 - k0) / RK * TN + n] = dm * (1.0f / 127.0f);
+    }
+}
+
+// grid：(N / TN, 區塊數) × 32·SG；Xq、sx 由 moe_scatter_i8 / p_act2_i8 產生。條帶、rescale 同 moe_pf_i8
+kernel void moe_pf_i8m(device const char *Xq [[buffer(0)]], device const uint *W [[buffer(1)]], device const bfloat *S [[buffer(2)]],
+                       device const bfloat *Z [[buffer(3)]], device half *Y [[buffer(4)]], constant gg_qmm_args &a [[buffer(5)]],
+                       device const uint4 *tiles [[buffer(6)]], device const float *sx [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint NT = 32 * SG, TS = TM / SG, CAP = TS * TN / 32;
+    static_assert(TM % SG == 0 && TS % 8 == 0 && TN % 32 == 0 && KD % KC == 0, "moe_pf_i8m：條帶形狀");
+    static_assert(TN * KC + KC / RK * TN * 4 <= 32768, "moe_pf_i8m：threadgroup memory");
+    const uint4 tile = tiles[tg.y];
+    const uint m0 = tile.y, m_end = tile.z;
+    if (m_end <= m0) return; // 沒用到的區塊
+    W += (ulong)tile.x * a.N * (KD / 8);
+    S += (ulong)tile.x * a.N * (KD / 64);
+    Z += (ulong)tile.x * a.N * (KD / 64);
+    const uint n0 = tg.x * TN;
+    threadgroup uint4 Wt4[TN * KC / 16]; // int8 [TN][KC]（uint4：16 位元組對齊，解碼時一次寫一個 uint4）
+    threadgroup uint *Wt = (threadgroup uint *)Wt4;
+    threadgroup float sf[KC / RK * TN];
+    using T2 = dextents<int32_t, 2>;
+    tensor<device int8_t, T2, tensor_inline> tX((device int8_t *)Xq, T2(KD, a.M));
+    tensor<threadgroup int8_t, T2, tensor_inline> tW((threadgroup int8_t *)Wt, T2(KC, TN));
+    const uint r0 = m0 + tid / 32 * TS; // 這個 SIMD group 的條帶
+    const bool live = r0 < m_end;
+    constexpr auto desc = matmul2d_descriptor(TS, TN, RK, false, true, false, matmul2d_descriptor::mode::multiply);
+    matmul2d<desc, execution_simdgroups<1>> op;
+    auto x0 = tX.slice(0, r0);
+    auto acc = op.get_destination_cooperative_tensor<decltype(x0), decltype(tW), int32_t>();
+    float c[CAP];
+    ushort nl[CAP];
+#pragma unroll
+    for (uint16_t i = 0; i < CAP; ++i) {
+        c[i] = 0;
+        nl[i] = (ushort)acc.get_multidimensional_index(i)[0];
+    }
+    // 累加器的欄排列同 moe_pf_i8（M5 的 16 × 64：第 nl[0] + i % 4 + 16·(i / 8) 欄）；不是這個排列時逐一讀（PFDBG 3 強制逐一讀）
+    bool lay = CAP % 8 == 0 && nl[0] % 4 == 0 && nl[0] + 16 * (CAP / 8 - 1) + 3 < TN && PFDBG != 3;
+#pragma unroll
+    for (uint16_t i = 0; i < CAP; ++i) lay = lay && nl[i] == nl[0] + (i & 3) + 16 * (i >> 3);
+    for (uint k0 = 0; k0 < KD; k0 += KC) {
+        pf_dq8m<NT>(W, S, Z, n0, k0, tid, Wt, sf);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (live)
+            for (uint j = 0; j < KC / RK; j++) {
+                auto xs = tX.slice(k0 + j * RK, r0);
+                auto ws = tW.slice(j * RK, 0);
+                op.run(xs, ws, acc);
+                if (lay) {
+#pragma unroll
+                    for (uint16_t i = 0; i < CAP; ++i) c[i] = fma(float(acc[i]), sf[j * TN + nl[0] + (i & 3) + 16 * (i >> 3)], c[i]);
+                } else {
+#pragma unroll
+                    for (uint16_t i = 0; i < CAP; ++i) c[i] = fma(float(acc[i]), sf[j * TN + nl[i]], c[i]);
+                }
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!live) return;
+#pragma unroll
+    for (uint16_t i = 0; i < CAP; ++i)
+        if (acc.is_valid_element(i)) {
+            auto ix = acc.get_multidimensional_index(i);
+            const uint n = n0 + ix[0], mm = r0 + ix[1];
+            if (mm < m_end) Y[(ulong)mm * a.N + n] = half(c[i] * sx[mm]);
+        }
+}
+#endif // I8_MLX
+#endif // GG_PART == 5
 #endif
 #endif

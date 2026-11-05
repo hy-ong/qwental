@@ -520,3 +520,176 @@ kernel void qsa_flash_tr(device const half *q [[buffer(0)]], device const half *
             out[(ulong)t * QH * HD + hd] = gated ? half(float(o) * tr_sigm(float(qg[(ulong)t * 2 * QH * HD + hd + (g * GQA + h) * HD + HD]))) : o;
         }
 }
+
+// ================================================================ INT8 Q·Kᵀ（QW_INT8 類別清單含 "qk" 才用，會改變精度）
+// qk8_quant：每列 HD 個 half 對稱量化成 INT8（s = max|x| / 127，全 0 時 1）。q（[T][QH][HD]）、K cache（[位置][KVH][HD]）共用。
+// 每列一個 SIMD group（threadgroup 256 = 8 列）。grid：ceil(n / 8) × 256
+static_assert(HD == 256, "qk8_quant：32 lane × 8 個");
+kernel void qk8_quant(device const half *x [[buffer(0)]], device int8_t *xq [[buffer(1)]], device float *xs [[buffer(2)]],
+                      constant uint &n [[buffer(3)]], uint tgi [[threadgroup_position_in_grid]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    const uint r = tgi * 8 + sg;
+    if (r >= n) return;
+    device const half4 *xr = (device const half4 *)(x + (ulong)r * HD);
+    const float4 v0 = float4(xr[lane * 2]), v1 = float4(xr[lane * 2 + 1]);
+    const float4 a = max(fabs(v0), fabs(v1));
+    const float m = simd_max(max(max(a.x, a.y), max(a.z, a.w)));
+    const float sc = m > 0 ? m / 127.0f : 1.0f, inv = 1.0f / sc;
+    device char4 *o = (device char4 *)(xq + (ulong)r * HD);
+    o[lane * 2] = char4(clamp(rint(v0 * inv), -127.0f, 127.0f));
+    o[lane * 2 + 1] = char4(clamp(rint(v1 * inv), -127.0f, 127.0f));
+    if (lane == 0) xs[r] = sc;
+}
+
+// qsa_flash_tr8：同 qsa_flash_tr，只有 S = Q·Kᵀ 改成 INT8 × INT8 → INT32（tensor 單元）再乘 q 的 (query, head) scale 與
+// K 的 (token, kv head) scale。q8 [T][QH][HD]、qs [T][QH]；K8 [位置][KVH][HD]、ks [位置][KVH]。P·V 仍是 FP16。
+// S 的 INT32 累加器在 scale 之後直接存 float 的位元（as_type），排列不變，後面的 online softmax 與 qsa_flash_tr 相同。
+// grid：(KVH, T) × 32·TR_NSG
+#ifndef QK8_KC
+#define QK8_KC 32 // S 的 K 方向一次幾維
+#endif
+kernel void qsa_flash_tr8(device const int8_t *q8 [[buffer(0)]], device const int8_t *K8 [[buffer(1)]], device const half *V [[buffer(2)]],
+                          device const uint *sel_all [[buffer(3)]], device const uint *nsel_all [[buffer(4)]],
+                          device half *out [[buffer(5)]], constant qsa_pf_args *aa [[buffer(6)]],
+                          device const half *qg [[buffer(7)]], constant uint &gated [[buffer(8)]],
+                          device const float *qs [[buffer(9)]], device const float *ks [[buffer(10)]],
+                          uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int NTH = TR_NSG * 32, NS = TR_QCH / TR_NSG, DS = HD / TR_NSG;
+    threadgroup half p[16 * TR_QCH];
+    threadgroup int cid[2][TR_QCH];
+    threadgroup float csk[2][TR_QCH]; // 這段、下一段 token 的 K scale（不可見 = 0）
+    threadgroup float pm[TR_NSG][16], ps[TR_NSG][16];
+    const uint g = tg.x, t = tg.y;
+    constant qsa_pf_args &a = aa[t];
+    device const uint *sel = sel_all + (ulong)t * SEL;
+    const uint nsel = a.sparse ? nsel_all[t] : 0, ntok = a.ntok;
+    const int nch = (int)((ntok + TR_QCH - 1) / TR_QCH);
+    using T2 = dextents<int32_t, 2>;
+    auto tok_of = [&](int c) -> int { return c < (int)ntok ? pf_tok((uint)c, sel, nsel, a) : -1; };
+
+    constexpr auto dS = matmul2d_descriptor(16, NS, QK8_KC, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto dO = matmul2d_descriptor(16, DS, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<dS, execution_simdgroup> opS;
+    matmul2d<dO, execution_simdgroup> opO;
+    tensor<device int8_t, T2, tensor_inline> tQ((device int8_t *)q8 + ((ulong)t * QH + g * GQA) * HD, T2(HD, GQA));
+    tensor<threadgroup half, T2, tensor_inline> tP(p, T2(TR_QCH, 16));
+    auto rv = opO.template get_right_input_cooperative_tensor<half, half, float>();
+    auto rk = opS.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+    auto tPh = tP.template slice<32, 16>(0, 0);
+    auto tA0 = tQ.template slice<QK8_KC, 16>(0, 0);
+    auto tot = opO.template get_destination_cooperative_tensor<__tensor_ops_detail::__remove_addrspace_t<decltype(tPh)>,
+                                                               __tensor_ops_detail::__remove_addrspace_t<decltype(rv)>, float>();
+    for (uint16_t i = 0; i < tot.get_capacity(); ++i) tot[i] = 0.0f;
+    const int d0 = sg * DS;
+    const ulong rs = KVH * HD;
+    device const int8_t *Kg = K8 + g * HD;
+    device const half *Vg = V + g * HD + d0;
+    const uint r0 = ((lane >> 1) & 3) + 4 * (lane >> 4);
+    const bool wr = (lane & 9) == 0;
+    // 這個 lane 兩列的 q scale（列 ≥ GQA 不可見，scale 不用）
+    device const float *qsr = qs + (ulong)t * QH + g * GQA;
+    const float q0s = r0 < GQA ? qsr[r0] * 0.0625f : 0.0f, q1s = r0 + 8 < GQA ? qsr[r0 + 8] * 0.0625f : 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    for (int j = tid; j < TR_QCH; j += NTH) {
+        const int id = tok_of(j);
+        cid[0][j] = id;
+        csk[0][j] = id >= 0 ? ks[(ulong)id * KVH + g] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int ch = 0; ch < nch; ++ch) {
+        const int c0 = ch * TR_QCH, nc = min(TR_QCH, (int)ntok - c0);
+        threadgroup const int *cc_ = cid[ch & 1];
+        threadgroup const float *ck_ = csk[ch & 1];
+        auto s = opS.template get_destination_cooperative_tensor<__tensor_ops_detail::__remove_addrspace_t<decltype(tA0)>,
+                                                                 __tensor_ops_detail::__remove_addrspace_t<decltype(rk)>, int32_t>();
+        for (uint16_t i = 0; i < s.get_capacity(); ++i) s[i] = 0;
+        for (int k0 = 0; k0 < HD; k0 += QK8_KC) {
+#if QK8_K4 // 每個 lane 連續 4 個元素 = 同一個 token 的連續 4 維（與 half 的 K4 同樣的假設）
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < rk.get_capacity(); i += 4) {
+                const auto ix = rk.get_multidimensional_index(i);
+                const int id = cc_[sg * NS + ix[1]];
+                const char4 w = id >= 0 ? *(device const char4 *)(Kg + (ulong)id * rs + k0 + ix[0]) : char4(0);
+                rk[i] = w.x; rk[i + 1] = w.y; rk[i + 2] = w.z; rk[i + 3] = w.w;
+            }
+#else
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < rk.get_capacity(); ++i) {
+                const auto ix = rk.get_multidimensional_index(i);
+                const int id = cc_[sg * NS + ix[1]];
+                rk[i] = id >= 0 ? Kg[(ulong)id * rs + k0 + ix[0]] : (int8_t)0;
+            }
+#endif
+            auto tA = tQ.template slice<QK8_KC, 16>(k0, 0);
+            opS.run(tA, rk, s);
+        }
+        float x0 = -INFINITY, x1 = -INFINITY;
+        for (uint16_t i = 0; i < s.get_capacity(); ++i) {
+            const auto ix = s.get_multidimensional_index(i); // (token, 列)
+            const bool vis = s.is_valid_element(i) && ix[1] < GQA && sg * NS + ix[0] < nc;
+            const float v = vis ? float(s[i]) * (ix[1] < 8 ? q0s : q1s) * ck_[sg * NS + ix[0]] : -INFINITY;
+            s[i] = as_type<int32_t>(v);
+            if (ix[1] < 8) x0 = max(x0, v);
+            else x1 = max(x1, v);
+        }
+        x0 = max(x0, simd_shuffle_xor(x0, 1));
+        x0 = max(x0, simd_shuffle_xor(x0, 8));
+        x1 = max(x1, simd_shuffle_xor(x1, 1));
+        x1 = max(x1, simd_shuffle_xor(x1, 8));
+        if (wr) { pm[sg][r0] = x0; pm[sg][r0 + 8] = x1; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ch + 1 < nch)
+            for (int j = tid; j < TR_QCH; j += NTH) {
+                const int id = tok_of(c0 + TR_QCH + j);
+                cid[(ch + 1) & 1][j] = id;
+                csk[(ch + 1) & 1][j] = id >= 0 ? ks[(ulong)id * KVH + g] : 0.0f;
+            }
+        float n0 = m0, n1 = m1;
+        for (int k = 0; k < TR_NSG; ++k) { n0 = max(n0, pm[k][r0]); n1 = max(n1, pm[k][r0 + 8]); }
+        const float f0 = n0 == -INFINITY ? 1.0f : exp(m0 - n0), f1 = n1 == -INFINITY ? 1.0f : exp(m1 - n1);
+        float y0 = 0.0f, y1 = 0.0f;
+        for (uint16_t i = 0; i < s.get_capacity(); ++i) {
+            const auto ix = s.get_multidimensional_index(i);
+            const bool lo = ix[1] < 8;
+            const float sv = as_type<float>(s[i]);
+            const float ev = sv == -INFINITY ? 0.0f : exp(sv - (lo ? n0 : n1));
+            if (lo) y0 += ev;
+            else y1 += ev;
+            if (s.is_valid_element(i)) p[ix[1] * TR_QCH + sg * NS + ix[0]] = half(ev);
+        }
+        y0 += simd_shuffle_xor(y0, 1);
+        y0 += simd_shuffle_xor(y0, 8);
+        y1 += simd_shuffle_xor(y1, 1);
+        y1 += simd_shuffle_xor(y1, 8);
+        if (wr) { ps[sg][r0] = y0; ps[sg][r0 + 8] = y1; }
+        m0 = n0;
+        m1 = n1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float z0 = 0.0f, z1 = 0.0f;
+        for (int k = 0; k < TR_NSG; ++k) { z0 += ps[k][r0]; z1 += ps[k][r0 + 8]; }
+        l0 = l0 * f0 + z0;
+        l1 = l1 * f1 + z1;
+        for (uint16_t i = 0; i < tot.get_capacity(); ++i) tot[i] *= tot.get_multidimensional_index(i)[1] < 8 ? f0 : f1;
+        for (int cc = 0; cc < TR_QCH; cc += 32) {
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < rv.get_capacity(); i += 4) {
+                const auto ix = rv.get_multidimensional_index(i);
+                const int id = cc_[cc + ix[1]];
+                const half4 w = id >= 0 ? *(device const half4 *)(Vg + (ulong)id * rs + ix[0]) : half4(0.0h);
+                rv[i] = w.x; rv[i + 1] = w.y; rv[i + 2] = w.z; rv[i + 3] = w.w;
+            }
+            tPh = tP.template slice<32, 16>(cc, 0);
+            opO.run(tPh, rv, tot);
+        }
+    }
+    for (uint16_t i = 0; i < tot.get_capacity(); ++i)
+        if (tot.is_valid_element(i)) {
+            const auto ix = tot.get_multidimensional_index(i);
+            const int h = ix[1];
+            if (h >= GQA) continue;
+            const half o = half(tot[i] / (h < 8 ? l0 : l1));
+            const uint hd = (g * GQA + h) * HD + d0 + ix[0];
+            out[(ulong)t * QH * HD + hd] = gated ? half(float(o) * tr_sigm(float(qg[(ulong)t * 2 * QH * HD + hd + (g * GQA + h) * HD + HD]))) : o;
+        }
+}

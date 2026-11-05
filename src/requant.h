@@ -8,3 +8,7 @@
 #include "model.h"
 
 bool qw_requant4(qw_model *m, const char *sel, char *err, size_t errlen);
+
+// GGUF profile 的 dense 投影另做一份每列對稱 8-bit 的影子（L->i8），只給 prefill 的 INT8 × INT8 GEMM 用；
+// decode / 驗證仍讀原本的 GGUF 區塊。sel：以逗號列出 lin、attn、shared（QW_INT8=1 → 全部）
+bool qw_gguf_c8(qw_model *m, const char *sel, char *err, size_t errlen);

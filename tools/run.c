@@ -177,10 +177,14 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (getenv("QW_PPL")) { // 困惑度：逐 token（decode 路徑），第 i 個位置的 logits 對第 i+1 個 token 的 −log p
+        // QW_PPL_PF=N：前 N 個 token 走批次 prefill（量 prefill 路徑對後續輸出的影響），從位置 N−1 起計分與 dump
+        const int npf = getenv("QW_PPL_PF") ? atoi(getenv("QW_PPL_PF")) : 0;
+        if (npf >= n) { fprintf(stderr, "QW_PPL_PF 必須小於 token 數\n"); return 1; }
         double nll = 0;
         int cnt = 0;
-        for (int i = 0; i + 1 < n; i++) {
-            const float *L = qw_engine_step(e, ids[i], NULL);
+        for (int i = npf > 0 ? npf - 1 : 0; i + 1 < n; i++) {
+            double pms;
+            const float *L = npf > 0 && i == npf - 1 ? qw_engine_prefill(e, ids, npf, NULL, &pms) : qw_engine_step(e, ids[i], NULL);
             if (!L) break;
             static FILE *pd = NULL; // QW_PPL_DUMP=檔案：每個位置的 logits（float32 × 248320）依序寫出，給 tools/vs_strata_logits.py 對照
             if (!pd && getenv("QW_PPL_DUMP")) pd = fopen(getenv("QW_PPL_DUMP"), "wb");
@@ -189,7 +193,7 @@ int main(int argc, char **argv) {
             for (int v = 1; v < 248320; v++) if (L[v] > mx) mx = L[v];
             double z = 0;
             for (int v = 0; v < 248320; v++) z += exp((double)L[v] - mx);
-            if (i >= 32) { nll += log(z) + mx - L[ids[i + 1]]; cnt++; }
+            if (i >= (npf > 0 ? npf - 1 : 32)) { nll += log(z) + mx - L[ids[i + 1]]; cnt++; }
         }
         printf("困惑度：%d 個 token，平均 NLL %.4f，PPL %.3f\n", cnt, nll / cnt, exp(nll / cnt));
         return 0;

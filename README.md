@@ -6,18 +6,41 @@ A Metal inference engine for **Qwen3.8-Flash-Next** on an **Apple M5 Max (128 GB
 
 ## Performance
 
-Qwental runs Strata's default model file, the ISTA-DASLab GSQ-RCO **IQ3_S GGUF**, unchanged: same weights, FP16 compute. Measured against Strata on the same machine (`bench/vs_iq3s.sh 3`, medians of three alternating rounds, tokens/s):
+Qwental runs Strata's default model file, the ISTA-DASLab GSQ-RCO **IQ3_S GGUF**, unchanged: same weights, FP16 compute. Measured against Strata on the same machine (`bench/vs_server.py`, two alternating rounds, mean tokens/s):
 
-| | Strata | Qwental |
-|---|---|---|
-| Decode: prose | 84.0 | **110.5** (+31.5%) |
-| Decode: new code | 123.1 | **126.3** (+2.6%) |
-| Decode: code edits | 148.2 | **173.9** (+17.3%) |
-| Decode after a 10.7K prompt | 79.7 | **93.0** (+16.7%) |
-| Decode after a 47K prompt | 77.9 | **84.3** (+8.2%) |
-| Prefill, 10.7K / 47K | 1217 / 1231 | **1519 / 1520** (+24%) |
+| | Strata | Qwental | Qwental `--int8` |
+|---|---|---|---|
+| Decode: prose | 97.2 | **112.5** (+16%) | |
+| Decode: new code | 142.3 | **153.8** (+8%) | |
+| Decode: code edits | 173.3 | **203.5** (+17%) | |
+| Decode after a 10.7K prompt | 93.9 | **101.3** (+8%) | |
+| Decode after a 47K prompt | 85.9 | **88.3** (+3%) | |
+| Prefill 10.7K | 1473 | 1728 (+17%) | **2750** (+87%) |
+| Prefill 47K | 1461 | 1747 (+20%) | 2541 (+74%); `--int8-qk` **2671** (+83%) |
 
-The output is the same model: over 600 positions of Strata's own output, Qwental's top-1 token matches Strata's every time (`bench/vs_strata_*.py`). Speculative decoding output is identical to greedy output.
+`--int8` does not change decode. Without INT8 flags the output is the same model: over 600 positions of Strata's own output, Qwental's top-1 token matches Strata's every time (`bench/vs_strata_*.py`), and speculative decoding output is identical to greedy output.
+
+Against oMLX 0.7.4 on the same MLX weights (mixed 4/8-bit, Qwental without `--gguf`):
+
+| | oMLX | Qwental | Qwental `--int8` / `--int8-qk` |
+|---|---|---|---|
+| Decode: prose / new code / code edits | 53.4 / 78.4 / 136.4 | **91.8 / 131.9 / 181.5** | |
+| Decode after 10.7K / 47K | 53.8 / 55.3 | **83.0 / 81.1** | |
+| Prefill 10.7K | 1884 | 1950 | 2456 / **2480** |
+| Prefill 47K | 2072 | 2015 | 2526 / **2611** |
+
+### What INT8 costs
+
+The INT8 flags change prefill numerics. Measured on 300 scored positions after an 8K–32K prompt, for code, English and Chinese text (`QW_PPL_PF`, `tools/logit_cmp.py`), against the same build without INT8 (GGUF; on the MLX weights `--int8` keeps top-1 at 96.3%, KL 0.008–0.039):
+
+| | top-1 same | mean KL | perplexity |
+|---|---|---|---|
+| `--int8` | 97.9% | 0.006–0.023 | −1.4% to +0.7% |
+| `--int8-qk` | 98.0% | 0.005–0.018 | −1.2% to +1.3% |
+| `--int8-hyper` | 96.7% | 0.006–0.066 | up to +7.6% (English text) |
+| For scale: MLX 4/8-bit vs the IQ3_S GGUF | 93.3% | 0.038–0.141 | −5.0% to +7.1% |
+
+`--int8` and `--int8-qk` stay well inside the gap between two quantizations of the same model; `--int8-hyper` does not, and is experimental.
 
 ## Quick start
 
@@ -42,6 +65,9 @@ Model files in `models/`:
 - OpenAI Chat Completions: `/v1/chat/completions`
 - Prefix cache with multiple KV slots and SSD-backed snapshots
 - Use Claude Code or any Anthropic/OpenAI client as the front end
+- `--int8`: INT8 prefill for expert matrices (and dense matrices with `--gguf`), about 25–60% faster on long prompts. Decode is unchanged; outputs differ slightly from the default (see "What INT8 costs"). With `--gguf` it uses 3 GB more memory.
+- `--int8-qk` / `--int8-hyper`: on top of `--int8`, also run the attention Q·Kᵀ (`qk`) or the hyper-connection mix_down (`hyper`, `--gguf` only) in INT8. Each implies `--int8`. `--int8-qk` helps mostly on long prompts at about the same quality as `--int8`; `--int8-hyper` is experimental (it hurt English text in testing).
+- `--fast-head` (with `--gguf`): runs the Q6_K lm_head on the matrix units with FP16-rounded weights, as llama.cpp does. Faster speculative verification; outputs can differ from the default at near-ties.
 
 ## Features
 

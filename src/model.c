@@ -70,7 +70,7 @@ static qw_qlin qlin(ctx *c, int bits, int out, int in, int ne, const char *fmt, 
     va_start(ap, fmt);
     vsnprintf(base, sizeof base, fmt, ap);
     va_end(ap);
-    qw_qlin q = {NULL, NULL, NULL, bits, out, in, ne, false, NULL, 0};
+    qw_qlin q = {NULL, NULL, NULL, bits, out, in, ne, false, NULL, 0, NULL, false};
     snprintf(name, sizeof name, "%s.weight", base);
     q.w = find(c, name);
     if (q.w && q.w->gq) { // GGUF 格式：原始區塊（或 BF16），沒有 scales / biases

@@ -24,13 +24,15 @@ enum {
 };
 
 // 一個量化線性層（MLX affine，group 64）。ne > 1 時是多個 expert 疊在一起。
-typedef struct {
+typedef struct qw_qlin {
     const st_tensor *w, *s, *b; // weight（U32）、scales、biases（BF16）
     int bits, out, in, ne;
     bool chan; // 每列對稱 8-bit（每組 scale 相同、bias = −128·scale）：prefill 可走 INT8 × INT8
     const void *rsum_t; // chan 時：每列 Σ(q − 128)（int32 [列]，st_tensor）
     int gq;             // GGUF 格式：ggml type + 1（0 = MLX affine）。此時 w 是原始區塊 [ne?·out][每列位元組]、s / b 為 NULL、bits = 0；
                         // BF16 矩陣也走這裡（gq = 31）
+    const struct qw_qlin *i8; // GGUF 的 INT8 影子（QW_INT8）：每列對稱 8-bit（chan、沒有 bias），只給 prefill 用；NULL = 沒有
+    bool kn; // w 排成 [in][out]（只有 GGUF 的 INT8 影子：每列對稱 8-bit，prefill 的右運算元不轉置）
 } qw_qlin;
 
 // 一個不量化的 tensor（BF16 / F32 / I64）

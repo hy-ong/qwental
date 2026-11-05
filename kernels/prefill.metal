@@ -194,14 +194,33 @@ inline void rope_pair(thread float &a, thread float &b, uint d, uint pos, float 
     b = x2 * c + x1 * s;
 }
 
+// RoPE 的 cos / sin 表：rcs[t][d] = (cos, sin)(θ^(−2d/RD)·(pos0 + t))，d < 32（RD = 64、θ = 1e7，attention 與 indexer 相同）。
+// 與 rope_pair 同一個算式（結果逐位元相同）。位置大時 sin / cos 的引數化簡很慢（pos ≥ 32768 時 p_attn_prep 慢約 2 倍），
+// 原本每個 token 的 24 + 2 個 head（加上 indexer 4 個）各算一次，現在每段每個位置只算一次。grid：(32, T)
+kernel void p_rope_tab(device float2 *rcs [[buffer(0)]], constant uint &pos0 [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    constexpr uint RD = 64;
+    constexpr float THETA = 10000000.0f;
+    const uint d = gid.x, t = gid.y;
+    const float f = pow(THETA, -float(2 * d) / float(RD)) * float(pos0 + t);
+    rcs[t * (RD / 2) + d] = float2(cos(f), sin(f));
+}
+
+// rope_pair 的後半：用查表的 (cos, sin) 旋轉。fma 的位置照編譯器對 rope_pair 的收縮方式寫死
+// （a = fma(x1, c, −x2·s)、b = fma(x1, s, x2·c)），結果才與 rope_pair 逐位元相同（寫成 x1 * c − x2 * s 會差 1 ulp）
+inline void rope_cs(thread float &a, thread float &b, float2 cs) {
+    const float c = cs.x, s = cs.y;
+    const float x1 = a, x2 = b;
+    a = fma(x1, c, -(x2 * s));
+    b = fma(x1, s, x2 * c);
+}
+
 // q/k 的 RMSNorm + RoPE，k、v 寫進 cache。grid：(24 + 2, T) × 256。qg：[T][12288]，kin/vin：[T][512]
 // norm 權重型別 NT：MLX 是 bfloat，GGUF profile 是 float（_f 版）
 template <typename NT>
 inline void p_attn_prep_body(device const half *qg, device const half *kin, device const half *vin, device const NT *qn,
-                             device const NT *kn, device half *q, device half *Kc, device half *Vc, uint pos0, uint2 tg, uint tid,
-                             threadgroup float *tmp, threadgroup float *v) {
+                             device const NT *kn, device half *q, device half *Kc, device half *Vc, device const float2 *rcs,
+                             uint pos0, uint2 tg, uint tid, threadgroup float *tmp, threadgroup float *v) {
     constexpr uint HD = 256, QH = 24, KVH = 2, RD = 64;
-    constexpr float THETA = 10000000.0f;
     const uint hh = tg.x, t = tg.y, pos = pos0 + t;
     const bool isq = hh < QH;
     const uint kh = hh - QH;
@@ -211,7 +230,7 @@ inline void p_attn_prep_body(device const half *qg, device const half *kin, devi
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < RD / 2) {
         float a = v[tid], b = v[tid + RD / 2];
-        rope_pair(a, b, tid, pos, THETA, RD);
+        rope_cs(a, b, rcs[t * (RD / 2) + tid]);
         v[tid] = a;
         v[tid + RD / 2] = b;
     }
@@ -227,9 +246,10 @@ inline void p_attn_prep_body(device const half *qg, device const half *kin, devi
     kernel void NAME(device const half *qg [[buffer(0)]], device const half *kin [[buffer(1)]], device const half *vin [[buffer(2)]], \
                      device const NT *qn [[buffer(3)]], device const NT *kn [[buffer(4)]], device half *q [[buffer(5)]],             \
                      device half *Kc [[buffer(6)]], device half *Vc [[buffer(7)]], constant uint &pos0 [[buffer(8)]],                \
-                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {                         \
+                     device const float2 *rcs [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]],                              \
+                     uint tid [[thread_index_in_threadgroup]]) {                                                                     \
         threadgroup float tmp[32], v[256];                                                                                            \
-        p_attn_prep_body<NT>(qg, kin, vin, qn, kn, q, Kc, Vc, pos0, tg, tid, tmp, v);                                                 \
+        p_attn_prep_body<NT>(qg, kin, vin, qn, kn, q, Kc, Vc, rcs, pos0, tg, tid, tmp, v);                                            \
     }
 P_ATTN_PREP(p_attn_prep, bfloat)
 P_ATTN_PREP(p_attn_prep_f, float)

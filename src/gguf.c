@@ -294,6 +294,7 @@ bool qw_gguf_attach(st_model *st, qw_model *m, const char *dir, unsigned parts, 
                 const uint64_t pg = (uint64_t)getpagesize(), mlo = tlo / pg * pg;
                 void *tab = mmap(NULL, thi - mlo, PROT_READ, MAP_SHARED, g->fd, (off_t)mlo);
                 if (tab == MAP_FAILED) { snprintf(err, errlen, "GGUF：PLE 表 mmap 失敗"); return false; }
+                madvise(tab, thi - mlo, MADV_RANDOM); // 隨機讀幾列：不要預讀（見 engine.c 的 ngram_table.bin）
                 int qb, bb;
                 qw_ggml_block((int)g->t[k].type, &qb, &bb);
                 m->ple_tab = (const uint8_t *)tab + (tlo - mlo);

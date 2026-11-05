@@ -233,7 +233,7 @@ bool qw_dflash_load(qw_model *m, const char *pack, const char *vocab, qw_dflash 
                 q40_row_split(src + r * (size_t)(cols / 32) * 18, cols, (uint8_t *)tw->data + r * (size_t)(cols / 2),
                               (uint16_t *)td->data + r * (size_t)(cols / 32));
             });
-            if (Q) *Q = (qw_qlin){tw, td, NULL, 4, rows, cols, 1, false, NULL, 0}; // b = NULL、bits = 4：Q4_0 拆開版（df_q4）
+            if (Q) *Q = (qw_qlin){tw, td, NULL, 4, rows, cols, 1, false, NULL, 0, NULL, false}; // b = NULL、bits = 4：Q4_0 拆開版（df_q4）
         } else if (!strcmp(E->dtype, "q4_0")) {
             const int rows = E->rows, cols = E->cols;
             const uint64_t o = where[i], os = o + al((uint64_t)rows * cols), ob = os + al((uint64_t)rows * (cols / 64) * 2);
@@ -244,7 +244,7 @@ bool qw_dflash_load(qw_model *m, const char *pack, const char *vocab, qw_dflash 
                 q40_row_to_q8(src + r * (size_t)(cols / 32) * 18, cols, (uint32_t *)tw->data + r * (cols / 4),
                               (uint16_t *)ts->data + r * (cols / 64), (uint16_t *)tb->data + r * (cols / 64));
             });
-            if (Q) *Q = (qw_qlin){tw, ts, tb, 8, rows, cols, 1, false, NULL, 0};
+            if (Q) *Q = (qw_qlin){tw, ts, tb, 8, rows, cols, 1, false, NULL, 0, NULL, false};
         } else {
             st_tensor *t = T_(E->name, !strcmp(E->dtype, "bf16") ? ST_BF16 : ST_F32, E->rows, E->cols, where[i], E->bytes);
             memcpy(map + where[i], src, E->bytes);
@@ -264,7 +264,7 @@ bool qw_dflash_load(qw_model *m, const char *pack, const char *vocab, qw_dflash 
         dispatch_apply((size_t)d->nv, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
             memcpy((uint8_t *)tw->data + i * grb, (const uint8_t *)LH->w->data + (size_t)vids[i] * grb, grb);
         });
-        d->head = (qw_qlin){tw, NULL, NULL, 0, d->nv, LH->in, 1, false, NULL, LH->gq};
+        d->head = (qw_qlin){tw, NULL, NULL, 0, d->nv, LH->in, 1, false, NULL, LH->gq, NULL, false};
         st_tensor *tv = T_("df.vocab", ST_U32, d->nv, 1, vocab_off, (uint64_t)d->nv * 4);
         memcpy((void *)tv->data, vids, (size_t)d->nv * 4);
         d->vocab = tv;
@@ -280,7 +280,7 @@ bool qw_dflash_load(qw_model *m, const char *pack, const char *vocab, qw_dflash 
             memcpy((uint16_t *)ts->data + (size_t)i * ng, (const uint16_t *)LH->s->data + (size_t)id * ng, (size_t)ng * 2);
             memcpy((uint16_t *)tb->data + (size_t)i * ng, (const uint16_t *)LH->b->data + (size_t)id * ng, (size_t)ng * 2);
         }
-        d->head = (qw_qlin){tw, ts, tb, hb, d->nv, LH->in, 1, false, NULL, 0};
+        d->head = (qw_qlin){tw, ts, tb, hb, d->nv, LH->in, 1, false, NULL, 0, NULL, false};
         st_tensor *tv = T_("df.vocab", ST_U32, d->nv, 1, vocab_off, (uint64_t)d->nv * 4);
         memcpy(tv->data ? (void *)tv->data : NULL, vids, (size_t)d->nv * 4);
         d->vocab = tv;
