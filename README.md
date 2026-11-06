@@ -55,9 +55,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 ```
 
 Model files in `models/`:
-- the IQ3_S GGUF (two shards of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`)
-- `Qwen3.8-Flash-Next-mixed-4-8bit/` from [`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit`](https://huggingface.co/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit) (tokenizer and config)
-- `dflash2/` with the DFlash2 drafter pack (`…q4_0-selq4.pack`)
+- the IQ3_S GGUF (two shards of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`); with `--gguf`, the tokenizer is read from the GGUF metadata (token ids identical to `tokenizer.json`)
+- `dflash2/` with the DFlash2 drafter pack (`…q4_0-selq4.pack`), next to the GGUF directory (or next to the MLX directory when there is one)
+- optional: `Qwen3.8-Flash-Next-mixed-4-8bit/` from [`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit`](https://huggingface.co/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit), needed only to run the MLX weights (without `--gguf`). When it is present, its tokenizer is used.
 
 ## Server
 
@@ -68,6 +68,7 @@ Model files in `models/`:
 - `--int8`: INT8 prefill for expert matrices (and dense matrices with `--gguf`), about 25–60% faster on long prompts. Decode is unchanged; outputs differ slightly from the default (see "What INT8 costs"). With `--gguf` it uses 3 GB more memory.
 - `--int8-qk` / `--int8-hyper`: on top of `--int8`, also run the attention Q·Kᵀ (`qk`) or the hyper-connection mix_down (`hyper`, `--gguf` only) in INT8. Each implies `--int8`. `--int8-qk` helps mostly on long prompts at about the same quality as `--int8`; `--int8-hyper` is experimental (it hurt English text in testing).
 - `--fast-head` (with `--gguf`): runs the Q6_K lm_head on the matrix units with FP16-rounded weights, as llama.cpp does. Faster speculative verification; outputs can differ from the default at near-ties.
+- `--exact-spec` (MLX weights): makes speculative decoding produce exactly the greedy output. MLX outputs differ slightly from the default; GGUF is unaffected (already exact).
 
 ## Features
 
@@ -78,7 +79,6 @@ Model files in `models/`:
 ## Limits
 
 - One model, one machine (M5 Max), one request at a time
-- The MLX model directory is still required for the tokenizer
 
 ## License
 

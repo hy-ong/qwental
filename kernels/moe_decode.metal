@@ -14,6 +14,9 @@
 // 主程式注入：E、TOPK、D（hidden）、I（expert 中間維度）、RPS（每個 SIMD group 算幾列）
 
 #include <metal_stdlib>
+#ifdef QW_STRICT // MLX profile（主程式注入）：safe 數學模式，不重排加總。驗證（NB 個 token）與逐 token decode 的同一段算式才會逐位元相同，
+#pragma METAL fp math_mode(safe) // 推測解碼的輸出 = greedy。fast 模式下編譯器依情境（token 迴圈、展開）重排，兩邊捨入不同
+#endif
 using namespace metal;
 
 #define GS 64

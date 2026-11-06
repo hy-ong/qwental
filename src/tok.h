@@ -1,4 +1,4 @@
-// Qwen 的 byte-level BPE tokenizer（讀模型目錄的 vocab.json、merges.txt、tokenizer.json 的特殊 token）
+// Qwen 的 byte-level BPE tokenizer（讀模型目錄的 vocab.json、merges.txt、tokenizer.json 的特殊 token，或 GGUF 的 tokenizer.ggml.*）
 // 限制：不做 NFC 正規化（輸入假設已經是 NFC；一般程式碼、英文、中日韓文都是）
 #pragma once
 #include <stddef.h>
@@ -7,6 +7,10 @@
 typedef struct qw_tok qw_tok;
 
 qw_tok *qw_tok_open(const char *model_dir, char *err, size_t errlen);
+// 從 GGUF 的 tokenizer.ggml.*（tokens、token_type、merges）讀；path 是 .gguf 檔或放分片的目錄。結果與 tokenizer.json 版相同
+qw_tok *qw_tok_open_gguf(const char *path, char *err, size_t errlen);
+// model_dir 有 vocab.json（或沒給 gguf）就用 qw_tok_open，否則用 gguf 的 tokenizer
+qw_tok *qw_tok_open_any(const char *model_dir, const char *gguf, char *err, size_t errlen);
 void qw_tok_close(qw_tok *t);
 
 // 文字 → token id。特殊 token（<|im_start|> 等）原樣出現在文字裡時直接對應。

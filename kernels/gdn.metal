@@ -601,4 +601,282 @@ kernel void gdn_scan2(device half *Wh [[buffer(0)]],      // tensor 需要非 co
     }
     sT.store(tSblk);
 }
+
+// scan2s（QW_GDN_CHUNK=1）：跟 scan2 相同的三個矩陣乘法，但每個 SIMD group 各自算一塊（execution_simdgroup），
+// 不用 execution_simdgroups<8> 的整組運算：Δ、O 各切成 2 × 4 塊 32 × 16，狀態 S 切成 4 × 2 塊 32 × 32 留在各自的暫存器
+#define S2_DM 32
+#define S2_DN 16
+#define S2_SM 32
+#define S2_SN 32
+kernel void gdn_scan2s(device half *Wh [[buffer(0)]],
+                       device float *Uf [[buffer(1)]],
+                       device half *QA [[buffer(2)]],
+                       device half *Kt [[buffer(3)]],
+                       device const float *gCi [[buffer(4)]],
+                       device float *S [[buffer(5)]],
+                       device half *o [[buffer(6)]],
+                       constant gdn_chunk_args &args [[buffer(7)]],
+                       constant uint &t_base [[buffer(8)]],
+                       device float *Ssnap [[buffer(9)]],
+                       constant gdn_snap_args &snap [[buffer(10)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]]) {
+    static_assert(C == 2 * S2_DM && DVB == 4 * S2_DN && DK == 4 * S2_SM && DVB == 2 * S2_SN, "scan2s 的切法假設 C = DVB = 64、DK = 128");
+    using T2 = dextents<int32_t, 2>;
+    const uint hv = tg.x, dv0 = tg.y * DVB;
+    threadgroup half SD[(DK + C) * DVB]; // 列 0..DK-1 是 S（FP16 副本），列 DK.. 是 Δ
+    threadgroup half *Db = SD + DK * DVB;
+    // 這個 SIMD group 負責的塊：Δ / O 的 (dm, dn)，S 的 (sm, sn)
+    const uint dm = (sg / 4) * S2_DM, dn = (sg % 4) * S2_DN;
+    const uint sm = (sg / 2) * S2_SM, sn = (sg % 2) * S2_SN;
+
+    tensor<threadgroup half, T2, tensor_inline> tSc(SD + dn, T2(S2_DN, DK), array<int, 2>{1, DVB});      // S 的 dn.. 欄
+    tensor<threadgroup half, T2, tensor_inline> tSDc(SD + dn, T2(S2_DN, DK + C), array<int, 2>{1, DVB}); // [S ; Δ] 的 dn.. 欄
+    tensor<threadgroup half, T2, tensor_inline> tDc(Db + sn, T2(S2_SN, C), array<int, 2>{1, DVB});       // Δ 的 sn.. 欄
+    tensor<device float, T2, tensor_inline> tSdev(S + (ulong)hv * DK * DV, T2(DV, DK));
+    auto tSblk = tSdev.slice(dv0 + sn, sm);
+
+    constexpr auto dD = matmul2d_descriptor(S2_DM, S2_DN, DK);
+    matmul2d<dD, execution_simdgroup> opD;
+    constexpr auto dO = matmul2d_descriptor(S2_DM, S2_DN, DK + C);
+    matmul2d<dO, execution_simdgroup> opO;
+    constexpr auto dS = matmul2d_descriptor(S2_SM, S2_SN, C, true, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<dS, execution_simdgroup> opS;
+
+    using tdev_t = tensor<device half, T2, tensor_inline>;
+    auto sT = opS.get_destination_cooperative_tensor<tdev_t, decltype(tDc), float>();
+    sT.load(tSblk);
+#pragma unroll
+    for (uint16_t i = 0; i < sT.get_capacity(); ++i)
+        if (sT.is_valid_element(i)) {
+            auto ix = sT.get_multidimensional_index(i);
+            SD[(sm + ix[1]) * DVB + sn + ix[0]] = half(sT[i]);
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = 0; c < args.nchunk; c++) {
+        const ulong base = ((ulong)c * HV + hv);
+        tdev_t tW(Wh + base * C * DK + dm * DK, T2(DK, S2_DM));
+        tensor<device float, T2, tensor_inline> tU(Uf + base * C * DV, T2(DV, C));
+        auto tUblk = tU.slice(dv0 + dn, dm);
+        tdev_t tQA(QA + base * C * (DK + C) + dm * (DK + C), T2(DK + C, S2_DM));
+        tdev_t tK(Kt + base * C * DK + sm, T2(S2_SM, C), array<int, 2>{1, DK}); // Kt 的 sm.. 欄（左邊轉置後是 Ktᵀ 的 sm.. 列）
+
+        // 1. Δ = U − W S
+        auto dT = opD.get_destination_cooperative_tensor<tdev_t, decltype(tSc), float>();
+#pragma unroll
+        for (uint16_t i = 0; i < dT.get_capacity(); ++i)
+            if (dT.is_valid_element(i)) dT[i] = 0;
+        opD.run(tW, tSc, dT);
+        auto uT = opD.get_destination_cooperative_tensor<tdev_t, decltype(tSc), float>();
+        uT.load(tUblk);
+#pragma unroll
+        for (uint16_t i = 0; i < dT.get_capacity(); ++i)
+            if (dT.is_valid_element(i)) {
+                auto ix = dT.get_multidimensional_index(i);
+                Db[(dm + ix[1]) * DVB + dn + ix[0]] = half(uT[i] - dT[i]);
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. O = [γQ | A] × [S ; Δ]
+        auto oT = opO.get_destination_cooperative_tensor<tdev_t, decltype(tSDc), float>();
+#pragma unroll
+        for (uint16_t i = 0; i < oT.get_capacity(); ++i)
+            if (oT.is_valid_element(i)) oT[i] = 0;
+        opO.run(tQA, tSDc, oT);
+#pragma unroll
+        for (uint16_t i = 0; i < oT.get_capacity(); ++i)
+            if (oT.is_valid_element(i)) {
+                auto ix = oT.get_multidimensional_index(i);
+                const ulong t = t_base + c * C + dm + ix[1];
+                o[(t * HV + hv) * DV + dv0 + dn + ix[0]] = half(oT[i]);
+            }
+
+        // 3. S = γ_C S + Ktᵀ Δ
+        const float gC = gCi[base];
+#pragma unroll
+        for (uint16_t i = 0; i < sT.get_capacity(); ++i)
+            if (sT.is_valid_element(i)) sT[i] *= gC;
+        opS.run(tK, tDc, sT);
+        threadgroup_barrier(mem_flags::mem_threadgroup); // 所有人都讀完舊的 S、Δ
+#pragma unroll
+        for (uint16_t i = 0; i < sT.get_capacity(); ++i)
+            if (sT.is_valid_element(i)) {
+                auto ix = sT.get_multidimensional_index(i);
+                SD[(sm + ix[1]) * DVB + sn + ix[0]] = half(sT[i]);
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < snap.n; k++)
+            if (c + 1 == snap.chunk[k]) {
+                tensor<device float, T2, tensor_inline> tK2(Ssnap + (ulong)k * snap.stride + (ulong)hv * DK * DV, T2(DV, DK));
+                auto blk = tK2.slice(dv0 + sn, sm);
+                sT.store(blk);
+            }
+    }
+    sT.store(tSblk);
+}
+
+// prep3s（QW_GDN_CHUNK=1）：跟 prep3 相同，但矩陣乘法改成每個 SIMD group 各算一塊（execution_simdgroup）
+kernel void gdn_prep3s(device half *q [[buffer(0)]],
+                      device half *k [[buffer(1)]],
+                      device half *v [[buffer(2)]],
+                      device const float *a [[buffer(3)]],
+                      device const float *beta [[buffer(4)]],
+                      device half *Wh [[buffer(5)]],
+                      device float *Uf [[buffer(6)]],
+                      device half *QA [[buffer(7)]],
+                      device half *Kt [[buffer(8)]],
+                      device float *gCo [[buffer(9)]],
+                      constant gdn_chunk_args &args [[buffer(10)]],
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint NT = 256;
+    const uint c = tg.x, hv = tg.y, hk = HK_OF(hv);
+    const uint t0 = c * C;
+    threadgroup float G[C], B[C];
+    threadgroup float Xf[C * C];                       // L → X（FP32）
+    threadgroup half *Xb = (threadgroup half *)Xf;     // 之後重用：X·diag(β)
+    threadgroup half *Xg = Xb + C * C;                 //           X·diag(βγ)
+
+    // 塊內前綴和：兩個 SIMD group 各做 32 個，再補上前半段的總和
+    if (tid < C) {
+        B[tid] = beta[(ulong)(t0 + tid) * HV + hv];
+        float x = a[(ulong)(t0 + tid) * HV + hv];
+        G[tid] = simd_prefix_inclusive_sum(x);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid >= 32 && tid < C) G[tid] += G[31];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong base = ((ulong)c * HV + hv);
+    device half *qa = QA + base * C * (DK + C);
+    using T2 = dextents<int32_t, 2>;
+
+    // KKᵀ 與 QKᵀ（[C × DK] × [DK × C]，右邊轉置）：每個 SIMD group 一塊 32 × 16（列 dm..、欄 dn..）
+    const uint dm = (sg / 4) * 32, dn = (sg % 4) * 16;
+    tensor<device half, T2, tensor_inline> tKm(k + ((ulong)(t0 + dm) * HK + hk) * DK, T2(DK, 32), array<int, 2>{1, HK * DK});
+    tensor<device half, T2, tensor_inline> tQm(q + ((ulong)(t0 + dm) * HK + hk) * DK, T2(DK, 32), array<int, 2>{1, HK * DK});
+    tensor<device half, T2, tensor_inline> tKn(k + ((ulong)(t0 + dn) * HK + hk) * DK, T2(DK, 16), array<int, 2>{1, HK * DK});
+    constexpr auto dKK = matmul2d_descriptor(32, 16, DK, false, true);
+    matmul2d<dKK, execution_simdgroup> opKK;
+    {
+        auto kk = opKK.get_destination_cooperative_tensor<decltype(tKm), decltype(tKn), float>();
+#pragma unroll
+        for (uint16_t i = 0; i < kk.get_capacity(); ++i)
+            if (kk.is_valid_element(i)) kk[i] = 0;
+        opKK.run(tKm, tKn, kk);
+#pragma unroll
+        for (uint16_t i = 0; i < kk.get_capacity(); ++i)
+            if (kk.is_valid_element(i)) {
+                auto ix = kk.get_multidimensional_index(i);
+                const uint r = dm + ix[1], j = dn + ix[0];
+                Xf[r * C + j] = j < r ? B[r] * kk[i] * exp(G[r] - G[j]) : 0.0f;
+            }
+        auto qk = opKK.get_destination_cooperative_tensor<decltype(tQm), decltype(tKn), float>();
+#pragma unroll
+        for (uint16_t i = 0; i < qk.get_capacity(); ++i)
+            if (qk.is_valid_element(i)) qk[i] = 0;
+        opKK.run(tQm, tKn, qk);
+#pragma unroll
+        for (uint16_t i = 0; i < qk.get_capacity(); ++i)
+            if (qk.is_valid_element(i)) {
+                auto ix = qk.get_multidimensional_index(i);
+                const uint r = dm + ix[1], j = dn + ix[0];
+                qa[r * (DK + C) + DK + j] = half(j <= r ? qk[i] * exp(G[r] - G[j]) : 0.0f);
+            }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 區塊求逆 X = (I + L)⁻¹，區塊大小 16（C = 64 → 4×4 個區塊）
+    // 1) 對角區塊：SIMD group b 負責第 b 個，16 步前向代換，只需 SIMD group 內同步
+    {
+        constexpr uint NB = 16;
+        if (sg < C / NB && lane < NB) {
+            const uint r0 = sg * NB, col = lane;
+            for (uint i2 = 0; i2 < NB; i2++) {
+                float val = (col == i2) ? 1.0f : 0.0f;
+                for (uint j = col; j < i2; j++) val -= Xf[(r0 + i2) * C + r0 + j] * Xf[(r0 + j) * C + r0 + col];
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                Xf[(r0 + i2) * C + r0 + col] = val;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // 2) 非對角區塊：X_IJ = −X_II · Σ_{K=J}^{I−1} L_IK X_KJ
+        //    依列區塊 I 由上到下、同一列內 J 由左到右；X_IJ 寫回 (I,J) 之後，
+        //    同一列後面的區塊只會用到 K ≥ J' > J 的 L，所以就地覆寫是安全的。
+        const uint r = tid / NB, cc = tid % NB; // 每個執行緒負責區塊內的一個元素
+        for (uint I = 1; I < C / NB; I++)
+            for (uint J = 0; J < I; J++) {
+                float t = 0;
+                for (uint K = J; K < I; K++) {
+                    const uint kk0 = K * NB;
+                    for (uint m = 0; m < NB; m++)
+                        t += Xf[(I * NB + r) * C + kk0 + m] * Xf[(kk0 + m) * C + J * NB + cc];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                Xf[(I * NB + r) * C + J * NB + cc] = t; // 暫存 T_IJ
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float x = 0;
+                for (uint m = 0; m < NB; m++) x -= Xf[(I * NB + r) * C + I * NB + m] * Xf[(I * NB + m) * C + J * NB + cc];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                Xf[(I * NB + r) * C + J * NB + cc] = x;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+    }
+    // X 轉成兩份 FP16（先全部讀進暫存器，再覆蓋同一塊記憶體）
+    constexpr uint XPER = C * C / NT;
+    float xr[XPER];
+    for (uint r = 0; r < XPER; r++) xr[r] = Xf[tid + r * NT];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = 0; r < XPER; r++) {
+        const uint e = tid + r * NT, j = e % C;
+        Xb[e] = half(xr[r] * B[j]);
+        Xg[e] = half(xr[r] * B[j] * exp(G[j]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // W = Xg K、U = Xb V（[C × C] × [C × DK]）：每個 SIMD group 一塊 32 × 32（列 wm..、欄 wn..）
+    const uint wm = (sg / 4) * 32, wn = (sg % 4) * 32;
+    tensor<threadgroup half, T2, tensor_inline> tXb(Xb + wm * C, T2(C, 32));
+    tensor<threadgroup half, T2, tensor_inline> tXg(Xg + wm * C, T2(C, 32));
+    tensor<device half, T2, tensor_inline> tKc(k + ((ulong)t0 * HK + hk) * DK + wn, T2(32, C), array<int, 2>{1, HK * DK});
+    tensor<device half, T2, tensor_inline> tVc(v + ((ulong)t0 * HV + hv) * DV + wn, T2(32, C), array<int, 2>{1, HV * DV});
+    constexpr auto dW = matmul2d_descriptor(32, 32, C);
+    matmul2d<dW, execution_simdgroup> opW;
+    {
+        auto w = opW.get_destination_cooperative_tensor<decltype(tXg), decltype(tKc), float>();
+#pragma unroll
+        for (uint16_t i = 0; i < w.get_capacity(); ++i)
+            if (w.is_valid_element(i)) w[i] = 0;
+        opW.run(tXg, tKc, w);
+#pragma unroll
+        for (uint16_t i = 0; i < w.get_capacity(); ++i)
+            if (w.is_valid_element(i)) {
+                auto ix = w.get_multidimensional_index(i);
+                Wh[base * C * DK + (wm + ix[1]) * DK + wn + ix[0]] = half(w[i]);
+            }
+        auto u = opW.get_destination_cooperative_tensor<decltype(tXb), decltype(tVc), float>();
+#pragma unroll
+        for (uint16_t i = 0; i < u.get_capacity(); ++i)
+            if (u.is_valid_element(i)) u[i] = 0;
+        opW.run(tXb, tVc, u);
+        tensor<device float, T2, tensor_inline> tU(Uf + base * C * DV, T2(DV, C));
+        auto tUb = tU.slice(wn, wm);
+        u.store(tUb);
+    }
+
+    // [γQ | …] 的前半與 diag(γ_C/γ) K（逐元素）
+    const float gC = G[C - 1];
+    for (uint e = tid; e < C * DK; e += NT) {
+        const uint i = e / DK, d = e % DK;
+        const ulong idx = ((ulong)(t0 + i) * HK + hk) * DK + d;
+        qa[i * (DK + C) + d] = half(exp(G[i]) * float(q[idx]));
+        Kt[base * C * DK + e] = half(exp(gC - G[i]) * float(k[idx]));
+    }
+    if (tid == 0) gCo[base] = exp(gC);
+}
+
 #endif

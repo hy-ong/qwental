@@ -158,6 +158,64 @@ kernel void p_gdn_in_t(P_GDN_IN_ARGS(float)) {
     p_gdn_in_body(xin, w, st, ain, bin, A, dt_bias, q, k, v, la, be, tg, tid, tmp);
 }
 
+// 同 p_gdn_in，但每個 threadgroup 連續 GDN_TB 個 token（tg.y = token 區塊）：threadgroup 數少 GDN_TB 倍（原版每個 token、
+// 每個 head 一個 128 執行緒的 threadgroup），conv 的 4 個權重與前 3 個輸入留在暫存器裡滑動，每個輸入只讀一次（原版每個值
+// 被 4 個 token 各讀一次）。逐位元相同：conv 寫成明確的 fma 鏈（4096 個 token 實測與原版的捨入相同；寫成普通的
+// a·b + c·d + … 時編譯器依程式脈絡選不同的融合方式，少數元素差 1 ulp），正規化、la / be 與 p_gdn_in_body 同一個式子。
+// grid：(KH + VH, ceil(T / GDN_TB)) × 128
+#define GDN_TB 16
+template <typename AT>
+inline void p_gdn_in_tb_body(device const half *xin, device const bfloat *w, device const float *st, device const half *ain,
+                             device const half *bin, device const AT *A, device const bfloat *dt_bias, device half *q, device half *k,
+                             device half *v, device float *la, device float *be, constant uint &T, uint2 tg, uint tid,
+                             threadgroup float *tmp) {
+    constexpr uint DK = 128, KH = 16, VH = 48, C = 10240;
+    const uint hh = tg.x, t0 = tg.y * GDN_TB, t1 = min(t0 + GDN_TB, T);
+    // 一個 channel 的滑動視窗
+    struct win { float w0, w1, w2, w3, x0, x1, x2; };
+    auto init = [&](uint c) -> win {
+        auto inp = [&](int tt) -> float { return tt >= 0 ? float(xin[(ulong)tt * C + c]) : st[(3 + tt) * C + c]; };
+        return win{float(w[c * 4]), float(w[c * 4 + 1]), float(w[c * 4 + 2]), float(w[c * 4 + 3]), inp((int)t0 - 3), inp((int)t0 - 2),
+                   inp((int)t0 - 1)};
+    };
+    auto step = [&](thread win &s, uint t, uint c) -> float {
+        const float xt = float(xin[(ulong)t * C + c]);
+        const float o = fma(s.w3, xt, fma(s.w2, s.x2, fma(s.w1, s.x1, s.w0 * s.x0)));
+        s.x0 = s.x1, s.x1 = s.x2, s.x2 = xt;
+        return float(half(silu(o)));
+    };
+    if (hh < KH) {
+        const uint cq = hh * DK + tid, ck = KH * DK + hh * DK + tid;
+        win sq = init(cq), sk = init(ck);
+        const float ck2 = rsqrt(float(DK));
+        for (uint t = t0; t < t1; t++) {
+            const float qv = step(sq, t, cq), kv = step(sk, t, ck);
+            const float rq = rsqrt(tg_sum(qv * qv, tmp, tid, DK) / DK + EPS);
+            const float rk = rsqrt(tg_sum(kv * kv, tmp, tid, DK) / DK + EPS);
+            q[((ulong)t * KH + hh) * DK + tid] = half(qv * rq / DK);
+            k[((ulong)t * KH + hh) * DK + tid] = half(kv * rk * ck2);
+            if (hh == 0 && tid < VH) {
+                const float xa = float(ain[(ulong)t * VH + tid]) + float(dt_bias[tid]);
+                const float sp = xa > 20.0f ? xa : log(1.0f + exp(xa));
+                la[(ulong)t * VH + tid] = a_neg(A, tid) * sp;
+                be[(ulong)t * VH + tid] = sigm(float(bin[(ulong)t * VH + tid]));
+            }
+        }
+    } else {
+        const uint j = hh - KH, cv = 2 * KH * DK + j * DK + tid;
+        win sv = init(cv);
+        for (uint t = t0; t < t1; t++) v[((ulong)t * VH + j) * DK + tid] = half(step(sv, t, cv));
+    }
+}
+kernel void p_gdn_in_tb(P_GDN_IN_ARGS(bfloat), constant uint &T [[buffer(12)]]) {
+    threadgroup float tmp[32];
+    p_gdn_in_tb_body(xin, w, st, ain, bin, A, dt_bias, q, k, v, la, be, T, tg, tid, tmp);
+}
+kernel void p_gdn_in_t_tb(P_GDN_IN_ARGS(float), constant uint &T [[buffer(12)]]) {
+    threadgroup float tmp[32];
+    p_gdn_in_tb_body(xin, w, st, ain, bin, A, dt_bias, q, k, v, la, be, T, tg, tid, tmp);
+}
+
 // 更新 conv 狀態：最後 3 個 token 的輸入（T 可能 < 3，要跟舊狀態接起來）。grid：10240
 kernel void p_conv_state(device const half *xin [[buffer(0)]], device float *st [[buffer(1)]], constant uint &T [[buffer(2)]],
                          constant uint &C [[buffer(3)]], uint c [[thread_position_in_grid]]) {

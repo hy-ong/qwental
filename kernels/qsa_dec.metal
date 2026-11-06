@@ -9,6 +9,9 @@
 //   5. qsa_merge4：合併各段並乘上 output gate（k_attn_gate 的 dispatch 拿掉），輸出就是 o_proj 的輸入
 // 主程式注入：QH、KVH、HD、IH、ID、SEL、CR、MAXPER；名稱改名
 #include <metal_stdlib>
+#ifdef QW_STRICT // MLX profile（主程式注入）：safe 數學模式，不重排加總。驗證（NB 個 token）與逐 token decode 的同一段算式才會逐位元相同，
+#pragma METAL fp math_mode(safe) // 推測解碼的輸出 = greedy。fast 模式下編譯器依情境（token 迴圈、展開）重排，兩邊捨入不同
+#endif
 using namespace metal;
 
 #define EPS 1e-6f
@@ -147,6 +150,53 @@ kernel void qsa_score3(device const half *iq [[buffer(0)]], device const half *k
             score[(ulong)t * sstride + n] = v;
             atomic_fetch_add_explicit(&hist[t * NBIN + (as_type<uint>(v) >> HSH)], 1u, memory_order_relaxed);
         }
+    }
+}
+
+// 2b. indexer 分數 v4（驗證 5–8 個 token）：同 qsa_score3，但每個區塊的 nt·IH 個 simd_sum 改成一次 32 個值的 reduce-scatter
+// （第 s 步依 lane 的第 s 位元留下一半、把另一半用 simd_shuffle_xor(·, 2^s) 交給對方，交換從 32 × 5 次降到 31 次）。
+// simd_sum 在這台 GPU 上就是間隔 1、2、4、8、16 的 xor butterfly（主程式啟動時拿亂數與 qsa_score3 逐位元對過，不同就不用），
+// reduce-scatter 用同樣的間隔順序，每個值的加法樹不變，所以分數逐位元相同。之後同一個 token 的 IH 個值用 simd_shuffle
+// 收到同一個 lane（只搬不算），依原本的順序 s = 0 + max(·, 0) + … 加總。不足 8 個 token 的值補 0（不寫出）。
+template <uint W, uint S>
+inline void score4_rs(thread float *v, uint lane) { // 遞迴展開成固定索引（動態索引會讓 v[] 落到記憶體）
+    if constexpr (S < 5) {
+        constexpr ushort m = (ushort)(1u << S);
+        if constexpr (W > 1) {
+            const bool hi = (lane & m) != 0;
+#pragma unroll
+            for (uint q = 0; q < W / 2; q++) {
+                const float lo = v[q], up = v[W / 2 + q];
+                v[q] = (hi ? up : lo) + simd_shuffle_xor(hi ? lo : up, m);
+            }
+            score4_rs<W / 2, S + 1>(v, lane);
+        } else {
+            v[0] += simd_shuffle_xor(v[0], m);
+            score4_rs<1, S + 1>(v, lane);
+        }
+    }
+}
+kernel void qsa_score4(device const half *iq [[buffer(0)]], device const half *kblk [[buffer(1)]], device float *score [[buffer(2)]],
+                       constant qsa_args *aa [[buffer(3)]], constant uint &nt [[buffer(4)]], constant uint &sstride [[buffer(5)]],
+                       device atomic_uint *hist [[buffer(6)]], uint tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint NV = 32;
+    static_assert(IH * 8 == NV, "qsa_score4：8 個 token × IH 個 head = 32");
+    const uint n = tg * 8 + sg;
+    const float4 k = float4(((device const half4 *)(kblk + (ulong)n * ID))[lane]);
+    float v[NV];
+#pragma unroll
+    for (uint j = 0; j < NV; j++) // 第 j 個值 = token j / IH、head j % IH
+        v[j] = j / IH < nt ? dot(float4(((device const half4 *)(iq + (ulong)j * ID))[lane]), k) : 0.0f;
+    score4_rs<NV, 0>(v, lane);
+    const uint j = reverse_bits(lane) >> 27, t = j / IH; // 這個 lane 拿到第 rev(lane) 個值（反轉是自己的反函數）
+    float s = 0;
+#pragma unroll
+    for (uint h = 0; h < IH; h++) s += max(simd_shuffle(v[0], (ushort)(reverse_bits(t * IH + h) >> 27)), 0.0f);
+    if (j % IH == 0 && t < nt && aa[t].sparse && n < aa[t].nvis) {
+        const float x = s * rsqrt(float(ID));
+        score[(ulong)t * sstride + n] = x;
+        atomic_fetch_add_explicit(&hist[t * NBIN + (as_type<uint>(x) >> HSH)], 1u, memory_order_relaxed);
     }
 }
 

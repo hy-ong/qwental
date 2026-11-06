@@ -259,7 +259,7 @@ struct qw_engine {
     int dntap_n;   // 這個 batch 記了幾列
     qw_kernel *qsa_attn, *qsa_merge; // MLX 的 attention 核心（qsa_attn2 / qsa_merge2）
     // QSA v3（kernels/qsa_dec.metal）：decode 與驗證共用
-    qw_kernel *q3_prep[2], *q3_score, *q3_topk[3], *q4_attn, *q4_merge, *q5_attn;
+    qw_kernel *q3_prep[2], *q3_score, *q3_score4, *q3_topk[3], *q4_attn, *q4_merge, *q5_attn;
     qw_buf q3sc, q3sel, q3nsel, q3hist, q4part, q5stat, q5chk;
     qw_kernel *q5_cmp;
 };
@@ -276,12 +276,24 @@ static int q5_tt(void) { const int v = getenv("QW_ATT_TT") ? atoi(getenv("QW_ATT
 // 稀疏 token 的核心：qsa_attn5（QW_ATT4：沿用 qsa_attn4，對照用）
 static bool q5_on(void) { static int v = -1; if (v < 0) v = !getenv("QW_ATT4"); return v; }
 
+// QW_EXACT_SPEC=1（server 的 --exact-spec）：MLX profile 的推測解碼逐位元等於 greedy。
+// MLX profile 的 kernel 加 QW_STRICT（decode / 驗證用到的 .metal 檔改用 safe 數學模式、qmv / qmvb 共用 chunk 寫法，見 engine.metal 開頭），
+// 驗證的 gated norm / output gate 用與 decode 相同的融合算式（vb_xform）。代價：MLX 的 greedy 輸出也跟著變（捨入不同，q300 PPL 1.337 → 1.340）。
+// 預設（不開）與 GGUF profile 不受影響：kernel 原始碼前處理後與 v1.0.0 相同（GGUF 的 kernel 在 fast 模式下本來就逐位元一致）
+static bool exact_on(const qw_engine *e) {
+    static int v = -1;
+    if (v < 0) v = getenv("QW_EXACT_SPEC") && strcmp(getenv("QW_EXACT_SPEC"), "0") != 0;
+    return v && e->m && !e->m->gguf_parts;
+}
+static const char *strict_def(const qw_engine *e) { return exact_on(e) && !getenv("QW_NO_STRICT") ? "#define QW_STRICT 1\n" : ""; }
 static bool compile(qw_engine *e, const char *defs, const char *src, size_t len, char *err, size_t errlen) {
-    size_t dl = strlen(defs);
-    char *buf = malloc(dl + len);
-    memcpy(buf, defs, dl);
-    memcpy(buf + dl, src, len);
-    bool ok = qw_gpu_compile(e->g, buf, dl + len, err, errlen);
+    const char *sd = strict_def(e);
+    size_t sl = strlen(sd), dl = strlen(defs);
+    char *buf = malloc(sl + dl + len);
+    memcpy(buf, sd, sl);
+    memcpy(buf + sl, defs, dl);
+    memcpy(buf + sl + dl, src, len);
+    bool ok = qw_gpu_compile(e->g, buf, sl + dl + len, err, errlen);
     free(buf);
     return ok;
 }
@@ -289,9 +301,11 @@ static bool compile(qw_engine *e, const char *defs, const char *src, size_t len,
 // 多份原始碼接在一起編譯（最後一份的結尾 0 之前都要去掉）
 static bool compile3(qw_engine *e, const char *defs, const char *a, size_t al, const char *b, size_t bl, const char *c, size_t cl,
                      char *err, size_t errlen) {
-    const size_t dl = strlen(defs);
-    char *buf = malloc(dl + al + bl + cl + 3);
+    const char *sd = strict_def(e);
+    const size_t sl = strlen(sd), dl = strlen(defs);
+    char *buf = malloc(sl + dl + al + bl + cl + 3);
     size_t n = 0;
+    memcpy(buf + n, sd, sl); n += sl;
     memcpy(buf + n, defs, dl); n += dl;
     memcpy(buf + n, a, al - 1); n += al - 1; buf[n++] = '\n';
     memcpy(buf + n, b, bl - 1); n += bl - 1; buf[n++] = '\n';
@@ -876,6 +890,51 @@ static bool kv_reserve(qw_engine *e, int need) {
     return true;
 }
 
+// qsa_score4（驗證 5–8 個 token 的 indexer 打分數，reduce-scatter）的前提是 simd_sum 的加法順序與它相同：
+// 啟動時拿亂數與 qsa_score3 比（分數與直方圖逐位元，nt = 5…VBMAX），不同（或跑不了）就一律用 qsa_score3。QW_SCORE3=1：一律用 qsa_score3
+static bool score4_ok(qw_engine *e, qw_kernel *k4) {
+    typedef struct { uint32_t L, pos, nvis, ntok, sparse; } args;
+    enum { NBK = 2048, SST = NBK + 8, NBIN_ = 4096 };
+    if (!k4) return false;
+    qw_buf iq = {0}, kb = {0}, sc[2] = {{0}}, hs[2] = {{0}};
+    bool ok = qw_buf_new(e->g, (size_t)VBMAX * 4 * 128 * 2, &iq) && qw_buf_new(e->g, (size_t)NBK * 128 * 2, &kb);
+    for (int v = 0; v < 2 && ok; v++) ok = qw_buf_new(e->g, (size_t)VBMAX * SST * 4, &sc[v]) && qw_buf_new(e->g, (size_t)VBMAX * NBIN_ * 4, &hs[v]);
+    uint64_t r = 0x9e3779b97f4a7c15ull;
+    for (int i = 0; ok && i < VBMAX * 4 * 128; i++) {
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        ((_Float16 *)iq.ptr)[i] = (_Float16)((double)(r >> 11) / 9007199254740992.0 * 4 - 2);
+    }
+    for (int i = 0; ok && i < NBK * 128; i++) { // 大小不一，讓加法順序造成的捨入差異現形
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        ((_Float16 *)kb.ptr)[i] = (_Float16)(((double)(r >> 11) / 9007199254740992.0 * 2 - 1) * (double)(1 + (r >> 60)));
+    }
+    for (int nt = 5; nt <= VBMAX && ok; nt++) {
+        args aa[VBMAX];
+        for (int t = 0; t < nt; t++) aa[t] = (args){0, 0, (uint32_t)(NBK - 37 * t), 0, t != 1}; // token 1 不稀疏：不寫
+        const uint32_t unt = (uint32_t)nt, sst = SST;
+        for (int v = 0; v < 2 && ok; v++) {
+            memset(sc[v].ptr, 0, sc[v].size);
+            memset(hs[v].ptr, 0, hs[v].size);
+            qw_batch *b = qw_batch_begin(e->g, false);
+            qw_batch_kernel(b, v ? k4 : e->q3_score);
+            qw_batch_buf(b, 0, &iq, 0);
+            qw_batch_buf(b, 1, &kb, 0);
+            qw_batch_buf(b, 2, &sc[v], 0);
+            qw_batch_bytes(b, 3, aa, sizeof(args) * (size_t)nt);
+            qw_batch_bytes(b, 4, &unt, 4);
+            qw_batch_bytes(b, 5, &sst, 4);
+            qw_batch_buf(b, 6, &hs[v], 0);
+            qw_batch_dispatch(b, NBK / 8, 1, 1, 256, 1, 1);
+            ok = qw_batch_end(b) >= 0;
+        }
+        ok = ok && !memcmp(sc[0].ptr, sc[1].ptr, sc[0].size) && !memcmp(hs[0].ptr, hs[1].ptr, hs[0].size);
+    }
+    qw_buf *fb[6] = {&iq, &kb, &sc[0], &sc[1], &hs[0], &hs[1]};
+    for (int i = 0; i < 6; i++) if (fb[i]->handle) qw_buf_free(fb[i]);
+    if (!ok) fprintf(stderr, "qsa_score4 與 qsa_score3 的結果不同（simd_sum 的加法順序與假設不同），indexer 打分數一律用 qsa_score3\n");
+    return ok;
+}
+
 static void ggm_warm(qw_engine *e);
 qw_engine *qw_engine_open(const char *dir, int max_ctx, char *err, size_t errlen) {
     qw_engine *e = calloc(1, sizeof *e);
@@ -919,13 +978,15 @@ qw_engine *qw_engine_open(const char *dir, int max_ctx, char *err, size_t errlen
         return NULL;
     { // DFlash2 drafter：要在包成 Metal buffer 之前（會加一個虛擬分片）
         char dp[4200], vp[4200];
+        // dflash2/ 與模型目錄同層；沒有 MLX 目錄（GGUF profile）時改找 GGUF 目錄的同層
+        const char *ddir = access(dir, F_OK) && getenv("QW_GGUF") ? getenv("QW_GGUF") : dir;
         // 打包檔：QW_DF_PACK 指定；否則優先用 selq4 版（selector codebook 為 Q4_0，與 Strata 預設相同），沒有才用一般版
         if (getenv("QW_DF_PACK")) snprintf(dp, sizeof dp, "%s", getenv("QW_DF_PACK"));
         else {
-            snprintf(dp, sizeof dp, "%s/../dflash2/qwen3.8-flash-next-dflash2.q4_0-selq4.pack", dir);
-            if (access(dp, R_OK)) snprintf(dp, sizeof dp, "%s/../dflash2/qwen3.8-flash-next-dflash2.q4_0.pack", dir);
+            snprintf(dp, sizeof dp, "%s/../dflash2/qwen3.8-flash-next-dflash2.q4_0-selq4.pack", ddir);
+            if (access(dp, R_OK)) snprintf(dp, sizeof dp, "%s/../dflash2/qwen3.8-flash-next-dflash2.q4_0.pack", ddir);
         }
-        snprintf(vp, sizeof vp, "%s/../dflash2/draft_vocab.bin", dir);
+        snprintf(vp, sizeof vp, "%s/../dflash2/draft_vocab.bin", ddir);
         if (!getenv("QW_NO_DFLASH") && access(dp, R_OK) == 0) {
             if (!qw_dflash_load(e->m, dp, vp, &e->df, err, errlen)) return NULL;
             e->df_on = true;
@@ -1001,10 +1062,10 @@ qw_engine *qw_engine_open(const char *dir, int max_ctx, char *err, size_t errlen
         snprintf(defs, sizeof defs,
                  "#define qsa_prep_bf qsa_prep_bf_m%d\n#define qsa_prep_f qsa_prep_f_m%d\n#define qsa_score3 qsa_score3_m%d\n"
                  "#define qsa_topk3 qsa_topk3_m%d\n#define qsa_attn4 qsa_attn4_m%d\n#define qsa_merge4 qsa_merge4_m%d\n"
-                 "#define qsa_attn5 qsa_attn5_m%d\n#define qsa_cmp5 qsa_cmp5_m%d\n"
+                 "#define qsa_attn5 qsa_attn5_m%d\n#define qsa_cmp5 qsa_cmp5_m%d\n#define qsa_score4 qsa_score4_m%d\n"
                  "#define IH 4\n#define ID 128\n#define QH 24\n#define KVH 2\n#define HD 256\n#define SEL 512\n#define CR 4\n#define MAXPER %d\n"
                  "#define NCH4 %d\n#define TT %d\n%s",
-                 maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], q4_nch(), q5_tt(),
+                 maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], maxper[i], q4_nch(), q5_tt(),
                  getenv("QW_Q3X") ? getenv("QW_Q3X") : "");
         if (!compile(e, defs, src_qsa_dec, sizeof src_qsa_dec, err, errlen)) return NULL;
     }
@@ -1043,6 +1104,7 @@ qw_engine *qw_engine_open(const char *dir, int max_ctx, char *err, size_t errlen
         !(e->q5_cmp = need(e, "qsa_cmp5_m8", err, errlen)))
         return NULL;
 
+    if (!getenv("QW_SCORE3") && score4_ok(e, need(e, "qsa_score4_m8", err, errlen))) e->q3_score4 = need(e, "qsa_score4_m8", err, errlen);
     if (e->m->gguf_parts & QW_GG_ATTN) ggm_warm(e);
 
     // ---- 緩衝區
@@ -1671,6 +1733,7 @@ static void dn_tap_flush(qw_engine *e) {
 }
 
 static void deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, int li);
+static bool mlx_xf(const qw_qlin *L);
 
 // ---- GGUF DeltaNet 投影（kernels/dn_proj.metal）：qkv / z（Q4_K、Q5_K、Q6_K、IQ4_XS）+ a / b（BF16）一次 dispatch，out_proj 另一個
 enum { DN_NSG = 8 }; // 純量版：每個 threadgroup 幾個 SIMD group
@@ -1994,7 +2057,7 @@ static void deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, int l
     qw_batch_buf(b, 7, &e->ssp, 0);
     qw_batch_buf(b, 8, &e->S, (size_t)li * 48 * 128 * 128 * 4);
     qw_batch_dispatch(b, 48, 128 / 32, 1, 256, 1, 1);
-    if (!N->out.gq && !getenv("QW_NO_XF")) { // gated RMSNorm 併進 out_proj 的輸入
+    if (mlx_xf(&N->out)) { // gated RMSNorm 併進 out_proj 的輸入（--exact-spec 時驗證用 vb_xform，算式相同）
         qmv_args a = {(uint32_t)N->out.out, 0, (uint32_t)N->out.out, 0};
         qw_batch_kernel(b, N->out.bits == 4 ? e->qmv_xf1_4 : e->qmv_xf1);
         bind_t(e, b, 0, N->out.w); bind_t(e, b, 1, N->out.s); bind_t(e, b, 2, N->out.b);
@@ -3208,6 +3271,15 @@ static int gdn_chunk(void) {
     return c;
 }
 
+// prefill 的分塊 DeltaNet 走 gdn_prep3s / gdn_scan2s（每個 SIMD group 各算一塊，不用 execution_simdgroups<8>；遞迴約快 26%）。
+// 輸出與原本的 gdn_prep3 / gdn_scan2 逐位元相同（check_exact 驗證）；QW_GDN_CHUNK=0 改回原本的 kernel
+static int gdn_fast_ovr = -1; // 量測用（QW_GDN_KB 交錯比較）
+static bool gdn_fast(void) {
+    static int v = -1;
+    if (v < 0) v = !getenv("QW_GDN_CHUNK") || atoi(getenv("QW_GDN_CHUNK")) > 0;
+    return gdn_fast_ovr >= 0 ? gdn_fast_ovr : v;
+}
+
 static bool pf_init(qw_engine *e, char *err, size_t errlen) {
     if (e->pf_ready) return true;
     char defs[512];
@@ -3220,7 +3292,7 @@ static bool pf_init(qw_engine *e, char *err, size_t errlen) {
         if (e->m->lin_tiled) { // GGUF：V head 交錯順序的另一份（只有 prep 用到 key head；scan 共用）
             char gt[512];
             snprintf(gt, sizeof gt, "#define GDN_TILED 1\n#define gdn_seq gdn_seq_t\n#define gdn_prep gdn_prep_t\n#define gdn_scan gdn_scan_t\n"
-                     "#define gdn_prep2 gdn_prep2_t\n#define gdn_prep3 gdn_prep3_t\n#define gdn_scan2 gdn_scan2_t\n%s", gd);
+                     "#define gdn_prep2 gdn_prep2_t\n#define gdn_prep3 gdn_prep3_t\n#define gdn_scan2 gdn_scan2_t\n#define gdn_scan2s gdn_scan2s_t\n#define gdn_prep3s gdn_prep3s_t\n%s", gd);
             if (!compile(e, gt, src_gdnp, sizeof src_gdnp, err, errlen)) return false;
         }
     }
@@ -3477,23 +3549,46 @@ static void pf_deltanet(qw_engine *e, qw_batch *b, const qw_deltanet *N, int li,
     if (tap) { dn_tap_copy(e, b, &e->pout, true, T); e->dntap_n += (int)T; }
 }
 
-static void pf_deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, int li, uint32_t T) {
+// 量測用（QW_PF_KBENCH + QW_GDN_KB）：只編碼 pf_deltanet_core 的部分步驟：
+// 1 投影（qkv / z / a / b）、2 p_gdn_in + conv 狀態、4 分塊 prep、8 分塊 scan（含尾巴）、16 gated norm、32 out_proj
+static unsigned pfdn_mask = ~0u;
+
+// DeltaNet 的輸入投影 px → pqkv / pz / pa / pb；parts：1 qkv、2 z、4 a + b（量測用可只編碼一部分，正式路徑 7）
+static void pf_dn_proj(qw_engine *e, qw_batch *b, const qw_deltanet *N, uint32_t T, unsigned parts) {
     // GGUF DeltaNet 投影改走 attention 的 qmm_ggm（每 256 個值解一次 FP16）；QW_DN_GGM=0 用通用的 IQF qmm
     pf_i8_share(e, &e->px); // INT8：px 只量化一次
     if (dn_ggm_on() && N->in_qkv.gq) {
-        pf_attn_mm(e, b, &N->in_qkv, &e->px, &e->pqkv, T);
-        pf_attn_mm(e, b, &N->in_z, &e->px, &e->pz, T);
+        if (parts & 1) pf_attn_mm(e, b, &N->in_qkv, &e->px, &e->pqkv, T);
+        if (parts & 2) pf_attn_mm(e, b, &N->in_z, &e->px, &e->pz, T);
     } else {
-    pf_qmm(e, b, &N->in_qkv, &e->px, &e->pqkv, T, false);
-    pf_qmm(e, b, &N->in_z, &e->px, &e->pz, T, false);
+        if (parts & 1) pf_qmm(e, b, &N->in_qkv, &e->px, &e->pqkv, T, false);
+        if (parts & 2) pf_qmm(e, b, &N->in_z, &e->px, &e->pz, T, false);
     }
-    pf_qmm(e, b, &N->in_a, &e->px, &e->pa, T, false);
-    pf_qmm(e, b, &N->in_b, &e->px, &e->pb, T, false);
+    if (parts & 4) {
+        pf_qmm(e, b, &N->in_a, &e->px, &e->pa, T, false);
+        pf_qmm(e, b, &N->in_b, &e->px, &e->pb, T, false);
+    }
     pf_i8_share(e, NULL);
+}
+
+// p_gdn_in 的 token 區塊版（kernels/prefill.metal 的 p_gdn_in_tb：每個 threadgroup 連續 GDN_TB 個 token，逐位元相同）；
+// QW_GDN_TB=0 改回每個 token 一個 threadgroup
+enum { GDN_TB = 16 }; // 同 prefill.metal 的 GDN_TB
+static int gdn_tb_ovr = -1; // 量測用（QW_DN_KB 交錯比較）
+static bool gdn_tb_on(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("QW_GDN_TB") ? atoi(getenv("QW_GDN_TB")) : 1;
+    return gdn_tb_ovr >= 0 ? gdn_tb_ovr : v;
+}
+
+static void pf_deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, int li, uint32_t T) {
+    if (pfdn_mask & 1) pf_dn_proj(e, b, N, T, 7);
     const size_t cst = (size_t)li * 3 * 10240 * 4;
     const bool tl = e->m->lin_tiled; // GGUF：V head 交錯順序、A_neg（F32）
+    if (pfdn_mask & 2) {
     for (int rp = 0; rp < xrep("gdnin"); rp++) { // 量測用：QW_XREP=gdnin:n
-    qw_batch_kernel(b, pf_need(e, tl ? "p_gdn_in_t" : "p_gdn_in"));
+    const bool tb = gdn_tb_on();
+    qw_batch_kernel(b, pf_need(e, tb ? (tl ? "p_gdn_in_t_tb" : "p_gdn_in_tb") : (tl ? "p_gdn_in_t" : "p_gdn_in")));
     qw_batch_buf(b, 0, &e->pqkv, 0);
     bind_t(e, b, 1, N->conv1d);
     qw_batch_buf(b, 2, &e->conv_st, cst);
@@ -3506,7 +3601,10 @@ static void pf_deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, in
     qw_batch_buf(b, 9, &e->pv, 0);
     qw_batch_buf(b, 10, &e->pla, 0);
     qw_batch_buf(b, 11, &e->pbe, 0);
-    qw_batch_dispatch(b, 16 + 48, T, 1, 128, 1, 1);
+    if (tb) {
+        qw_batch_bytes(b, 12, &T, 4);
+        qw_batch_dispatch(b, 16 + 48, (T + GDN_TB - 1) / GDN_TB, 1, 128, 1, 1);
+    } else qw_batch_dispatch(b, 16 + 48, T, 1, 128, 1, 1);
     }
     uint32_t C = 10240;
     qw_batch_kernel(b, pf_need(e, "p_conv_state"));
@@ -3523,6 +3621,7 @@ static void pf_deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, in
         qw_batch_bytes(b, 3, &C, 4);
         d1(b, C, 256);
     }
+    }
     const size_t soff = (size_t)li * 48 * 128 * 128 * 4;
     // 分塊 GDN：前 T64 個 token
     const uint32_t CC = (uint32_t)gdn_chunk();
@@ -3530,7 +3629,8 @@ static void pf_deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, in
     if (T64) {
         gdn_chunk_args a = {T64, T64 / CC};
         uint32_t tb = 0;
-        qw_batch_kernel(b, pf_need(e, tl ? "gdn_prep3_t" : "gdn_prep3"));
+        if (pfdn_mask & 4) {
+        qw_batch_kernel(b, pf_need(e, gdn_fast() ? (tl ? "gdn_prep3s_t" : "gdn_prep3s") : (tl ? "gdn_prep3_t" : "gdn_prep3")));
         qw_batch_buf(b, 0, &e->pq, 0);
         qw_batch_buf(b, 1, &e->pk, 0);
         qw_batch_buf(b, 2, &e->pv, 0);
@@ -3543,7 +3643,9 @@ static void pf_deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, in
         qw_batch_buf(b, 9, &e->gG, 0);
         qw_batch_bytes(b, 10, &a, sizeof a);
         qw_batch_dispatch(b, a.nchunk, 48, 1, 256, 1, 1);
-        qw_batch_kernel(b, pf_need(e, "gdn_scan2"));
+        }
+        if (pfdn_mask & 8) {
+        qw_batch_kernel(b, pf_need(e, gdn_fast() ? "gdn_scan2s" : "gdn_scan2"));
         qw_batch_buf(b, 0, &e->gW, 0);
         qw_batch_buf(b, 1, &e->gU, 0);
         qw_batch_buf(b, 2, &e->gQA, 0);
@@ -3558,9 +3660,10 @@ static void pf_deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, in
         qw_batch_buf(b, 9, e->seg_n ? &e->snS : &e->S, soff);
         qw_batch_bytes(b, 10, &sa, sizeof sa);
         qw_batch_dispatch(b, 48, 128 / 64, 1, 256, 1, 1);
+        }
     }
     // 不滿 64 的尾巴：逐 token 用 decode 的單步 kernel
-    for (uint32_t t = T64; t < T; t++) {
+    for (uint32_t t = T64; t < T && (pfdn_mask & 8); t++) {
         qw_batch_kernel(b, tl ? e->gdn_step_t : e->gdn_step);
         qw_batch_buf(b, 0, &e->pq, (size_t)t * 2048 * 2);
         qw_batch_buf(b, 1, &e->pk, (size_t)t * 2048 * 2);
@@ -3573,12 +3676,15 @@ static void pf_deltanet_core(qw_engine *e, qw_batch *b, const qw_deltanet *N, in
         qw_batch_buf(b, 8, &e->S, soff);
         qw_batch_dispatch(b, 48, 128 / 32, 1, 256, 1, 1);
     }
+    if (pfdn_mask & 16) {
     qw_batch_kernel(b, pf_need(e, "p_normgate"));
     qw_batch_buf(b, 0, &e->po, 0);
     qw_batch_buf(b, 1, &e->pz, 0);
     bind_t(e, b, 2, N->norm);
     qw_batch_buf(b, 3, &e->py, 0);
     qw_batch_dispatch(b, 48, T, 1, 128, 1, 1);
+    }
+    if (!(pfdn_mask & 32)) return;
     if (dn_ggm_on() && N->out.gq) pf_attn_mm(e, b, &N->out, &e->py, &e->pout, T);
     else pf_qmm(e, b, &N->out, &e->py, &e->pout, T, false);
 }
@@ -4784,6 +4890,37 @@ void qw_engine_pf_kbench(qw_engine *e, int T, int reps) {
             if (*s == ',') s++;
             else if (*s) break;
         }
+        if (getenv("QW_KB_PREP")) { // 只量 p_attn_prep（q / k 的 norm + RoPE、KV 寫入）在各位置的時間；QW_KB_PREP=層號（KV 寫到哪一層，預設 0）
+            const int ai = atoi(getenv("QW_KB_PREP"));
+            const size_t Lc = (size_t)e->kvcap, koff = (size_t)(ai % NATT) * Lc * 2 * 256 * 2;
+            double bp[8];
+            for (int i = 0; i < np; i++) bp[i] = 1e9;
+            for (int trial = 0; trial < 3; trial++)
+                for (int i = np - 1; i >= 0; i--) {
+                    qw_batch *b = qw_batch_begin(e->g, false);
+                    pf_rope_tab(e, b, ps[i], (uint32_t)T);
+                    qw_batch_end(b);
+                    b = qw_batch_begin(e->g, false);
+                    for (int r = 0; r < reps; r++) {
+                        qw_batch_kernel(b, pf_need(e, La->att.nf32 ? "p_attn_prep_f" : "p_attn_prep"));
+                        qw_batch_buf(b, 0, &e->pqg, 0);
+                        qw_batch_buf(b, 1, &e->pkk, 0);
+                        qw_batch_buf(b, 2, &e->pvv, 0);
+                        bind_t(e, b, 3, La->att.q_norm);
+                        bind_t(e, b, 4, La->att.k_norm);
+                        qw_batch_buf(b, 5, &e->paq, 0);
+                        qw_batch_buf(b, 6, &e->Kc, koff);
+                        qw_batch_buf(b, 7, &e->Vc, koff);
+                        qw_batch_bytes(b, 8, &ps[i], 4);
+                        qw_batch_buf(b, 9, &e->prcs, 0);
+                        qw_batch_dispatch(b, 24 + 2, (unsigned)T, 1, 256, 1, 1);
+                    }
+                    const double t = qw_batch_end(b) * 1e3 / reps;
+                    if (t < bp[i]) bp[i] = t;
+                }
+            for (int i = 0; i < np; i++) printf("p_attn_prep @pos %6u（KV 第 %d 層）：%.3f ms\n", ps[i], ai % NATT, bp[i]);
+            return;
+        }
         if (getenv("QW_QK_AB")) { // INT8 Q·Kᵀ 的交錯 A/B：每個位置 QW_QK_AB=位元（預設 3）vs 不開，各取 3 次中最好的
             const int on = atoi(getenv("QW_QK_AB")) > 0 ? atoi(getenv("QW_QK_AB")) : 3;
             double bq[8][2];
@@ -4835,6 +4972,28 @@ void qw_engine_pf_kbench(qw_engine *e, int T, int reps) {
             }
         return;
     }
+    if (getenv("QW_GDN_KB")) { // DeltaNet prefill 各步驟（第 0 層，pfdn_mask 只編碼一部分；每次的時間 × NLIN）
+        // 每一步各量預設與 QW_GDN_CHUNK 版（同一個行程裡交錯，每輪交換先後）
+        static const char *gn[] = {"投影 qkv/z/a/b", "p_gdn_in + conv", "分塊 prep", "分塊 scan", "分塊 prep + scan", "gated norm", "out_proj", "全部"};
+        static const unsigned gm[] = {1, 2, 4, 8, 12, 16, 32, ~0u};
+        for (int k = 0; k < 8; k++) {
+            double best[2] = {1e9, 1e9};
+            for (int trial = 0; trial < 3; trial++)
+                for (int v2 = 0; v2 < 2; v2++) {
+                    const int f = (trial + v2) & 1;
+                    pfdn_mask = gm[k];
+                    gdn_fast_ovr = f;
+                    qw_batch *b = qw_batch_begin(e->g, false);
+                    for (int r = 0; r < reps; r++) pf_deltanet_core(e, b, &Ll->lin, 0, (uint32_t)T);
+                    const double t = qw_batch_end(b) * 1e3 / reps;
+                    if (t < best[f]) best[f] = t;
+                }
+            pfdn_mask = ~0u;
+            gdn_fast_ovr = -1;
+            printf("  DeltaNet %-18s 預設 %8.3f ms、fast %8.3f ms／次 × %d = %6.1f / %6.1f ms\n", gn[k], best[0], best[1], NLIN,
+                   best[0] * NLIN, best[1] * NLIN);
+        }
+    }
     if (getenv("QW_FLASH_KB") || getenv("QW_SEL_DUMP")) pf_flash_kb(e, (uint32_t)T, reps);
     if (getenv("QW_PF_PROF")) { // 各部分一次（第 0 層 / 第一個 attention 層）的逐 kernel 時間（profiling 會把 dispatch 拆開，總和比實際略大）
         for (int k = 0; k < 4; k++) {
@@ -4857,10 +5016,9 @@ void qw_engine_pf_kbench(qw_engine *e, int T, int reps) {
             double best = 1e9;
             for (int trial = 0; trial < 3; trial++) {
                 qw_batch *b = qw_batch_begin(e->g, false);
-                for (int r = 0; r < reps; r++) {
-                    if (k == 0) pf_qmm(e, b, &N->in_qkv, &e->px, &e->pqkv, (uint32_t)T, false);
-                    else if (k == 1) pf_qmm(e, b, &N->in_z, &e->px, &e->pz, (uint32_t)T, false);
-                    else if (k == 2) { pf_qmm(e, b, &N->in_a, &e->px, &e->pa, (uint32_t)T, false); pf_qmm(e, b, &N->in_b, &e->px, &e->pb, (uint32_t)T, false); }
+                for (int r = 0; r < reps; r++) { // 與 pf_deltanet_core 同一條路徑（INT8 時每次都含 px 的量化）
+                    if (k < 3) pf_dn_proj(e, b, N, (uint32_t)T, 1u << k);
+                    else if (dn_ggm_on() && N->out.gq) pf_attn_mm(e, b, &N->out, &e->py, &e->pout, (uint32_t)T);
                     else pf_qmm(e, b, &N->out, &e->py, &e->pout, (uint32_t)T, false);
                 }
                 const double t = qw_batch_end(b) * 1e3 / reps;
@@ -4868,6 +5026,49 @@ void qw_engine_pf_kbench(qw_engine *e, int T, int reps) {
             }
             printf("  DeltaNet %-12s %8.3f ms／次\n", pn[k], best);
         }
+        // p_gdn_in：每個 token 一個 threadgroup（gdn_tb_ovr = 0）vs token 區塊版（1）；先逐位元比對 q / k / v / la / be
+        const size_t sq = (size_t)T * 2048 * 2, sv = (size_t)T * 6144 * 2, sl = (size_t)T * 48 * 4;
+        char *r2 = malloc(2 * sq + sv + 2 * sl), *cs = malloc(3 * 10240 * 4);
+        memcpy(cs, e->conv_st.ptr, 3 * 10240 * 4); // 第 0 層的 conv 狀態：兩次都從同一個狀態開始（p_conv_state 會改寫）
+        const qw_buf *ob[5] = {&e->pq, &e->pk, &e->pv, &e->pla, &e->pbe};
+        const size_t os[5] = {sq, sq, sv, sl, sl};
+        for (int v = 0; v < 2; v++) {
+            gdn_tb_ovr = v;
+            for (int i = 0; i < 5; i++) memset(ob[i]->ptr, 0xff, os[i]);
+            memcpy(e->conv_st.ptr, cs, 3 * 10240 * 4);
+            pfdn_mask = 2;
+            qw_batch *b = qw_batch_begin(e->g, false);
+            pf_deltanet_core(e, b, N, 0, (uint32_t)T);
+            qw_batch_end(b);
+            size_t o = 0;
+            bool same = true;
+            for (int i = 0; i < 5; i++) {
+                if (!v) memcpy(r2 + o, ob[i]->ptr, os[i]);
+                else if (memcmp(r2 + o, ob[i]->ptr, os[i])) {
+                    same = false;
+                    size_t j = 0, nd = 0;
+                    while (j < os[i] && r2[o + j] == ((char *)ob[i]->ptr)[j]) j++;
+                    for (size_t u = 0; u < os[i]; u++) nd += r2[o + u] != ((char *)ob[i]->ptr)[u];
+                    printf("    緩衝區 %d：第一個不同的位元組 %zu / %zu，共 %zu 個\n", i, j, os[i], nd);
+                }
+                o += os[i];
+            }
+            if (v) printf("  DeltaNet p_gdn_in 區塊版 vs 原版：%s\n", same ? "相同" : "不同");
+        }
+        free(r2), free(cs);
+        double bt[2] = {1e9, 1e9};
+        for (int trial = 0; trial < 4; trial++)
+            for (int v2 = 0; v2 < 2; v2++) {
+                const int v = (trial + v2) & 1;
+                gdn_tb_ovr = v;
+                qw_batch *b = qw_batch_begin(e->g, false);
+                for (int r = 0; r < reps; r++) pf_deltanet_core(e, b, N, 0, (uint32_t)T);
+                const double t = qw_batch_end(b) * 1e3 / reps;
+                if (t < bt[v]) bt[v] = t;
+            }
+        gdn_tb_ovr = -1;
+        pfdn_mask = ~0u;
+        printf("  DeltaNet p_gdn_in + conv：原版 %8.3f ms、區塊版 %8.3f ms／次\n", bt[0], bt[1]);
     }
     { // attention 的投影（q / k / v / indexer / o），12 層輪流（格式依層不同）
         double best = 1e9;
@@ -4995,6 +5196,37 @@ static qw_kernel *qmvb_kernel(qw_engine *e, const char *kind, int bits, int K, b
 }
 
 typedef struct { uint32_t N, xstride, ystride, pad; } qmvb_args;
+// 驗證用的輸入轉換（kernels/qmvb.metal 的 qmvb_xform；XF = 1 DeltaNet gated RMSNorm、2 attention output gate）。
+// decode 把同樣的轉換併在 qmv_xf 裡（MLX），驗證要用逐字相同的算式（kb_normgate / kb_attn_gate 的捨入不同），推測解碼才會等於 greedy
+static qw_kernel *xform_kernel(qw_engine *e, int xf) {
+    char name[64], defs[512], err[8192];
+    snprintf(name, sizeof name, "qmvb_xform%d", xf);
+    qw_kernel *k = qw_kernel_get(e->g, name);
+    if (k) return k;
+    snprintf(defs, sizeof defs,
+             "#define qmvb_xform %s\n#define qmvb qmvb_xfu%d\n#define qmvb_splitk qmvb_splitk_xfu%d\n#define qmvb_multi qmvb_multi_xfu%d\n"
+             "#define XF %d\n#define BITS 8\n#define K 6144\n#define NB 1\n#define ST bfloat\n",
+             name, xf, xf, xf, xf);
+    if (!compile(e, defs, src_qmvb, sizeof src_qmvb, err, sizeof err) || !(k = qw_kernel_get(e->g, name))) {
+        fprintf(stderr, "編譯 %s 失敗：%s\n", name, err);
+        exit(1);
+    }
+    return k;
+}
+// decode 的 MLX DeltaNet / attention 是否把轉換併進 out_proj / o_proj（qmv_xf）；--exact-spec 時驗證跟著用 xform_kernel
+static bool mlx_xf(const qw_qlin *L) { return !L->gq && !getenv("QW_NO_XF"); }
+static bool vb_xf(const qw_engine *e, const qw_qlin *L) { return exact_on(e) && mlx_xf(L); }
+static void vb_xform(qw_engine *e, qw_batch *b, int xf, const qw_buf *o, const qw_buf *aux, const qw_buf *ssp, const st_tensor *nw, const qw_buf *y) {
+    _Static_assert(6144 % 256 == 0, "qmvb_xform：每個 token 6144 個元素、256 個一組");
+    qw_batch_kernel(b, xform_kernel(e, xf));
+    qw_batch_buf(b, 0, o, 0);
+    qw_batch_buf(b, 1, aux, 0);
+    qw_batch_buf(b, 2, ssp, 0);
+    bind_t(e, b, 3, nw);
+    qw_batch_buf(b, 4, y, 0);
+    qw_batch_dispatch(b, 6144 / 256, (unsigned)VB, 1, 256, 1, 1);
+}
+
 typedef struct { uint32_t N[4], off[4], total, xstride; } qmvb_multi_args;
 
 // 驗證用 matvec 改走矩陣單元（kernels/qmvb_tc.metal）的條件：token 數夠多（QW_VB_TC=最少幾個，0 = 關）、
@@ -5154,6 +5386,7 @@ static bool vb_init(qw_engine *e, char *err, size_t errlen) {
         qmvb_kernel(e, "qmvb_multi", e->m->mtp.att.q.bits, D, false);
     }
     vk(e, "kb_hc_in");
+    if (exact_on(e)) { xform_kernel(e, 1); xform_kernel(e, 2); }
     if (e->m->lin_tiled) { dn_kernel(e, "dn_ksum", nb); gf_kernel(e, nb); } // GGUF DeltaNet 投影（一個 NB 一個 library）、合併版 GDN
     if (e->m->mixer.mix_down.gq) gh_kernel(e, "ghc_dsk", nb); // GGUF hyper（同一個 library 有兩段版與三段版）
     if (nb == 2 || nb == 3 || nb == 5) gg_precompile(e, nb); // 驗證的 MoE kernel 以 2、4、8 個 token 編譯（gg_nbv）
@@ -5262,7 +5495,8 @@ static void vb_deltanet(qw_engine *e, qw_batch *b, const qw_deltanet *N, int li)
     for (int t = 1; t < VBMAX; t++) qw_batch_buf(b, 7 + t, t < VB ? &e->Sx[t - 1] : &e->S, soff);
     qw_batch_dispatch(b, 48, 128 / 32, 1, 256, 1, 1);
     }
-    if (dn_mask & 8) {
+    if ((dn_mask & 8) && vb_xf(e, &N->out)) vb_xform(e, b, 1, &e->bgo, &e->bz, &e->bssp, N->norm, &e->bgy);
+    else if (dn_mask & 8) {
     qw_batch_kernel(b, vk(e, "kb_normgate"));
     qw_batch_buf(b, 0, &e->bgo, 0);
     qw_batch_buf(b, 1, &e->bz, 0);
@@ -5322,8 +5556,8 @@ static void qsa_layer(qw_engine *e, qw_batch *b, const qw_attn *A, int ai, uint3
         }
         aa[t] = a;
     }
-    if (sparse && (at_mask & 4)) {
-        qw_batch_kernel(b, e->q3_score);
+    if (sparse && (at_mask & 4)) { // 驗證 5–8 個 token：qsa_score4（同結果，交換次數少）
+        qw_batch_kernel(b, e->q3_score4 && nb >= 5 && nb <= 8 ? e->q3_score4 : e->q3_score);
         qw_batch_buf(b, 0, io->iq, 0);
         qw_batch_buf(b, 1, &e->kblk, boff);
         qw_batch_buf(b, 2, &e->q3sc, 0);
@@ -5435,7 +5669,7 @@ static void qsa_layer(qw_engine *e, qw_batch *b, const qw_attn *A, int ai, uint3
         qw_batch_bytes(b, 2, &nch, 4);
         qw_batch_dispatch(b, 24, (unsigned)nb, 1, 256, 1, 1);
     }
-    if (nb == 1 && !getenv("QW_NO_XF") && !A->o.gq) { // output gate 併進 o_proj 的輸入
+    if (nb == 1 && mlx_xf(&A->o)) { // output gate 併進 o_proj 的輸入（--exact-spec 時驗證用 vb_xform，算式相同）
         if (!(at_mask & 128)) return;
         qmv_args a2 = {(uint32_t)A->o.out, 0, (uint32_t)A->o.out, 0};
         qw_batch_kernel(b, A->o.bits == 4 ? e->qmv_xf2_4 : e->qmv_xf2);
@@ -5449,7 +5683,8 @@ static void qsa_layer(qw_engine *e, qw_batch *b, const qw_attn *A, int ai, uint3
         qw_batch_dispatch(b, (a2.N + 7) / 8, 1, 1, 256, 1, 1);
         return;
     }
-    if (at_mask & 64) {
+    if ((at_mask & 64) && nb > 1 && vb_xf(e, &A->o)) vb_xform(e, b, 2, io->ao, io->qg, &e->bssp, A->q_norm, io->ay); // 同 decode 的 qmv_xf2
+    else if (at_mask & 64) {
         qw_batch_kernel(b, pf_need(e, "kb_attn_gate"));
         qw_batch_buf(b, 0, io->ao, 0);
         qw_batch_buf(b, 1, io->qg, 0);
@@ -5824,6 +6059,12 @@ static void snap_copy_k(qw_engine *e, struct qw_snap *c, bool to_snap, int stage
         d1(b, n, 256);
     }
     qw_batch_end(b);
+    if (stage >= 0 && to_snap && getenv("QW_SNAP_DUMP")) { // 除錯：段中檢查點的 DeltaNet 狀態寫到檔案（比較 scan 版本用）
+        char p[512];
+        snprintf(p, sizeof p, "%s.%d", getenv("QW_SNAP_DUMP"), stage);
+        FILE *f = fopen(p, "wb");
+        if (f) { fwrite((const char *)e->snS.ptr + (size_t)stage * e->S.size, 1, e->S.size, f); fclose(f); }
+    }
 }
 
 // 存一個長度為 len 的檢查點：同長度的覆寫，否則用空的或最舊的
@@ -6566,7 +6807,7 @@ static void att_test(qw_engine *e, int reps) {
     if (P < 8 || P + VBMAX + 8 > e->max_ctx || !kv_reserve(e, P + VBMAX + 8)) { fprintf(stderr, "QW_ATT_TEST：位置不合（QW_CTX 要 > 位置 + 16）\n"); return; }
     const size_t Lc = (size_t)e->kvcap;
     uint64_t s = 777;
-    { // KV：每層 4096 個 token 的亂數重複（時間量測不受影響）；區塊 key、raw_k 全部亂數
+    if (!getenv("QW_ATT_REAL")) { // KV：每層 4096 個 token 的亂數重複（時間量測不受影響）；區塊 key、raw_k 全部亂數（QW_ATT_REAL=1：沿用 prefill 寫好的真實 KV）
         const size_t rows = 4096, rowh = 2 * 256;
         _Float16 *pat = malloc(rows * rowh * 2 * 2);
         for (size_t i = 0; i < rows * rowh * 2; i++) pat[i] = (_Float16)at_rnd(&s);
@@ -6659,37 +6900,50 @@ static void att_test(qw_engine *e, int reps) {
         }
     }
     free(od); free(oa); free(osc);
-    // 2) 各步驟累加時間（12 層輪流）
+    // 2) 各步驟累加時間（12 層輪流）。QW_ATT_PS=位置,位置…（≤ P，KV 已填到 P）：同一個行程裡交錯量各位置（避開降頻造成的差異）
     static const char *nm[] = {"投影 q/k/v/idx", "+ 準備", "+ 打分數", "+ 選取", "+ attention", "+ 合併", "+ gate", "+ o_proj（全部）"};
-    printf("\n位置 %d（%s）\n| 步驟 |", P, P + 1 > QW_IDX_BUDGET ? "稀疏" : "全看");
-    for (int k = 0; k < nn; k++) printf(" NB = %d |", nbs[k]);
+    int ps[8] = {P}, np = 1;
+    if (getenv("QW_ATT_PS")) {
+        np = 0;
+        for (const char *q = getenv("QW_ATT_PS"); *q && np < 8;) {
+            char *end;
+            const long v = strtol(q, &end, 10);
+            if (end == q) break;
+            if (v >= 8 && v <= P) ps[np++] = (int)v;
+            q = *end == ',' ? end + 1 : end;
+        }
+        if (!np) ps[np++] = P;
+    }
+    printf("\n| 步驟 |");
+    for (int pi = 0; pi < np; pi++)
+        for (int k = 0; k < nn; k++) printf(" %d（%s）NB = %d |", ps[pi], ps[pi] + 1 > QW_IDX_BUDGET ? "稀疏" : "全看", nbs[k]);
     printf("\n|---|");
-    for (int k = 0; k < nn; k++) printf("---|");
+    for (int k = 0; k < nn * np; k++) printf("---|");
     printf("\n");
     const int nst = getenv("QW_ATT_MASK") ? 1 : 8; // QW_ATT_MASK=遮罩：只量這些步驟
     for (int st = 0; st < nst; st++) {
         at_mask = getenv("QW_ATT_MASK") ? (unsigned)strtoul(getenv("QW_ATT_MASK"), NULL, 0) : (2u << st) - 1;
-        if (nst > 1 && P + 1 <= QW_IDX_BUDGET && (st == 2 || st == 3)) continue;
         if (nst > 1) printf("| %s |", nm[st]);
         else printf("| 遮罩 0x%x |", at_mask);
-        for (int k = 0; k < nn; k++) {
-            const int nb = nbs[k];
-            if (nb > 1) e->vbn = nb;
-            double best = 1e30;
-            for (int t = 0; t < 3; t++) {
-                qw_batch *b = qw_batch_begin(e->g, false);
-                for (int r = 0; r < reps; r++) {
-                    const int ai = r % NATT;
-                    e->pos = P;
-                    if (nb == 1) attention(e, b, &e->m->layers[ai * 4 + 3].att, ai);
-                    else vb_attention(e, b, &e->m->layers[ai * 4 + 3].att, ai, P);
-                    if (getenv("QW_ATT_SERIAL")) qw_batch_barrier(b); // 層與層之間不重疊（像真正的 decode）
+        for (int pi = 0; pi < np; pi++)
+            for (int k = 0; k < nn; k++) {
+                const int nb = nbs[k], P1 = ps[pi];
+                if (nb > 1) e->vbn = nb;
+                double best = 1e30;
+                for (int t = 0; t < 3; t++) {
+                    qw_batch *b = qw_batch_begin(e->g, false);
+                    for (int r = 0; r < reps; r++) {
+                        const int ai = r % NATT;
+                        e->pos = P1;
+                        if (nb == 1) attention(e, b, &e->m->layers[ai * 4 + 3].att, ai);
+                        else vb_attention(e, b, &e->m->layers[ai * 4 + 3].att, ai, P1);
+                        if (getenv("QW_ATT_SERIAL")) qw_batch_barrier(b); // 層與層之間不重疊（像真正的 decode）
+                    }
+                    const double tt = qw_batch_end(b);
+                    if (tt > 0 && tt < best) best = tt;
                 }
-                const double tt = qw_batch_end(b);
-                if (tt > 0 && tt < best) best = tt;
+                printf(" %.1f µs |", best / reps * 1e6);
             }
-            printf(" %.1f µs |", best / reps * 1e6);
-        }
         printf("\n");
     }
     at_mask = ~0u;

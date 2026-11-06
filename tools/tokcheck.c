@@ -1,5 +1,5 @@
 // tokenizer 對照：把檔案編碼成 token id（逗號分隔印出），並檢查解碼後是否還原原文
-// 用法：build/tokcheck 檔案 [-q]
+// 用法：build/tokcheck 檔案 [-q]（QW_TOK_GGUF=GGUF 檔或目錄：改用 GGUF 的 tokenizer）
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +10,8 @@ int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "用法：%s 檔案 [-q]\n", argv[0]); return 2; }
     char err[512];
     double t0 = qw_now();
-    qw_tok *t = qw_tok_open("models/Qwen3.8-Flash-Next-mixed-4-8bit", err, sizeof err);
+    qw_tok *t = getenv("QW_TOK_GGUF") ? qw_tok_open_gguf(getenv("QW_TOK_GGUF"), err, sizeof err)
+                                      : qw_tok_open("models/Qwen3.8-Flash-Next-mixed-4-8bit", err, sizeof err);
     if (!t) { fprintf(stderr, "%s\n", err); return 1; }
     const double tl = qw_now() - t0;
     FILE *f = fopen(argv[1], "rb");

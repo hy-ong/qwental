@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <unistd.h>
 #include "unicode_tab.h"
 
 typedef struct {
@@ -143,6 +145,55 @@ static void byte_map(uint32_t *b2c) {
     }
 }
 
+// 一條 merge「a b」（第 rank 條）加進表
+static void merge_add(qw_tok *t, const char *p, int len, int rank) {
+    const char *sp = memchr(p, ' ', (size_t)len);
+    if (!sp) return;
+    const int la = (int)(sp - p), lb = len - la - 1;
+    const int32_t a = str_find(t, p, la), b = str_find(t, sp + 1, lb);
+    char cat[1024];
+    if (a >= 0 && b >= 0 && la + lb < (int)sizeof cat) {
+        memcpy(cat, p, (size_t)la);
+        memcpy(cat + la, sp + 1, (size_t)lb);
+        const int32_t m = str_find(t, cat, la + lb);
+        if (m >= 0) {
+            const uint64_t key = ((uint64_t)(uint32_t)a << 32 | (uint32_t)b) + 1;
+            size_t i = mix64(key) & (t->mhcap - 1);
+            while (t->mh[i].key && t->mh[i].key != key) i = (i + 1) & (t->mhcap - 1);
+            if (!t->mh[i].key) t->mh[i] = (merge_ent){key, rank, m};
+        }
+    }
+}
+
+// vocab 與特殊 token 都放好之後：字串 → id 的表、byte 對應
+static bool tok_index(qw_tok *t, char *err, size_t errlen) {
+    t->shcap = 1;
+    while (t->shcap < (size_t)t->nvocab * 2) t->shcap <<= 1;
+    t->sh = malloc(t->shcap * sizeof(int32_t));
+    memset(t->sh, 0xff, t->shcap * sizeof(int32_t));
+    for (int i = 0; i < t->nvocab; i++)
+        if (t->str[i]) str_put(t, i);
+    uint32_t b2c[256];
+    byte_map(b2c);
+    for (int b = 0; b < 256; b++) {
+        char o[4];
+        const int n = utf8_put(o, b2c[b]);
+        t->byte_id[b] = str_find(t, o, n);
+        t->ch2byte[b2c[b]] = (uint8_t)b;
+        if (t->byte_id[b] < 0) { snprintf(err, errlen, "vocab 缺少 byte %d", b); return false; }
+    }
+    return true;
+}
+
+static void sp_add(qw_tok *t, const char *s, int n, int32_t id) {
+    special *x = &t->sp[t->nsp++];
+    x->s = malloc((size_t)n + 1);
+    memcpy(x->s, s, (size_t)n);
+    x->s[n] = 0;
+    x->len = n;
+    x->id = id;
+}
+
 qw_tok *qw_tok_open(const char *dir, char *err, size_t errlen) {
     char path[1024];
     qw_tok *t = calloc(1, sizeof *t);
@@ -185,37 +236,17 @@ qw_tok *qw_tok_open(const char *dir, char *err, size_t errlen) {
         int n;
         p = json_str(cp, buf, &n);
         if (t->nsp < 64 && id >= 0 && id < cap) {
-            special *s = &t->sp[t->nsp++];
-            s->s = malloc((size_t)n + 1);
-            memcpy(s->s, buf, (size_t)n);
-            s->s[n] = 0;
-            s->len = n;
-            s->id = (int32_t)id;
+            sp_add(t, buf, n, (int32_t)id);
             if (!t->str[id]) {
-                t->str[id] = strdup(s->s);
+                t->str[id] = strdup(t->sp[t->nsp - 1].s);
                 t->slen[id] = n;
             }
             if (id + 1 > t->nvocab) t->nvocab = (int)id + 1;
         }
     }
     free(tj);
-    // 字串 → id
-    t->shcap = 1;
-    while (t->shcap < (size_t)t->nvocab * 2) t->shcap <<= 1;
-    t->sh = malloc(t->shcap * sizeof(int32_t));
-    memset(t->sh, 0xff, t->shcap * sizeof(int32_t));
-    for (int i = 0; i < t->nvocab; i++)
-        if (t->str[i]) str_put(t, i);
-    // byte 對應
-    uint32_t b2c[256];
-    byte_map(b2c);
-    for (int b = 0; b < 256; b++) {
-        char o[4];
-        const int n = utf8_put(o, b2c[b]);
-        t->byte_id[b] = str_find(t, o, n);
-        t->ch2byte[b2c[b]] = (uint8_t)b;
-        if (t->byte_id[b] < 0) { snprintf(err, errlen, "vocab 缺少 byte %d", b); qw_tok_close(t); return NULL; }
-    }
+    // 字串 → id、byte 對應
+    if (!tok_index(t, err, errlen)) { qw_tok_close(t); return NULL; }
     // merges.txt：第 r 行「a b」→ rank r
     snprintf(path, sizeof path, "%s/merges.txt", dir);
     size_t mlen;
@@ -231,28 +262,156 @@ qw_tok *qw_tok_open(const char *dir, char *err, size_t errlen) {
         char *nl = strchr(p, '\n');
         if (!nl) nl = p + strlen(p);
         if (p[0] == '#' && rank == 0 && strncmp(p, "#version", 8) == 0) { p = *nl ? nl + 1 : nl; continue; }
-        char *sp = memchr(p, ' ', (size_t)(nl - p));
-        if (sp) {
-            const int32_t a = str_find(t, p, (int)(sp - p)), b = str_find(t, sp + 1, (int)(nl - sp - 1));
-            char cat[1024];
-            const int la = (int)(sp - p), lb = (int)(nl - sp - 1);
-            if (a >= 0 && b >= 0 && la + lb < (int)sizeof cat) {
-                memcpy(cat, p, (size_t)la);
-                memcpy(cat + la, sp + 1, (size_t)lb);
-                const int32_t m = str_find(t, cat, la + lb);
-                if (m >= 0) {
-                    const uint64_t key = ((uint64_t)(uint32_t)a << 32 | (uint32_t)b) + 1;
-                    size_t i = mix64(key) & (t->mhcap - 1);
-                    while (t->mh[i].key && t->mh[i].key != key) i = (i + 1) & (t->mhcap - 1);
-                    if (!t->mh[i].key) t->mh[i] = (merge_ent){key, rank, m};
-                }
-            }
-            rank++;
-        }
+        if (memchr(p, ' ', (size_t)(nl - p))) merge_add(t, p, (int)(nl - p), rank++);
         p = *nl ? nl + 1 : nl;
     }
     free(mt);
     return t;
+}
+
+// ---------------------------------------------------------------- GGUF（tokenizer.ggml.*）
+// tokens（id → byte-level 字串）、token_type（1 一般、3 control、4 user defined、5 未使用的 [PAD…]）、merges（「a b」，依 rank 排）。
+// 對應 tokenizer.json：vocab = type 1；added_tokens = type 3 與 4；type 5 不在 tokenizer.json 裡，略過。
+static bool g_rd(FILE *f, void *p, size_t n) { return fread(p, 1, n, f) == n; }
+static char *g_str(FILE *f, int *len) {
+    uint64_t n;
+    if (!g_rd(f, &n, 8) || n > (1u << 24)) return NULL;
+    char *s = malloc(n + 1);
+    if (!g_rd(f, s, n)) { free(s); return NULL; }
+    s[n] = 0;
+    if (len) *len = (int)n;
+    return s;
+}
+static bool g_skip(FILE *f, uint32_t t) {
+    static const int sz[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    if (t == 8) { uint64_t n; return g_rd(f, &n, 8) && fseeko(f, (off_t)n, SEEK_CUR) == 0; }
+    if (t == 9) {
+        uint32_t at;
+        uint64_t n;
+        if (!g_rd(f, &at, 4) || !g_rd(f, &n, 8)) return false;
+        if (at == 8) {
+            for (uint64_t i = 0; i < n; i++) if (!g_skip(f, 8)) return false;
+            return true;
+        }
+        if (at > 12 || at == 9) return false;
+        return fseeko(f, (off_t)(n * (uint64_t)sz[at]), SEEK_CUR) == 0;
+    }
+    return t <= 12 && fseeko(f, sz[t], SEEK_CUR) == 0;
+}
+
+static int cmpstr_p(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+// 一個 GGUF 檔：有 tokenizer 就回傳 t；沒有（例如第二個分片）回傳 NULL 且 err 為空字串
+static qw_tok *tok_gguf_file(const char *path, char *err, size_t errlen) {
+    err[0] = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) { snprintf(err, errlen, "讀不到 %s", path); return NULL; }
+    char magic[4];
+    uint32_t ver;
+    uint64_t nt, nkv;
+    if (!g_rd(f, magic, 4) || memcmp(magic, "GGUF", 4) || !g_rd(f, &ver, 4) || !g_rd(f, &nt, 8) || !g_rd(f, &nkv, 8) || ver < 2) {
+        fclose(f);
+        snprintf(err, errlen, "%s 不是 GGUF v2+", path);
+        return NULL;
+    }
+    char **tok = NULL, **mer = NULL;
+    int *tlen = NULL, *mlen = NULL;
+    int32_t *ttype = NULL;
+    uint64_t ntok = 0, nmer = 0, ntype = 0;
+    bool bad = false;
+    char model[64] = "";
+    for (uint64_t i = 0; i < nkv && !bad; i++) {
+        char *k = g_str(f, NULL);
+        uint32_t t;
+        if (!k || !g_rd(f, &t, 4)) { free(k); bad = true; break; }
+        if (t == 9 && (!strcmp(k, "tokenizer.ggml.tokens") || !strcmp(k, "tokenizer.ggml.merges"))) {
+            const bool is_tok = k[15] == 't';
+            uint32_t at;
+            uint64_t n;
+            if (!g_rd(f, &at, 4) || !g_rd(f, &n, 8) || at != 8 || n > (1u << 22)) { bad = true; free(k); break; }
+            char **a = calloc(n, sizeof *a);
+            int *l = calloc(n, sizeof *l);
+            for (uint64_t j = 0; j < n && !bad; j++) bad = !(a[j] = g_str(f, &l[j]));
+            if (is_tok) { tok = a; tlen = l; ntok = n; } else { mer = a; mlen = l; nmer = n; }
+        } else if (t == 9 && !strcmp(k, "tokenizer.ggml.token_type")) {
+            uint32_t at;
+            uint64_t n;
+            if (!g_rd(f, &at, 4) || !g_rd(f, &n, 8) || (at != 4 && at != 5) || n > (1u << 22)) { bad = true; free(k); break; }
+            ttype = malloc(n * 4);
+            bad = !g_rd(f, ttype, n * 4);
+            ntype = n;
+        } else if (t == 8 && !strcmp(k, "tokenizer.ggml.model")) {
+            char *v = g_str(f, NULL);
+            if (!v) bad = true;
+            else { snprintf(model, sizeof model, "%s", v); free(v); }
+        } else
+            bad = !g_skip(f, t);
+        free(k);
+    }
+    fclose(f);
+    qw_tok *t = NULL;
+    if (bad) snprintf(err, errlen, "%s 的 metadata 壞掉", path);
+    else if (!tok) ; // 沒有 tokenizer（不是錯誤）
+    else if (strcmp(model, "gpt2") || !mer || !ttype || ntype != ntok)
+        snprintf(err, errlen, "%s：tokenizer 不是 byte-level BPE（tokenizer.ggml.model = %s）或缺 merges / token_type", path, model);
+    else {
+        t = calloc(1, sizeof *t);
+        t->str = calloc(ntok, sizeof(char *));
+        t->slen = calloc(ntok, sizeof(int));
+        for (uint64_t i = 0; i < ntok; i++) {
+            const int ty = ttype[i];
+            if (ty != 1 && ty != 3 && ty != 4) continue;
+            if (ty != 1) {
+                if (t->nsp == 64) { snprintf(err, errlen, "%s：特殊 token 超過 64 個", path); break; }
+                sp_add(t, tok[i], tlen[i], (int32_t)i);
+            }
+            t->str[i] = tok[i];
+            t->slen[i] = tlen[i];
+            tok[i] = NULL;
+            t->nvocab = (int)i + 1;
+        }
+        if (err[0] || !tok_index(t, err, errlen)) { qw_tok_close(t); t = NULL; }
+        else {
+            t->mhcap = 1;
+            while (t->mhcap < (nmer + 1) * 2) t->mhcap <<= 1;
+            t->mh = calloc(t->mhcap, sizeof(merge_ent));
+            for (uint64_t r = 0; r < nmer; r++) merge_add(t, mer[r], mlen[r], (int)r);
+        }
+    }
+    for (uint64_t i = 0; i < ntok; i++) free(tok[i]);
+    for (uint64_t i = 0; i < nmer; i++) free(mer[i]);
+    free(tok); free(tlen); free(mer); free(mlen); free(ttype);
+    return t;
+}
+
+qw_tok *qw_tok_open_gguf(const char *path, char *err, size_t errlen) {
+    DIR *d = opendir(path);
+    if (!d) return tok_gguf_file(path, err, errlen); // 單一檔案
+    char *names[64];
+    int nn = 0;
+    for (struct dirent *de; (de = readdir(d)) && nn < 64;) {
+        const size_t l = strlen(de->d_name);
+        if (l > 5 && !strcmp(de->d_name + l - 5, ".gguf")) {
+            char p[2048];
+            snprintf(p, sizeof p, "%s/%s", path, de->d_name);
+            names[nn++] = strdup(p);
+        }
+    }
+    closedir(d);
+    qsort(names, (size_t)nn, sizeof *names, cmpstr_p);
+    qw_tok *t = NULL;
+    err[0] = 0;
+    for (int i = 0; i < nn && !t && !err[0]; i++) t = tok_gguf_file(names[i], err, errlen); // 依檔名找第一個有 tokenizer 的分片
+    for (int i = 0; i < nn; i++) free(names[i]);
+    if (!t && !err[0]) snprintf(err, errlen, "%s 裡沒有含 tokenizer 的 GGUF", path);
+    return t;
+}
+
+qw_tok *qw_tok_open_any(const char *model_dir, const char *gguf, char *err, size_t errlen) {
+    char p[1100];
+    snprintf(p, sizeof p, "%s/vocab.json", model_dir);
+    if (!gguf || access(p, R_OK) == 0) return qw_tok_open(model_dir, err, errlen);
+    return qw_tok_open_gguf(gguf, err, errlen);
 }
 
 void qw_tok_close(qw_tok *t) {

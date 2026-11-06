@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define PFX "language_model.model."
 
@@ -151,7 +152,13 @@ static int iq_fmt(const char *dir, const char *layer, const char *proj) {
 }
 
 qw_model *qw_model_open(const char *dir, char *err, size_t errlen) {
-    st_model *st = st_model_open(dir, err, errlen);
+    // GGUF profile 且沒有 MLX 權重（目錄不存在或裡面沒有 safetensors）：從空的 st_model 開始，全部 tensor 來自 GGUF
+    char ip[1100], sp[1100];
+    snprintf(ip, sizeof ip, "%s/model.safetensors.index.json", dir);
+    snprintf(sp, sizeof sp, "%s/model.safetensors", dir);
+    const bool no_mlx = getenv("QW_GGUF") && access(ip, R_OK) && access(sp, R_OK);
+    st_model *st = no_mlx ? calloc(1, sizeof *st) : st_model_open(dir, err, errlen);
+    if (no_mlx) st->dir = strdup(dir);
     if (!st) return NULL;
     qw_model *m = calloc(1, sizeof *m);
     m->st = st;

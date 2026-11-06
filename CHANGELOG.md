@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0 — 2026-11-07
+
+Runs from a single GGUF, and the last known 1.0 issue has an opt-in fix. Without the new flags the output is bit-identical to 1.0.0 on both the GGUF and the MLX profile.
+
+Against 1.1.0 on the same IQ3_S GGUF (`bench/vs_server.py`, two alternating rounds, mean tok/s): prefill 10.7K / 48K with `--int8-qk` 2580 / 2700 → 2701 / 2801 (+4–5%); default and `--int8` within ±3%; decode unchanged. Profiling this round found prefill GEMMs near the matrix-unit limits (INT8 about 110 of 121 TOPS) and decode reading at or near memory bandwidth, so further bit-identical gains are small.
+
+- No MLX model directory needed with `--gguf`: the tokenizer comes from the GGUF metadata (token ids identical to `tokenizer.json` on code, English, Chinese, emoji, special tokens and invalid UTF-8), the three PLE constant tensors from the GGUF's `ple.*` keys, and `dflash2/` is looked up next to the GGUF directory. With an MLX directory present, behaviour is unchanged.
+- `--exact-spec` / `QW_EXACT_SPEC=1` (MLX weights): speculative decoding output equals greedy (safe-math MLX decode/verify kernels, one chunk sum shared by qmv/qmvb, verify uses decode's fused norm-gate/attention gate). MLX outputs change slightly (q300 PPL 1.337 → 1.340); decode 1–8% slower. GGUF is already exact.
+- With an INT8 flag, startup also compiles the INT8 prefill kernels (2304-token and 64-token warmup prefills): first 12.7K-token request TTFT 5.4 → 4.3 s on GGUF `--int8`, at 0.9–1.8 s more startup (about 5 s on MLX). `QW_NO_I8_WARM=1` skips it.
+- Prefill DeltaNet: the chunked (WY) prep and scan kernels give each SIMD group its own tile instead of one 8-group matmul; recurrence 3.39 → 2.50 ms per layer, 4096-token `--int8` prefill about 3% faster. Bit-identical; `QW_GDN_CHUNK=0` restores the old kernels.
+- Prefill DeltaNet input step (conv + normalize) runs 16 consecutive tokens per threadgroup and reads each input once: 0.61 → 0.34 ms per layer. Bit-identical (explicit fma chain); `QW_GDN_TB=0` restores the old kernel.
+- Verify of 5–8 tokens scores the attention indexer with one reduce-scatter per block instead of 32 `simd_sum`s (bit-identical, checked against the old kernel at startup; `QW_SCORE3=1` forces the old one).
+
+### Known limits
+- With `QW_GGUF_PARTS` selecting only some parts, the remaining weights still come from the MLX directory.
+
 ## 1.1.0 — 2026-11-06
 
 INT8 prefill behind flags, faster long prompts, and a same-weights comparison against oMLX. Without the new flags the output is bit-identical to 1.0.0 on both the GGUF and the MLX profile.

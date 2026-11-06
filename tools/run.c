@@ -57,7 +57,8 @@ int main(int argc, char **argv) {
     static float layers[48 * 10240];
     const float *lg = NULL;
     if (getenv("QW_GEN")) { // 一般生成：取樣參數由環境變數設定，印出解碼後的文字
-        qw_tok *tk = qw_tok_open(getenv("QW_MODEL") ? getenv("QW_MODEL") : "models/Qwen3.8-Flash-Next-mixed-4-8bit", err, sizeof err);
+        qw_tok *tk = qw_tok_open_any(getenv("QW_MODEL") ? getenv("QW_MODEL") : "models/Qwen3.8-Flash-Next-mixed-4-8bit", getenv("QW_GGUF"), err,
+                                     sizeof err);
         if (!tk) { fprintf(stderr, "%s\n", err); return 1; }
         const int32_t stops[2] = {248046, 248044};
         qw_gen g = {.temperature = getenv("QW_TEMP") ? (float)atof(getenv("QW_TEMP")) : 0.7f, .top_k = 20, .top_p = 0.95f,

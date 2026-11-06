@@ -15,6 +15,9 @@
 // 主程式注入：IH、ID、QH、KVH、HD、SEL、CR（compress ratio = 4）、CHUNK（每段 token 數）
 
 #include <metal_stdlib>
+#ifdef QW_STRICT // MLX profile（主程式注入）：safe 數學模式，不重排加總。驗證（NB 個 token）與逐 token decode 的同一段算式才會逐位元相同，
+#pragma METAL fp math_mode(safe) // 推測解碼的輸出 = greedy。fast 模式下編譯器依情境（token 迴圈、展開）重排，兩邊捨入不同
+#endif
 using namespace metal;
 
 #define GQA (QH / KVH)

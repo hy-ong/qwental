@@ -63,6 +63,9 @@ typedef struct {
     uint64_t fsize, data0;
     gtensor *t;
     int nt;
+    // PLE 的常數（metadata 的 <arch>.ple.*）：MLX 目錄是 I64 tensor；沒有 MLX 目錄時由這裡補上
+    int64_t ple_meta[3][16];
+    int ple_meta_n[3], ple_layer;
 } gfile;
 
 static bool rdn(FILE *f, void *p, size_t n) { return fread(p, 1, n, f) == n; }
@@ -95,6 +98,34 @@ static bool skipv(FILE *f, uint32_t t, uint32_t *align, const char *key) {
     return true;
 }
 
+// PLE 常數的 metadata 名稱（後綴）與對應的 MLX tensor 名稱（後綴）
+static const char *const ple_meta_key[3] = {".ple.layer_multipliers", ".ple.head_offsets", ".ple.head_vocab_sizes"};
+static const char *const ple_meta_mlx[3] = {"layer_multipliers", "ngram_heads_offsets", "ngram_heads_vocab_sizes"};
+static bool key_ends(const char *k, const char *suf) {
+    const size_t a = strlen(k), b = strlen(suf);
+    return a > b && !strcmp(k + a - b, suf);
+}
+// 整數陣列（最多 cap 個）讀進 dst；型別不是整數陣列或太長時回傳 false（呼叫端改成略過）
+static bool rd_intarr(FILE *f, int64_t *dst, int cap, int *n_out) {
+    const off_t at0 = ftello(f);
+    uint32_t at;
+    uint64_t n;
+    if (!rdn(f, &at, 4) || !rdn(f, &n, 8) || n > (uint64_t)cap || !(at == 4 || at == 5 || at == 10 || at == 11)) {
+        fseeko(f, at0, SEEK_SET);
+        return false;
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        if (at == 4 || at == 5) {
+            uint32_t v;
+            if (!rdn(f, &v, 4)) return false;
+            dst[i] = at == 5 ? (int64_t)(int32_t)v : (int64_t)v;
+        } else if (!rdn(f, &dst[i], 8))
+            return false;
+    }
+    *n_out = (int)n;
+    return true;
+}
+
 static bool gparse(const char *path, gfile *g, char *err, size_t errlen) {
     memset(g, 0, sizeof *g);
     FILE *f = fopen(path, "rb");
@@ -110,7 +141,16 @@ static bool gparse(const char *path, gfile *g, char *err, size_t errlen) {
     for (uint64_t i = 0; i < nkv; i++) {
         char *k = rstr(f);
         uint32_t t;
-        if (!k || !rdn(f, &t, 4) || !skipv(f, t, &align, k)) { free(k); fclose(f); snprintf(err, errlen, "GGUF：%s 的 metadata 壞掉", path); return false; }
+        if (!k || !rdn(f, &t, 4)) { free(k); fclose(f); snprintf(err, errlen, "GGUF：%s 的 metadata 壞掉", path); return false; }
+        bool done = false;
+        for (int q = 0; q < 3 && t == 9 && !done; q++)
+            if (key_ends(k, ple_meta_key[q])) done = rd_intarr(f, g->ple_meta[q], 16, &g->ple_meta_n[q]);
+        if (t == 9 && key_ends(k, ".ple.layers")) {
+            int64_t l[16];
+            int n = 0;
+            if ((done = rd_intarr(f, l, 16, &n)) && n == 1) g->ple_layer = (int)l[0];
+        }
+        if (!done && !skipv(f, t, &align, k)) { free(k); fclose(f); snprintf(err, errlen, "GGUF：%s 的 metadata 壞掉", path); return false; }
         free(k);
     }
     g->t = calloc(nt, sizeof *g->t);
@@ -320,6 +360,22 @@ bool qw_gguf_attach(st_model *st, qw_model *m, const char *dir, unsigned parts, 
             newf[nnew++] = a;
         }
     }
+    // PLE 常數：MLX 目錄沒有（或根本沒有 MLX 目錄）時，從 GGUF metadata 補成 I64 tensor（值與 MLX 的相同）
+    int ple_add[3] = {0}, ple_src[3] = {0};
+    char ple_name[3][200];
+    int ple_layer = 0;
+    for (int i = 0; i < nn; i++) ple_layer = gf[i].ple_layer > ple_layer ? gf[i].ple_layer : ple_layer;
+    if ((parts & QW_GG_PLE) && m->ple_tab)
+        for (int q = 0; q < 3; q++) {
+            snprintf(ple_name[q], sizeof ple_name[q], "language_model.model.layers.%d.ple.ple_embedding.%s", ple_layer, ple_meta_mlx[q]);
+            int src = 0;
+            while (src + 1 < nn && gf[src].ple_meta_n[q] == 0) src++;
+            if (gf[src].ple_meta_n[q] > 0 && !st_model_find(st, ple_name[q], NULL)) {
+                ple_add[q] = gf[src].ple_meta_n[q];
+                ple_src[q] = src;
+                conv_bytes += 16384;
+            }
+        }
     void *cmap = mmap(NULL, conv_bytes + 16384, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (cmap == MAP_FAILED) { snprintf(err, errlen, "GGUF：配置轉換記憶體失敗"); return false; }
     st_file *cf = calloc(1, sizeof *cf);
@@ -329,7 +385,7 @@ bool qw_gguf_attach(st_model *st, qw_model *m, const char *dir, unsigned parts, 
     cf->size = conv_bytes + 16384;
     // 每個區域的 tensor 表（最多 nj 個）
     for (int i = 0; i < nnew; i++) newf[i]->tensors = calloc((size_t)nj + 1, sizeof(st_tensor));
-    cf->tensors = calloc((size_t)nj + 1, sizeof(st_tensor));
+    cf->tensors = calloc((size_t)nj + 4, sizeof(st_tensor));
     uint64_t cofs = 0;
     int nconv_f32 = 0;
     st_tensor *idxq[QW_LAYERS] = {0};
@@ -458,6 +514,19 @@ bool qw_gguf_attach(st_model *st, qw_model *m, const char *dir, unsigned parts, 
         if (pread(idxkg[l]->fd, dst, nb, (off_t)(idxkg[l]->data0 + t->off)) != (ssize_t)nb) { snprintf(err, errlen, "GGUF：讀 indexer k 失敗"); return false; }
         idxq[l]->shape[0] += (int64_t)t->dims[1];
         idxq[l]->nbytes += n * 2;
+    }
+    for (int q = 0; q < 3; q++) {
+        if (!ple_add[q]) continue;
+        st_tensor *o = &cf->tensors[cf->ntensors++];
+        o->name = strdup(ple_name[q]);
+        o->offset = cofs;
+        o->data = (char *)cmap + cofs;
+        o->dtype = ST_I64;
+        o->ndim = 1;
+        o->shape[0] = ple_add[q];
+        o->nbytes = (uint64_t)ple_add[q] * 8;
+        memcpy((void *)o->data, gf[ple_src[q]].ple_meta[q], o->nbytes);
+        cofs += 16384;
     }
     if (cofs > cf->size) { snprintf(err, errlen, "GGUF：轉換記憶體不足（%llu > %zu）", (unsigned long long)cofs, cf->size); return false; }
     // st_find 用 bsearch：每個檔的 tensor 表要依名稱排序（GGUF 的 blk.2 在 blk.10 前面，換成 MLX 名稱後不是字典序）

@@ -9,6 +9,9 @@
 //   BITS：4 或 8；K：輸入維度；RPS：每個 SIMD group 算幾列；SPT：每個 threadgroup 幾個 SIMD group；
 //   ST：scale / bias 的型別（MLX 通常是 bfloat）；qmv：kernel 名稱
 #include <metal_stdlib>
+#ifdef QW_STRICT // MLX profile（主程式注入）：safe 數學模式，不重排加總。驗證（NB 個 token）與逐 token decode 的同一段算式才會逐位元相同，
+#pragma METAL fp math_mode(safe) // 推測解碼的輸出 = greedy。fast 模式下編譯器依情境（token 迴圈、展開）重排，兩邊捨入不同
+#endif
 using namespace metal;
 
 #ifndef YT
@@ -29,6 +32,40 @@ struct qmv_args {
     uint y_stride;   // 每個 slot 的輸出間距（元素數）
     uint pad;
 };
+
+// QW_STRICT（--exact-spec，MLX）用下面的 chunk 寫法；預設（#else）保留 v1.0.0 的逐個累加，輸出逐位元不變
+#ifdef QW_STRICT
+// 一個 chunk（16 個權重）的運算。qmvb.metal（驗證）有逐字相同的一份：兩邊必須一起改，驗證才會與 decode 逐位元相同。
+// 權重解成 4 個 float4（4-bit：前 8 個的偶數 / 奇數 nibble、後 8 個的偶數 / 奇數 nibble；8-bit：依序 4 個一組），
+// 內積是 4 段 dot 兩兩相加（固定的加總樹：safe 模式下不重排，又比逐個累加的長依賴鏈快）
+inline void unpack16(device const uint *W, ulong row, uint c, thread float4 *w4) {
+#if BITS == 4
+    const uint2 w = ((device const uint2 *)(W + row * ROWW))[c];
+    w4[0] = float4(as_type<uchar4>(w.x & 0x0f0f0f0fu));
+    w4[1] = float4(as_type<uchar4>((w.x >> 4) & 0x0f0f0f0fu));
+    w4[2] = float4(as_type<uchar4>(w.y & 0x0f0f0f0fu));
+    w4[3] = float4(as_type<uchar4>((w.y >> 4) & 0x0f0f0f0fu));
+#else
+    // 兩次 8 bytes 讀取：checkpoint 的 tensor 只保證 8 bytes 對齊
+    const uint2 wl = ((device const uint2 *)(W + row * ROWW))[2 * c], wh = ((device const uint2 *)(W + row * ROWW))[2 * c + 1];
+    w4[0] = float4(as_type<uchar4>(wl.x));
+    w4[1] = float4(as_type<uchar4>(wl.y));
+    w4[2] = float4(as_type<uchar4>(wh.x));
+    w4[3] = float4(as_type<uchar4>(wh.y));
+#endif
+}
+inline float dot16(thread const float4 *w4, float4 x0, float4 x1, float4 x2, float4 x3) {
+#if BITS == 4
+    return (dot(w4[0], float4(x0.xz, x1.xz)) + dot(w4[1], float4(x0.yw, x1.yw))) +
+           (dot(w4[2], float4(x2.xz, x3.xz)) + dot(w4[3], float4(x2.yw, x3.yw)));
+#else
+    return (dot(w4[0], x0) + dot(w4[1], x1)) + (dot(w4[2], x2) + dot(w4[3], x3));
+#endif
+}
+inline float sum16(float4 x0, float4 x1, float4 x2, float4 x3) { return dot((x0 + x1) + (x2 + x3), float4(1)); }
+// 一列一個 chunk：acc += s·Σ q·x + z·Σ x
+inline float chunk_acc(float acc, float s, float z, float d, float xs) { return acc + (s * d + z * xs); }
+#endif
 
 kernel void qmv(device const uint *W [[buffer(0)]],
                 device const ST *S [[buffer(1)]],
@@ -58,6 +95,10 @@ kernel void qmv(device const uint *W [[buffer(0)]],
     for (uint c = lane; c < NCHUNK; c += 32) {
         // 讀 16 個輸入值，同時算它們的和（給 bias 用）
         device const half4 *xp = (device const half4 *)(x + c * CHUNK);
+#ifdef QW_STRICT
+        const float4 x0 = float4(xp[0]), x1 = float4(xp[1]), x2 = float4(xp[2]), x3 = float4(xp[3]);
+        const float xs = sum16(x0, x1, x2, x3);
+#else
         float xv[CHUNK];
         float xs = 0;
         for (int j = 0; j < 4; j++) {
@@ -65,10 +106,16 @@ kernel void qmv(device const uint *W [[buffer(0)]],
             xv[4 * j + 0] = h.x; xv[4 * j + 1] = h.y; xv[4 * j + 2] = h.z; xv[4 * j + 3] = h.w;
             xs += h.x + h.y + h.z + h.w;
         }
+#endif
         const uint g = c / (GS / CHUNK);
         for (int r = 0; r < RPS; r++) {
             const uint row = row0 + r;
             if (row >= N) break;
+#ifdef QW_STRICT
+            float4 w4[4];
+            unpack16(W, row, c, w4);
+            acc[r] = chunk_acc(acc[r], float(S[(ulong)row * NG + g]), float(Z[(ulong)row * NG + g]), dot16(w4, x0, x1, x2, x3), xs);
+#else
             float d = 0;
 #if BITS == 4
             uint2 w = ((device const uint2 *)(W + (ulong)row * ROWW))[c];
@@ -86,6 +133,7 @@ kernel void qmv(device const uint *W [[buffer(0)]],
             const float s = float(S[(ulong)row * NG + g]);
             const float z = float(Z[(ulong)row * NG + g]);
             acc[r] += s * d + z * xs;
+#endif
         }
     }
     for (int r = 0; r < RPS; r++) {
@@ -98,6 +146,13 @@ kernel void qmv(device const uint *W [[buffer(0)]],
 // 共用：一個 chunk（16 個權重）的內積（未乘 scale）與 x 的總和
 inline float chunk_dot(device const uint *W, ulong row, uint c, device const half *x, thread float &xs) {
     device const half4 *xp = (device const half4 *)(x + c * CHUNK);
+#ifdef QW_STRICT
+    const float4 x0 = float4(xp[0]), x1 = float4(xp[1]), x2 = float4(xp[2]), x3 = float4(xp[3]);
+    xs = sum16(x0, x1, x2, x3);
+    float4 w4[4];
+    unpack16(W, row, c, w4);
+    return dot16(w4, x0, x1, x2, x3);
+#else
     float xv[CHUNK];
     xs = 0;
     for (int j = 0; j < 4; j++) {
@@ -118,6 +173,7 @@ inline float chunk_dot(device const uint *W, ulong row, uint c, device const hal
     for (int n = 0; n < 4; n++) d += float((wh.y >> (8 * n)) & 255u) * xv[12 + n];
 #endif
     return d;
+#endif
 }
 
 // split-K：列少、K 很長（例如 10240 → 320）。每個 threadgroup 一列，8 個 SIMD group 各算 K 的一段再加總
@@ -133,7 +189,11 @@ kernel void qmv_splitk(device const uint *W [[buffer(0)]], device const ST *S [[
         float xs;
         const float d = chunk_dot(W, row, c, x, xs);
         const uint g = c / (GS / CHUNK);
+#ifdef QW_STRICT
+        acc = chunk_acc(acc, float(S[(ulong)row * NG + g]), float(Z[(ulong)row * NG + g]), d, xs);
+#else
         acc += float(S[(ulong)row * NG + g]) * d + float(Z[(ulong)row * NG + g]) * xs;
+#endif
     }
     acc = simd_sum(acc);
     if (lane == 0) part[sg] = acc;
@@ -158,7 +218,11 @@ kernel void qmv_halfsg(device const uint *W [[buffer(0)]], device const ST *S [[
             float xs;
             const float d = chunk_dot(W, row, c, x, xs);
             const uint g = c / (GS / CHUNK);
+#ifdef QW_STRICT
+            acc = chunk_acc(acc, float(S[(ulong)row * NG + g]), float(Z[(ulong)row * NG + g]), d, xs);
+#else
             acc += float(S[(ulong)row * NG + g]) * d + float(Z[(ulong)row * NG + g]) * xs;
+#endif
         }
     // 16 個 lane 內加總
     for (uint o = 8; o > 0; o >>= 1) acc += simd_shuffle_xor(acc, o);
@@ -195,7 +259,11 @@ kernel void qmv_multi(device const uint *W0 [[buffer(0)]], device const ST *S0 [
         float xs;
         const float d = chunk_dot(W, row, c, x, xs);
         const uint g = c / (GS / CHUNK);
+#ifdef QW_STRICT
+        acc = chunk_acc(acc, float(S[row * NG + g]), float(Z[row * NG + g]), d, xs);
+#else
         acc += float(S[row * NG + g]) * d + float(Z[row * NG + g]) * xs;
+#endif
     }
     acc = simd_sum(acc);
     if (lane == 0) y[row] = YT(acc);
@@ -221,7 +289,11 @@ kernel void qmv_splitk_inj(device const uint *W [[buffer(0)]], device const ST *
             float xs;
             const float d = chunk_dot(W, row, c, x, xs);
             const uint g = c / (GS / CHUNK);
+#ifdef QW_STRICT
+            acc = chunk_acc(acc, float(S[(ulong)row * NG + g]), float(Z[(ulong)row * NG + g]), d, xs);
+#else
             acc += float(S[(ulong)row * NG + g]) * d + float(Z[(ulong)row * NG + g]) * xs;
+#endif
         }
     } else {
         const uint s = row - a.N;
@@ -244,6 +316,51 @@ kernel void qmv_splitk_inj(device const uint *W [[buffer(0)]], device const ST *
 //         ss[head] = Σ_{j<4} ssp[head·4 + j]（gdn_step 輸出的部分平方和）
 // XF = 2（attention 的 output gate）：x[d] = o[d] · sigmoid(qg[(d/256)·512 + 256 + d%256])
 #ifdef XF
+#ifdef QW_STRICT // --exact-spec（MLX）：與 qmvb.metal 的 qmvb_xform 共用 xf_elem
+// 一個元素的轉換。qmvb.metal 的 qmvb_xform（驗證用）有一份逐字相同的副本：兩邊必須一致，驗證才會與 decode 逐位元相同。
+// 本檔是 safe 數學模式（不重排），超越函數明確用 fast:: 版本（與原本 fast 模式的速度相同、結果與編譯情境無關）
+inline float xf_elem(uint d, device const half *o, device const half *aux, device const float *ssp, device const bfloat *nw) {
+    float v = float(o[d]);
+#if XF == 1
+    const uint hh = d / 128;
+    const float ss = ssp[hh * 4] + ssp[hh * 4 + 1] + ssp[hh * 4 + 2] + ssp[hh * 4 + 3];
+    v = fast::divide(v * fast::rsqrt(ss / 128.0f + 1e-6f) * float(nw[d % 128]), 1.0f + fast::exp(-float(aux[d])));
+#else
+    v = fast::divide(v, 1.0f + fast::exp(-float(aux[(d / 256) * 512 + 256 + d % 256])));
+#endif
+    return float(half(v)); // 與未合併版一樣先轉成 FP16
+}
+// Σ x 的加總同 chunk_dot（sum16）：驗證走 qmvb_xform（寫成 FP16）→ qmvb，結果要與這裡逐位元相同
+inline void xform_chunk(uint c, device const half *o, device const half *aux, device const float *ssp, device const bfloat *nw,
+                        thread float4 *xq, thread float &xs) {
+    for (uint j = 0; j < 4; j++) {
+        const uint d = c * CHUNK + 4 * j;
+        xq[j] = float4(xf_elem(d, o, aux, ssp, nw), xf_elem(d + 1, o, aux, ssp, nw), xf_elem(d + 2, o, aux, ssp, nw),
+                       xf_elem(d + 3, o, aux, ssp, nw));
+    }
+    xs = sum16(xq[0], xq[1], xq[2], xq[3]);
+}
+
+kernel void qmv_xf(device const uint *W [[buffer(0)]], device const ST *S [[buffer(1)]], device const ST *Z [[buffer(2)]],
+                   device const half *o [[buffer(3)]], device YT *y [[buffer(4)]], device const half *aux [[buffer(5)]],
+                   constant qmv_args &a [[buffer(6)]], device const float *ssp [[buffer(7)]], device const bfloat *nw [[buffer(8)]],
+                   uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                   uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tg * 8 + sg;
+    if (row >= a.N) return;
+    float acc = 0;
+    for (uint c = lane; c < NCHUNK; c += 32) {
+        float4 xq[4], w4[4];
+        float xs;
+        xform_chunk(c, o, aux, ssp, nw, xq, xs);
+        unpack16(W, row, c, w4);
+        const uint g = c / (GS / CHUNK);
+        acc = chunk_acc(acc, float(S[(ulong)row * NG + g]), float(Z[(ulong)row * NG + g]), dot16(w4, xq[0], xq[1], xq[2], xq[3]), xs);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[row] = YT(acc);
+}
+#else // 預設：v1.0.0 的寫法（輸出逐位元不變）
 inline void xform_chunk(uint c, device const half *o, device const half *aux, device const float *ssp, device const bfloat *nw,
                         thread float *xv, thread float &xs) {
     xs = 0;
@@ -292,4 +409,5 @@ kernel void qmv_xf(device const uint *W [[buffer(0)]], device const ST *S [[buff
     acc = simd_sum(acc);
     if (lane == 0) y[row] = YT(acc);
 }
+#endif
 #endif

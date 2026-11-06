@@ -1,8 +1,11 @@
 // Qwental HTTP server：Anthropic Messages API（/v1/messages，含串流）與 OpenAI Chat Completions（/v1/chat/completions）
 // 一次處理一個請求（單一使用者）。
-// 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--version]
-// --gguf：整個模型改用該目錄的 GGUF（Strata 的 IQ3_S 等；等同 QW_GGUF=目錄 QW_GGUF_PARTS=all）
+// 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--exact-spec] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--version]
+// --gguf：整個模型改用該目錄的 GGUF（Strata 的 IQ3_S 等；等同 QW_GGUF=目錄 QW_GGUF_PARTS=all）。
+//   這時 MLX 目錄（--model）是選用的：沒有時 tokenizer 讀 GGUF 的 metadata，dflash2/ 改找 GGUF 目錄的同層
+//   （QW_GGUF_PARTS 只選一部分時其餘權重仍來自 MLX 目錄）
 // --fast-head：GGUF 的 Q6_K lm_head 走矩陣單元（權重捨入成 FP16，同 llama.cpp 的 mul_mm；輸出與預設略有差異；等同 QW_LM_TC=2）
+// --exact-spec：MLX profile 的推測解碼逐位元等於 greedy（kernel 改用 safe 數學模式；MLX 輸出與預設略有差異；GGUF 不受影響；等同 QW_EXACT_SPEC=1）
 // --int8：INT8 prefill（routed expert 走 INT8 × INT8，GGUF 另外加上 dense 投影；decode 不變；等同 QW_INT8=1）
 // --int8-qk：再加上 attention 的 Q·Kᵀ（indexer 打分與稀疏核心）走 INT8；--int8-hyper：再加上 GGUF hyper-connection 的 mix_down 走 INT8。
 //   兩者都隱含 --int8，各自會讓輸出再多一點差異（等同 QW_INT8=lin,attn,shared,moe[,qk][,hyper]）
@@ -490,6 +493,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--int8-qk")) { i8qk = true; continue; }
         if (!strcmp(argv[i], "--int8-hyper")) { i8hy = true; continue; }
         if (!strcmp(argv[i], "--fast-head")) { setenv("QW_LM_TC", "2", 1); continue; }
+        if (!strcmp(argv[i], "--exact-spec")) { setenv("QW_EXACT_SPEC", "1", 1); continue; }
         if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "--gguf")) { setenv("QW_GGUF", argv[i + 1], 1); setenv("QW_GGUF_PARTS", "all", 0); }
         else if (!strcmp(argv[i], "--port")) port = atoi(argv[i + 1]);
@@ -507,7 +511,7 @@ int main(int argc, char **argv) {
     } else if (i8) setenv("QW_INT8", "1", 1);
     signal(SIGPIPE, SIG_IGN);
     char err[1024];
-    TK = qw_tok_open(MODEL_DIR, err, sizeof err);
+    TK = qw_tok_open_any(MODEL_DIR, getenv("QW_GGUF"), err, sizeof err); // 沒有 MLX 目錄時用 GGUF 的 tokenizer
     if (!TK) { fprintf(stderr, "❌ %s\n", err); return 1; }
     IM_END = qw_tok_special(TK, "<|im_end|>");
     EOT = qw_tok_special(TK, "<|endoftext|>");
@@ -522,11 +526,27 @@ int main(int argc, char **argv) {
         qw_gen g = {.temperature = 0, .max_tokens = 4, .stop = NULL, .nstop = 0, .spec = !getenv("QW_NO_SPEC")};
         qw_engine_generate_ex(E, w, 4, &g, NULL, NULL, NULL);
     }
+    // INT8 prefill（--int8 等）的 kernel 依段長（< 128 或 ≥ 128 個 token）與 context（> 2048 才走稀疏 attention 與 INT8 Q·Kᵀ）
+    // 分別在第一次用到時編譯：再跑一段 WN 個 token 的 prefill 與接在後面的 WC 個 token（同一個 slot、從快照接續），
+    // 第一個長請求就不必等編譯。dummy token 不會與真正的 prompt（以 <|im_start|> 開頭）共用前綴，輸出不受影響
+    if (getenv("QW_INT8") && strcmp(getenv("QW_INT8"), "0") && !getenv("QW_NO_I8_WARM")) {
+        enum { WN = 2304, WC = 64 };
+        int32_t *w = malloc(sizeof(int32_t) * (WN + WC));
+        for (int i = 0; i < WN + WC; i++) w[i] = 1000 + (int32_t)((i * 7919u) % 100000u);
+        const double tw = qw_now();
+        qw_gen g = {.temperature = 0, .max_tokens = 1, .stop = NULL, .nstop = 0, .spec = false};
+        qw_engine_generate_ex(E, w, WN, &g, NULL, NULL, NULL);
+        qw_engine_generate_ex(E, w, WN + WC, &g, NULL, NULL, NULL);
+        free(w);
+        fprintf(stderr, "INT8 prefill kernel 預熱 %.1f 秒\n", qw_now() - tw);
+    }
     fprintf(stderr, "Qwental %s：模型載入與預熱 %.1f 秒，context %d%s%s%s，監聽 http://%s:%d\n", QW_VERSION, qw_now() - t0, ctx,
             getenv("QW_GGUF") ? "，GGUF " : "", getenv("QW_GGUF") ? getenv("QW_GGUF") : "",
             getenv("QW_INT8") && strcmp(getenv("QW_INT8"), "0") ? "，INT8 prefill" : "", host, port);
     if (i8qk || i8hy) fprintf(stderr, "INT8 prefill 另外包含：%s%s\n", i8qk ? "attention Q·Kᵀ（--int8-qk）" : "", i8hy ? (i8qk ? "、hyper mix_down（--int8-hyper）" : "hyper mix_down（--int8-hyper）") : "");
     if (getenv("QW_LM_TC") && atoi(getenv("QW_LM_TC"))) fprintf(stderr, "lm_head：矩陣單元版（--fast-head）\n");
+    if (getenv("QW_EXACT_SPEC") && strcmp(getenv("QW_EXACT_SPEC"), "0"))
+        fprintf(stderr, "推測解碼 = greedy（--exact-spec%s）\n", getenv("QW_GGUF") ? "；GGUF 本來就是，不影響" : "");
     const int ls = socket(AF_INET, SOCK_STREAM, 0);
     const int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);

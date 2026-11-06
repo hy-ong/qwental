@@ -55,9 +55,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 ```
 
 `models/` 裡需要的模型檔：
-- IQ3_S GGUF（`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` 的兩個分片）
-- `Qwen3.8-Flash-Next-mixed-4-8bit/`，來自 [`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit`](https://huggingface.co/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit)（tokenizer 與設定）
-- `dflash2/`，放 DFlash2 猜測模型的打包檔（`…q4_0-selq4.pack`）
+- IQ3_S GGUF（`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` 的兩個分片）；`--gguf` 時 tokenizer 直接從 GGUF 的 metadata 讀（token id 與 `tokenizer.json` 完全相同）
+- `dflash2/`，放 DFlash2 猜測模型的打包檔（`…q4_0-selq4.pack`），與 GGUF 目錄同層（有 MLX 目錄時與 MLX 目錄同層）
+- 選用：`Qwen3.8-Flash-Next-mixed-4-8bit/`，來自 [`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit`](https://huggingface.co/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit)，只有跑 MLX 權重（不加 `--gguf`）時才需要。有這個目錄時用它的 tokenizer。
 
 ## Server
 
@@ -68,6 +68,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 - `--int8`：prefill 的 expert 矩陣（GGUF 再加上 dense 矩陣）改走 INT8，長 prompt 約快 25–60%。decode 不變；輸出與預設略有差異（見「INT8 的代價」）。搭配 `--gguf` 時多用 3 GB 記憶體。
 - `--int8-qk`／`--int8-hyper`：在 `--int8` 之外，attention 的 Q·Kᵀ（`qk`）或 hyper-connection 的 mix_down（`hyper`，限 `--gguf`）也改走 INT8。兩者都隱含 `--int8`。`--int8-qk` 主要對長 prompt 有幫助，品質與 `--int8` 相當；`--int8-hyper` 屬實驗性質（測試中英文內容變差）。
 - `--fast-head`（搭配 `--gguf`）：Q6_K 的 lm_head 改走矩陣單元，權重捨入成 FP16（同 llama.cpp）。推測解碼的驗證較快；機率幾乎相同時，輸出可能與預設不同。
+- `--exact-spec`（MLX 權重）：推測解碼的輸出與 greedy 完全相同。MLX 輸出與預設略有差異；GGUF 不受影響（本來就相同）。
 
 ## 功能
 
@@ -78,7 +79,6 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 ## 限制
 
 - 只支援一個模型、一台機器（M5 Max），一次處理一個請求
-- 目前仍需要 MLX 模型目錄裡的 tokenizer
 
 ## 授權
 
