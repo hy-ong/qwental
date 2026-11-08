@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.0 — 2026-11-09
+
+Concurrent requests: several agents (for example Claude Code subagents) are served at once instead of one after another. A lone request runs as before; without flags its output is bit-identical to 1.0.0 on both the GGUF and the MLX profile.
+
+Same IQ3_S GGUF, 400-token requests sent together (`bench/concurrent.py`, total tok/s, 1.2.0 → 1.3.0): one at a time 110.9 → 110.1; 4 at once 110.3 → 146.7 (+33%); 8 at once 107.9 → 172.3 (+60%); 16 at once 109.0 → 170.9 (+57%). MLX weights, 8 at once: 81.8 → 135.8 (+66%).
+
+### Concurrency (on by default)
+- Up to 16 requests at once (`--parallel N` sets the bound, up to 64; `--parallel 1` serves one at a time). Each conversation has its own KV slot and DeltaNet state; the weight-shared parts (embedding, projections, MoE, lm_head) run for all conversations in one pass, the attention core and DeltaNet recurrence per conversation.
+- The scheduler works from measured speeds: a lone request uses speculative decoding; with more, it compares time-sliced speculation against batched decoding for the current count and uses the faster one. Batches over 8 are split into groups by the measured step time of each group size.
+- GGUF: each conversation's output is bit-identical to running it alone (per-step logits for 1–16 conversations and 4K contexts; staggered, streaming, disconnect and load tests). MLX: batched decoding rounds slightly differently, the same kind of difference MLX's default speculative decoding already has; with `--exact-spec` it is bit-identical.
+- Long prompts no longer pause the others: while other conversations are generating, a new prompt is prefilled in slices of about 500 ms (`QW_PAR_CHUNK_MS`), bit-identical to one pass. A 30K-token prompt next to running streams: longest pause 16.8 → 0.58 s; the prompt itself finishes in 32.5 s instead of 21.5 s.
+- Prefixes are shared across slots: a request copies a longer prefix (system prompt, tool list) from another conversation's slot, even a busy one (17K tokens in about 0.1 s instead of an 8 s prefill). Batched prefill also writes system-prompt snapshots to the SSD cache.
+- Memory guard: slot memory (KV is about 33 KB per token) is capped at physical memory minus the weight files minus 16 GB (`QW_SLOT_MEM_GB` sets it); the least recently used idle slots are freed first, and one more each second while the system's available memory is under 10%.
+- Startup takes about 1.5–2 s longer (kernel warmup and step timing for batched decoding).
+
+### Tests and tools
+- `build/run`: `QW_PAR` (per-step logits of several prompts decoded together vs alone), `QW_PAR_TR` (per layer), `QW_PF_CHUNK` (sliced vs single prefill), `QW_MTP_CHAIN` (chained MTP draft acceptance, measured only) and `QW_VB_BENCH` (verify-round cost per kernel).
+- A 15-minute run of 6 simulated agents (shared 17K-token system prompt, multi-turn, streaming, disconnects, temperature 0 and 0.7): 591 requests without errors, RSS steady around 27 GB. Claude Code with three parallel subagents against the server.
+
+### Known limits
+- Total throughput stops growing past about 8 concurrent requests: each group of 8 reads the weights again.
+- With `QW_GGUF_PARTS` selecting only some parts, requests are served one at a time.
+- A long prompt that arrives while nothing else runs is prefilled in one pass; requests arriving meanwhile wait for it.
+
 ## 1.2.0 — 2026-11-07
 
 Runs from a single GGUF, and the last known 1.0 issue has an opt-in fix. Without the new flags the output is bit-identical to 1.0.0 on both the GGUF and the MLX profile.

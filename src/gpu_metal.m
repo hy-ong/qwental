@@ -10,7 +10,7 @@
 #include "gpu.h"
 
 #define QW_MAX_LIBS 1024 // GGUF profile 每部分依格式 / token 數各編一份 library
-#define QW_MAX_KERNELS 512
+#define QW_MAX_KERNELS 4096 // 並發（--parallel）每種 token 數各編一批，512 不夠
 
 struct qw_kernel {
     char name[128];

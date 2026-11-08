@@ -29,6 +29,19 @@ Against oMLX 0.7.4.dev1 on the same MLX weights (mixed 4/8-bit, Qwental without 
 | Prefill 10.7K | 1884 | 1950 | 2456 / **2480** |
 | Prefill 47K | 2072 | 2015 | 2526 / **2611** |
 
+### Concurrent requests
+
+Several agents (for example Claude Code subagents) are served at once. Same IQ3_S GGUF, 400-token requests sent together (`bench/concurrent.py`, total tokens/s):
+
+| Requests at once | 1.2.0 | 1.3.0 |
+|---|---|---|
+| 1 | 110.9 | 110.1 |
+| 4 | 110.3 | **146.7** (+33%) |
+| 8 | 107.9 | **172.3** (+60%) |
+| 16 | 109.0 | **170.9** (+57%) |
+
+On the MLX weights, 8 at once: 81.8 → 135.8. GGUF output is bit-identical to running each request alone.
+
 ### What INT8 costs
 
 The INT8 flags change prefill numerics. Measured on 300 scored positions after an 8K–32K prompt, for code, English and Chinese text (`QW_PPL_PF`, `tools/logit_cmp.py`), against the same build without INT8 (GGUF; on the MLX weights `--int8` keeps top-1 at 96.3%, KL 0.008–0.039):
@@ -63,7 +76,8 @@ Model files in `models/`:
 
 - Anthropic Messages API: `/v1/messages` (streaming, thinking, tool use) and `/v1/messages/count_tokens`
 - OpenAI Chat Completions: `/v1/chat/completions`
-- Prefix cache with multiple KV slots and SSD-backed snapshots
+- Prefix cache with multiple KV slots and SSD-backed snapshots; prefixes are shared across concurrent conversations
+- Concurrent requests (on by default, up to 16; `--parallel N` sets the bound, up to 64, `--parallel 1` serves one at a time): speculative decoding for a lone request, batched decoding when several are active, picked from measured speed. A long new prompt is prefilled in slices so running conversations keep streaming. Slot memory is capped (physical memory minus weights minus 16 GB, or `QW_SLOT_MEM_GB`).
 - Use Claude Code or any Anthropic/OpenAI client as the front end
 - `--int8`: INT8 prefill for expert matrices (and dense matrices with `--gguf`), about 25–60% faster on long prompts. Decode is unchanged; outputs differ slightly from the default (see "What INT8 costs"). With `--gguf` it uses 3 GB more memory.
 - `--int8-qk` / `--int8-hyper`: on top of `--int8`, also run the attention Q·Kᵀ (`qk`) or the hyper-connection mix_down (`hyper`, `--gguf` only) in INT8. Each implies `--int8`. `--int8-qk` helps mostly on long prompts at about the same quality as `--int8`; `--int8-hyper` is experimental (it hurt English text in testing).
@@ -78,7 +92,9 @@ Model files in `models/`:
 
 ## Limits
 
-- One model, one machine (M5 Max), one request at a time
+- One model, one machine (M5 Max)
+- Concurrent requests: GGUF output is bit-identical to running alone; on the MLX weights batched decoding rounds slightly differently (like MLX's default speculative decoding), and `--exact-spec` makes it bit-identical. A lone request is unaffected
+- Total throughput stops growing past about 8 concurrent requests
 
 ## License
 

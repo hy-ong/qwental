@@ -171,34 +171,48 @@ struct dn_epi {
 };
 inline float dn_silu(float x) { return x / (1.0f + exp(-x)); }
 inline float dn_sigm(float x) { return 1.0f / (1.0f + exp(-x)); }
-// 第 g 列（[0, 16480)）的 NB 個結果 v → 各自的去處（一個執行緒做完一列）
-inline void dn_epi_row(uint g, thread const float *v, thread const dn_epi &ep, device half *yq, device half *yz, device float *la,
-                       device float *be, constant dn_in_args &a) {
+// 第 g 列（[0, 16480)）的 NT 個結果 v → 各自的去處（一個執行緒做完一列）。平常 NT = NB；並發（DN_MS）逐個 token 用 NT = 1
+template <uint NT>
+inline void dn_epi_rowT(uint g, thread const float *v, device float *st, device float *const *so, device const bfloat *cw,
+                        device const float *An, device const bfloat *dtb, device half *yq, device half *yz, device float *la,
+                        device float *be, constant dn_in_args &a) {
     constexpr uint C = 10240;
     if (g < C) {
-        float seq[3 + NB];
-        seq[0] = ep.st[g]; seq[1] = ep.st[C + g]; seq[2] = ep.st[2 * C + g];
-        for (uint t = 0; t < NB; t++) seq[3 + t] = float(half(v[t]));
-        const float w0 = float(ep.cw[g * 4]), w1 = float(ep.cw[g * 4 + 1]), w2 = float(ep.cw[g * 4 + 2]), w3 = float(ep.cw[g * 4 + 3]);
-        for (uint t = 0; t < NB; t++) yq[(ulong)t * a.ys[0] + g] = half(dn_silu(w0 * seq[t] + w1 * seq[t + 1] + w2 * seq[t + 2] + w3 * seq[t + 3]));
-        ep.st[g] = seq[1]; ep.st[C + g] = seq[2]; ep.st[2 * C + g] = seq[3];
-        for (uint t = 1; t < NB; t++) {
-            device float *o = ep.so[t - 1];
+        float seq[3 + NT];
+        seq[0] = st[g]; seq[1] = st[C + g]; seq[2] = st[2 * C + g];
+        for (uint t = 0; t < NT; t++) seq[3 + t] = float(half(v[t]));
+        const float w0 = float(cw[g * 4]), w1 = float(cw[g * 4 + 1]), w2 = float(cw[g * 4 + 2]), w3 = float(cw[g * 4 + 3]);
+        for (uint t = 0; t < NT; t++) yq[(ulong)t * a.ys[0] + g] = half(dn_silu(w0 * seq[t] + w1 * seq[t + 1] + w2 * seq[t + 2] + w3 * seq[t + 3]));
+        st[g] = seq[1]; st[C + g] = seq[2]; st[2 * C + g] = seq[3];
+        for (uint t = 1; t < NT; t++) {
+            device float *o = so[t - 1];
             o[g] = seq[t + 1]; o[C + g] = seq[t + 2]; o[2 * C + g] = seq[t + 3];
         }
     } else if (g < 16384) {
-        for (uint t = 0; t < NB; t++) yz[(ulong)t * a.ys[1] + g - C] = half(v[t]);
+        for (uint t = 0; t < NT; t++) yz[(ulong)t * a.ys[1] + g - C] = half(v[t]);
     } else if (g < 16432) {
         const uint j = g - 16384;
-        for (uint t = 0; t < NB; t++) {
-            const float xa = float(half(v[t])) + float(ep.dtb[j]);
+        for (uint t = 0; t < NT; t++) {
+            const float xa = float(half(v[t])) + float(dtb[j]);
             const float sp = xa > 20.0f ? xa : log(1.0f + exp(xa));
-            la[t * a.ys[2] + j] = ep.A[j] * sp;
+            la[t * a.ys[2] + j] = An[j] * sp;
         }
     } else {
         const uint j = g - 16432;
-        for (uint t = 0; t < NB; t++) be[t * a.ys[3] + j] = dn_sigm(float(half(v[t])));
+        for (uint t = 0; t < NT; t++) be[t * a.ys[3] + j] = dn_sigm(float(half(v[t])));
     }
+}
+inline void dn_epi_row(uint g, thread const float *v, thread const dn_epi &ep, device half *yq, device half *yz, device float *la,
+                       device float *be, constant dn_in_args &a) {
+#ifdef DN_MS
+    // 並發（qwental-serve --parallel）：第 t 個 token 是另一個對話，conv 狀態各自一份（t = 0 是 st、t ≥ 1 是 so[t − 1]）；
+    // 每個 token 用 NT = 1 的同一份程式（與 decode 逐位元相同）
+    for (uint t = 0; t < NB; t++)
+        dn_epi_rowT<1>(g, v + t, t == 0 ? ep.st : ep.so[t - 1], ep.so, ep.cw, ep.A, ep.dtb, yq + (ulong)t * a.ys[0], yz + (ulong)t * a.ys[1],
+                       la + t * a.ys[2], be + t * a.ys[3], a);
+#else
+    dn_epi_rowT<NB>(g, v, ep.st, ep.so, ep.cw, ep.A, ep.dtb, yq, yz, la, be, a);
+#endif
 }
 #define DN_EPI_ARGS                                                                                                              \
     device const bfloat *cw [[buffer(11)]], device float *st [[buffer(12)]], device const float *An [[buffer(13)]],             \

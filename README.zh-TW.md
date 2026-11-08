@@ -29,6 +29,19 @@ Qwental 直接執行 Strata 預設的模型檔 ISTA-DASLab GSQ-RCO **IQ3_S GGUF*
 | Prefill 10.7K | 1884 | 1950 | 2456／**2480** |
 | Prefill 47K | 2072 | 2015 | 2526／**2611** |
 
+### 同時多個請求
+
+多個 agent（例如 Claude Code 的 subagent）可以同時進行。同一個 IQ3_S GGUF，同時送出每個 400 token 的請求（`bench/concurrent.py`，總 tok/s）：
+
+| 同時請求數 | 1.2.0 | 1.3.0 |
+|---|---|---|
+| 1 | 110.9 | 110.1 |
+| 4 | 110.3 | **146.7**（+33%） |
+| 8 | 107.9 | **172.3**（+60%） |
+| 16 | 109.0 | **170.9**（+57%） |
+
+MLX 權重同時 8 個：81.8 → 135.8。GGUF 的輸出與每個請求單獨跑逐位元相同。
+
 ### INT8 的代價
 
 INT8 旗標會改變 prefill 的數值。以程式碼、英文、中文三種內容，在 8K–32K 的 prompt 之後打分 300 個位置（`QW_PPL_PF`、`tools/logit_cmp.py`），與同一版不開 INT8 比較（GGUF；MLX 權重下 `--int8` 第一名相同 96.3%、KL 0.008–0.039）：
@@ -63,7 +76,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 
 - Anthropic Messages API：`/v1/messages`（串流、thinking、tool use）與 `/v1/messages/count_tokens`
 - OpenAI Chat Completions：`/v1/chat/completions`
-- Prefix cache：多組 KV slot，並把快照存到 SSD
+- Prefix cache：多組 KV slot，並把快照存到 SSD；同時進行的對話之間共用前綴
+- 同時多個請求（預設開，最多 16 個；`--parallel N` 改上限，最多 64，`--parallel 1` 一次一個）：只有一個請求時走推測解碼，多個時一起 decode，依實測速度自動選。新的長 prompt 分段 prefill，正在生成的對話不會停住。slot 的記憶體有上限（實體記憶體 − 權重 − 16 GB，或 `QW_SLOT_MEM_GB`）。
 - 前端可以用 Claude Code 或任何 Anthropic / OpenAI 相容的 client
 - `--int8`：prefill 的 expert 矩陣（GGUF 再加上 dense 矩陣）改走 INT8，長 prompt 約快 25–60%。decode 不變；輸出與預設略有差異（見「INT8 的代價」）。搭配 `--gguf` 時多用 3 GB 記憶體。
 - `--int8-qk`／`--int8-hyper`：在 `--int8` 之外，attention 的 Q·Kᵀ（`qk`）或 hyper-connection 的 mix_down（`hyper`，限 `--gguf`）也改走 INT8。兩者都隱含 `--int8`。`--int8-qk` 主要對長 prompt 有幫助，品質與 `--int8` 相當；`--int8-hyper` 屬實驗性質（測試中英文內容變差）。
@@ -78,7 +92,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 
 ## 限制
 
-- 只支援一個模型、一台機器（M5 Max），一次處理一個請求
+- 只支援一個模型、一台機器（M5 Max）
+- 同時多個請求：GGUF 的輸出與單獨跑逐位元相同；MLX 權重一起 decode 時捨入與單獨跑略有不同（同 MLX 預設的推測解碼），加 `--exact-spec` 就逐位元相同。只有一個請求時不受影響
+- 同時超過約 8 個請求後，總速度不再增加
 
 ## 授權
 

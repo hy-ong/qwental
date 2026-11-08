@@ -1,7 +1,7 @@
 // Qwental 推論 engine（目前：decode 路徑，一次一個 token；prompt 也逐個 token 餵入）
 #pragma once
 
-#define QW_VERSION "1.2.0"
+#define QW_VERSION "1.3.0"
 #include <stdbool.h>
 #include <stdint.h>
 #include "gpu.h"
@@ -28,6 +28,8 @@ const float *qw_engine_prefill(qw_engine *e, const int32_t *ids, int n, float *d
 // MTP 猜一個 token（必須緊接在主模型處理位置 pos 的那一步之後）：next 是主模型選出的下一個 token，
 // 回傳 MTP 預測的再下一個 token（沒有 MTP 權重時回傳 −1）
 int32_t qw_engine_mtp_draft(qw_engine *e, int32_t next, int pos, double *gpu_ms);
+double qw_engine_vb_bench(qw_engine *e, const int32_t *toks, int k, int reps); // 驗證 k 個 token 的 GPU ms（實驗）
+int32_t qw_engine_mtp_chain(qw_engine *e, int32_t next, int pos, double *gpu_ms); // 接著上一次猜下一個（實驗）
 
 // MTP 推測解碼（greedy）：逐 token 處理 prompt（同時填 MTP 的 cache），之後每輪一次驗證 2 個 token。
 // 回傳生成數；stats = [輪數, 猜中數]；times = [prompt 的 GPU ms, 生成的 GPU ms, 生成的牆鐘 ms]
@@ -45,13 +47,14 @@ typedef struct {
     bool spec;             // 推測解碼（MTP + n-gram）
     const int *persist;    // 處理到這些位置時把狀態存到 SSD（例如 system 訊息結尾）；需要 qw_engine_set_cache_dir
     int npersist;
+    volatile bool *yield; // 非 NULL 且為 true 時：在推測解碼一輪結束（或不推測時一個 token）後停下，回傳 QW_FIN_YIELD（並發模式切換用）
 } qw_gen;
 typedef bool (*qw_tok_cb)(void *ctx, int32_t tok);
 typedef struct {
     int prompt, cached, gen, rounds, accepted, ngram_rounds;
     double prefill_ms, gen_ms;
 } qw_gen_stats;
-enum { QW_FIN_STOP, QW_FIN_LENGTH, QW_FIN_CALLBACK, QW_FIN_CTX, QW_FIN_ERROR = -1 };
+enum { QW_FIN_STOP, QW_FIN_LENGTH, QW_FIN_CALLBACK, QW_FIN_CTX, QW_FIN_YIELD, QW_FIN_ERROR = -1 };
 int qw_engine_generate_ex(qw_engine *e, const int32_t *prompt, int np, const qw_gen *g, qw_tok_cb cb, void *ctx, qw_gen_stats *st);
 void qw_engine_reset(qw_engine *e); // 回到空的 context
 void qw_engine_set_cache_dir(qw_engine *e, const char *dir); // 持久化前綴快取的目錄
@@ -68,3 +71,19 @@ int qw_engine_df_test(qw_engine *e, const float *feats, const int32_t *toks, int
 // 除錯（QW_TRACE）：驗證與 decode 逐層比對
 const void *qw_engine_trace_vb(qw_engine *e, const int32_t *toks, int k);
 const void *qw_engine_trace_buf(qw_engine *e, int tok);
+
+// ---- 並發（--parallel N）：每個對話一個 slot（QW_SLOTS ≥ 並發數）。GGUF 與單獨跑逐位元相同；MLX 只在 QW_EXACT_SPEC 時相同（否則捨入略有不同）
+int qw_engine_par_slots(qw_engine *e);
+enum { QW_PAR_MAX = 64 }; // 最多幾個對話同時進行（每步超過 8 個時分組算）
+int qw_engine_par_pick(qw_engine *e, const int32_t *prompt, int np, unsigned long long busy); // 選沒在用的 slot（busy 位元 = 正在用），-1 = 沒有
+const float *qw_engine_par_prefill(qw_engine *e, int sid, const int32_t *prompt, int np, int *cached); // 回傳最後位置的 logits
+const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prompt, int np, int chunk, int *done, int *cached); // 分段：一次最多 chunk 個，*done = 算到哪（> 0 從那裡接著算）
+void qw_engine_par_persist(qw_engine *e, const int *pos, int n); // 接下來的 par_prefill 處理到這些位置時把狀態存到 SSD（同 qw_gen.persist）
+const float *qw_engine_par_step(qw_engine *e, const int *sids, const int32_t *toks, int B, double *gpu_ms); // [B][vocab] logits
+void qw_engine_par_finish(qw_engine *e, int sid, const int32_t *gen, int ngen); // 生成結束：存快照給下次接續
+int qw_engine_par_solo(qw_engine *e, int sid, const int32_t *prompt, int np, const qw_gen *g, qw_tok_cb cb, void *ctx,
+                       qw_gen_stats *st); // 只有一個請求：在 slot sid 走一般生成（推測解碼）；cb 回傳 false 中途停下
+double qw_engine_par_cost(qw_engine *e, int B); // B 個對話一起 decode 一步的預估牆鐘 ms（最佳分組；0 = 還沒量過）
+size_t qw_engine_par_mem(qw_engine *e); // 各 slot 佔的記憶體合計（位元組）
+int qw_engine_par_trim(qw_engine *e, unsigned long long busy, size_t budget, bool one); // 超過 budget 就釋放最久沒用的閒置 slot（one：只放一組）；回傳放了幾組
+int32_t qw_engine_sample(const float *logits, const qw_gen *g, unsigned long long *rng); // 同 qw_engine_generate_ex 的取樣（rng 會前進）

@@ -16,6 +16,10 @@ static bool print_cb(void *ctx, int32_t t) {
     return true;
 }
 
+static uint64_t par_hash(const float *l) { uint64_t h = 1469598103934665603ull; const uint32_t *u = (const uint32_t *)l; for (int i = 0; i < 248320; i++) h = (h ^ u[i]) * 1099511628211ull; return h; }
+typedef struct { int n; int32_t *o; } par_col;
+static bool par_cb(void *c, int32_t t) { par_col *q = c; q->o[q->n++] = t; return true; }
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "用法：%s token,token,...|@檔案 [生成數量] [dump 目錄]（QW_CTX=最大 context，預設 4096）\n", argv[0]);
@@ -84,6 +88,307 @@ int main(int argc, char **argv) {
                100.0 * st[1] / (st[0] ? st[0] : 1), (double)(got - 1) / (st[0] ? st[0] : 1), tm[1] / (st[0] ? st[0] : 1));
         printf("生成 %d 個 token：GPU %.0f ms（%.1f tok/s）、牆鐘 %.0f ms（%.1f tok/s）\n", got - 1, tm[1], (got - 1) / tm[1] * 1e3, tm[2],
                (got - 1) / tm[2] * 1e3);
+        qw_engine_close(e);
+        return 0;
+    }
+    if (getenv("QW_PF_CHUNK")) { // 分段 prefill（每段 QW_PF_CHUNK 個 token，接著上一段）與一次 prefill 的最後 logits 比
+        const int C = atoi(getenv("QW_PF_CHUNK"));
+        double pm = 0;
+        qw_engine_reset(e);
+        const float *a = qw_engine_prefill(e, ids, n, NULL, &pm);
+        if (!a) return 1;
+        float *ac = malloc(248320 * 4);
+        memcpy(ac, a, 248320 * 4);
+        const float *s1 = qw_engine_step(e, 760, NULL);
+        float *sc = malloc(248320 * 4);
+        memcpy(sc, s1, 248320 * 4);
+        qw_engine_reset(e);
+        const float *b = NULL;
+        for (int i = 0; i < n; i += C) if (!(b = qw_engine_prefill(e, ids + i, n - i < C ? n - i : C, NULL, &pm))) return 1;
+        printf("分段 %d：prefill logits %s", C, memcmp(ac, b, 248320 * 4) ? "不同" : "相同");
+        const float *s2 = qw_engine_step(e, 760, NULL);
+        printf("、下一步 %s\n", memcmp(sc, s2, 248320 * 4) ? "不同" : "相同");
+        qw_engine_close(e);
+        return 0;
+    }
+    if (getenv("QW_PAR_TR")) { // 逐層比：一般 decode 一步 vs 並發（B = 1）一步（prompt 的最後一個 token；QW_TRACE 要設）
+        enum { REC = 10240 * 4 + 2560 * 2 };
+        double pm = 0;
+        qw_engine_reset(e);
+        if (!qw_engine_prefill(e, ids, n - 1, NULL, &pm)) return 1;
+        qw_engine_trace_buf(e, 0);
+        const float *dl = qw_engine_step(e, ids[n - 1], NULL);
+        float *dlc = malloc(248320 * 4);
+        memcpy(dlc, dl, 248320 * 4);
+        uint8_t *a = malloc((size_t)48 * 2 * REC);
+        memcpy(a, qw_engine_trace_buf(e, 0), (size_t)48 * 2 * REC);
+        setenv("QW_SLOTS", "3", 1);
+        const int TB = atoi(getenv("QW_PAR_TR")) > 1 ? atoi(getenv("QW_PAR_TR")) : 1; // QW_PAR_TR=k：同一個 prompt k 份一起，各欄都與 decode 比
+        int sidv[8];
+        int32_t tkv[8];
+        unsigned long long busy = 0;
+        for (int q = 0; q < TB; q++) {
+            sidv[q] = qw_engine_par_pick(e, ids, n - 1, busy);
+            busy |= 1ull << sidv[q];
+            if (!qw_engine_par_prefill(e, sidv[q], ids, n - 1, NULL)) return 1;
+            tkv[q] = ids[n - 1];
+        }
+        const float *plg = qw_engine_par_step(e, sidv, tkv, TB, NULL);
+        if (!plg) return 1;
+        for (int q = 0; q < TB; q++) printf("第 %d 欄 logits：%s\n", q, memcmp(plg + (size_t)q * 248320, dlc, 248320 * 4) ? "不同" : "相同");
+        const uint8_t *c0 = qw_engine_trace_buf(e, 0);
+        for (int q = 0; q < TB; q++) {
+        const uint8_t *c = c0 + (size_t)q * 48 * 2 * REC;
+        printf("第 %d 欄：", q);
+        for (int l = 0; l < 48; l++)
+            for (int pt = 0; pt < 2; pt++) {
+                const size_t o = ((size_t)l * 2 + pt) * REC;
+                const bool hs = !memcmp(a + o, c + o, 10240 * 4), os = !memcmp(a + o + 10240 * 4, c + o + 10240 * 4, 2560 * 2);
+                if (!hs || !os) { printf("第 %d 層%s：h %s、out %s\n", l, pt ? "（MoE 之後）" : "（attention / DeltaNet 之後）", hs ? "同" : "不同", os ? "同" : "不同"); l = 48; break; }
+            }
+        }
+        printf("比完\n");
+        qw_engine_close(e);
+        return 0;
+    }
+    if (getenv("QW_PAR_LG")) { // 一個 prompt：一般 decode（prefill + qw_engine_step）與並發路徑（B = 1）逐步比 logits，印出第一個不同的步
+        const int N = ngen;
+        float *ref = malloc((size_t)N * 248320 * 4);
+        int32_t *rt = malloc(sizeof(int32_t) * (size_t)N);
+        double pm = 0;
+        qw_engine_reset(e);
+        const float *l0 = qw_engine_prefill(e, ids, n, NULL, &pm);
+        for (int k = 0; k < N; k++) {
+            memcpy(ref + (size_t)k * 248320, l0, 248320 * 4);
+            int bst = 0;
+            for (int v = 1; v < 248320; v++) if (l0[v] > l0[bst]) bst = v;
+            rt[k] = bst;
+            l0 = qw_engine_step(e, bst, NULL);
+        }
+        setenv("QW_SLOTS", "3", 1);
+        const int sid = qw_engine_par_pick(e, ids, n, 0);
+        const float *pl = qw_engine_par_prefill(e, sid, ids, n, NULL);
+        int first = -1; double mx = 0;
+        for (int k = 0; k < N; k++) {
+            const float *r = ref + (size_t)k * 248320;
+            double d = 0;
+            for (int v = 0; v < 248320; v++) { const double q = fabs((double)pl[v] - r[v]); if (q > d) d = q; }
+            if (d > 0 && first < 0) first = k;
+            if (d > mx) mx = d;
+            if (d > 0 && k < first + 3) printf("第 %d 步（位置 %d）：logits 最大差 %.3g\n", k, n + k - 1, d);
+            int32_t tk = rt[k];
+            pl = qw_engine_par_step(e, &sid, &tk, 1, NULL);
+            if (!pl) return 1;
+        }
+        printf("%s；最大差 %.3g\n", first < 0 ? "全部逐位元相同" : "有差異", mx);
+        qw_engine_close(e);
+        return 0;
+    }
+    if (getenv("QW_PAR")) { // QW_PAR=檔案,檔案,…（各一個 prompt 的 token id）：先各自單獨 greedy（原本的路徑），再一起並發 greedy，逐 token 比較
+        enum { PM = 64 };
+        int32_t *pid[PM]; int pn[PM], B = 0;
+        char *lst = strdup(getenv("QW_PAR"));
+        for (char *f = strtok(lst, ","); f && B < PM; f = strtok(NULL, ",")) {
+            FILE *fp = fopen(f, "rb");
+            if (!fp) { fprintf(stderr, "開不了 %s\n", f); return 1; }
+            pid[B] = malloc(sizeof(int32_t) * 200000); pn[B] = 0;
+            long v; char c;
+            while (fscanf(fp, "%ld", &v) == 1) { pid[B][pn[B]++] = (int32_t)v; if (fscanf(fp, "%c", &c) != 1) break; }
+            fclose(fp);
+            B++;
+        }
+        const int N = ngen;
+        static int32_t ref[PM][4096], got[PM][4096];
+        static uint64_t rh[PM][4096];
+        const bool skip_ref = getenv("QW_PAR_NOREF") != NULL;
+        for (int i = 0; i < B && !skip_ref; i++) { // 基準：一般 decode（prefill + qw_engine_step，greedy），每步 logits 的雜湊
+            double pm = 0;
+            qw_engine_reset(e);
+            const float *l0 = qw_engine_prefill(e, pid[i], pn[i], NULL, &pm);
+            for (int k = 0; k < N && l0; k++) {
+                rh[i][k] = par_hash(l0);
+                int bst = 0;
+                for (int v = 1; v < 248320; v++) if (l0[v] > l0[bst]) bst = v;
+                ref[i][k] = bst;
+                if (k + 1 < N) l0 = qw_engine_step(e, bst, NULL);
+            }
+        }
+        int lgbad[PM];
+        for (int i = 0; i < PM; i++) lgbad[i] = -1;
+        int sid[PM]; int32_t last[PM]; unsigned long long busy = 0;
+        double tp = qw_now();
+        for (int i = 0; i < B; i++) {
+            sid[i] = qw_engine_par_pick(e, pid[i], pn[i], busy);
+            if (sid[i] < 0) { fprintf(stderr, "沒有空的 slot（QW_SLOTS）\n"); return 1; }
+            busy |= 1ull << sid[i];
+            const float *pl = qw_engine_par_prefill(e, sid[i], pid[i], pn[i], NULL);
+            if (!pl) { fprintf(stderr, "prefill 失敗\n"); return 1; }
+            int bst = 0;
+            for (int v = 1; v < 248320; v++) if (pl[v] > pl[bst]) bst = v;
+            got[i][0] = last[i] = bst;
+            if (!skip_ref && par_hash(pl) != rh[i][0] && lgbad[i] < 0) lgbad[i] = 0;
+        }
+        tp = qw_now() - tp;
+        double gsum = 0, tw = qw_now();
+        for (int k = 1; k < N; k++) {
+            if (k == 2) { tw = qw_now(); gsum = 0; } // 第一步含 kernel 編譯，不算
+            double gm = 0;
+            const float *bl = qw_engine_par_step(e, sid, last, B, &gm);
+            if (!bl) { fprintf(stderr, "par_step 失敗\n"); return 1; }
+            gsum += gm;
+            for (int i = 0; i < B; i++) {
+                const float *r = bl + (size_t)i * 248320;
+                if (!skip_ref && lgbad[i] < 0 && got[i][k - 1] == ref[i][k - 1] && par_hash(r) != rh[i][k]) lgbad[i] = k;
+                int bst = 0;
+                for (int v = 1; v < 248320; v++) if (r[v] > r[bst]) bst = v;
+                got[i][k] = last[i] = bst;
+            }
+        }
+        tw = qw_now() - tw;
+        if (getenv("QW_PAR_KPROF")) { // 再跑一步，逐 dispatch 計時、依 kernel 名稱加總
+            qw_gpu *g = qw_engine_gpu(e);
+            qw_profile_enable(g, true);
+            qw_engine_par_step(e, sid, last, B, NULL);
+            const int nd = qw_profile_count(g);
+            typedef struct { const char *name; double us; int cnt; } agg;
+            static agg ag[512];
+            int na = 0;
+            double tot = 0;
+            for (int q = 0; q < nd; q++) {
+                double us;
+                const char *nm = qw_profile_get(g, q, &us);
+                tot += us;
+                int j = 0;
+                while (j < na && strcmp(ag[j].name, nm)) j++;
+                if (j == na && na < 512) ag[na++] = (agg){nm, 0, 0};
+                if (j < na) { ag[j].us += us; ag[j].cnt++; }
+            }
+            for (int x = 0; x < na; x++)
+                for (int y = x + 1; y < na; y++)
+                    if (ag[y].us > ag[x].us) { agg t = ag[x]; ag[x] = ag[y]; ag[y] = t; }
+            printf("\n## 並發 %d 一步的 kernel（%d 個 dispatch，合計 %.2f ms）\n", B, nd, tot / 1e3);
+            for (int x = 0; x < na && x < 22; x++) printf("| %s | %d | %.3f ms |\n", ag[x].name, ag[x].cnt, ag[x].us / 1e3);
+            qw_profile_enable(g, false);
+        }
+        for (int i = 0; i < B; i++) {
+            int same = 0;
+            while (same < N && got[i][same] == ref[i][same]) same++;
+            if (skip_ref) printf("對話 %d（slot %d，prompt %d）\n", i, sid[i], pn[i]);
+            else if (lgbad[i] >= 0) printf("對話 %d（slot %d，prompt %d）：前 %d / %d 個 token 相同，logits 從第 %d 步起不同 ✗\n", i, sid[i], pn[i], same, N, lgbad[i]);
+            else printf("對話 %d（slot %d，prompt %d）：%d 個 token、每步 logits 都與單獨跑逐位元相同%s\n", i, sid[i], pn[i], N, same == N ? " ✓" : "（token 卻不同？）✗");
+        }
+        printf("並發 %d：prefill 共 %.0f ms；decode %d 步，每步 GPU %.2f ms、牆鐘 %.2f ms → 總共 %.1f tok/s（每個對話 %.1f）\n", B, tp * 1e3, N - 1,
+               gsum / (N - 2), tw * 1e3 / (N - 2), B * (N - 2) / tw, (N - 2) / tw);
+        qw_engine_close(e);
+        return 0;
+    }
+    if (getenv("QW_VB_BENCH")) { // QW_VB_BENCH=次數：prefill 前 n−8 個 token，再用最後 8 個 token 量驗證 1…8 個 token 的 GPU 時間
+        const int reps = atoi(getenv("QW_VB_BENCH")) > 0 ? atoi(getenv("QW_VB_BENCH")) : 10;
+        double pm = 0;
+        if (!qw_engine_prefill(e, ids, n - 8, NULL, &pm)) return 1;
+        qw_engine_vb_bench(e, ids + n - 8, 1, 2);
+        for (int k = 2; k <= 8; k++) qw_engine_vb_bench(e, ids + n - 8, k, 1); // 暖機（編譯）
+        for (double tw = qw_now(); qw_now() - tw < 1.5;) qw_engine_vb_bench(e, ids + n - 8, 8, 1); // 讓 GPU 時脈拉起來
+        if (getenv("QW_VB_PROF")) { // QW_VB_PROF=k：驗證 k 個 token 一次，逐 dispatch 計時，依 kernel 名稱加總
+            const int k = atoi(getenv("QW_VB_PROF"));
+            qw_gpu *g = qw_engine_gpu(e);
+            qw_profile_enable(g, true);
+            qw_engine_vb_bench(e, ids + n - 8, k, 1);
+            const int nd = qw_profile_count(g);
+            typedef struct { const char *name; double us; int cnt; } agg;
+            agg a[256];
+            int na = 0;
+            double tot = 0;
+            for (int i = 0; i < nd; i++) {
+                double us;
+                const char *nm = qw_profile_get(g, i, &us);
+                tot += us;
+                int j = 0;
+                while (j < na && strcmp(a[j].name, nm)) j++;
+                if (j == na && na < 256) a[na++] = (agg){nm, 0, 0};
+                if (j < na) { a[j].us += us; a[j].cnt++; }
+            }
+            for (int i = 0; i < na; i++)
+                for (int j = i + 1; j < na; j++)
+                    if (a[j].us > a[i].us) { agg t = a[i]; a[i] = a[j]; a[j] = t; }
+            printf("\n## 驗證 %d 個 token 的每個 kernel（%d 個 dispatch，合計 %.2f ms）\n\n| kernel | 次數 | 合計 | 每次 |\n|---|---|---|---|\n", k, nd, tot / 1e3);
+            for (int i = 0; i < na; i++) printf("| %s | %d | %.3f ms | %.1f µs |\n", a[i].name, a[i].cnt, a[i].us / 1e3, a[i].us / a[i].cnt);
+            qw_profile_enable(g, false);
+            qw_engine_close(e);
+            return 0;
+        }
+        double t1 = 0;
+        printf("context %d；", n - 8);
+        for (int k = 1; k <= 8; k++) {
+            const double t = qw_engine_vb_bench(e, ids + n - 8, k, reps);
+            if (k == 1) t1 = t;
+            printf(" %d:%.2f", k, t);
+        }
+        printf(" ms（1 = 一般 decode %.2f）\n", t1);
+        qw_engine_close(e);
+        return 0;
+    }
+    if (getenv("QW_MTP_CHAIN")) {
+        // 量 MTP 鏈（一輪猜 K 個）：逐 token 跑主模型（greedy），每步之後用真實殘差流猜第 1 個，再用 MTP 自己的殘差流連續猜到第 K 個。
+        // 下一步主模型用真實殘差流重跑 MTP，蓋掉鏈寫進 MTP cache 的位置（同 NInfer 的 history repair）
+        const int K = atoi(getenv("QW_MTP_CHAIN")) < 1 ? 1 : atoi(getenv("QW_MTP_CHAIN")) > 8 ? 8 : atoi(getenv("QW_MTP_CHAIN"));
+        const int total = n + ngen;
+        int32_t *seq = malloc(sizeof(int32_t) * (size_t)(total + 16));
+        int32_t (*dr)[8] = calloc((size_t)total + 16, sizeof *dr);
+        double m1 = 0, mc = 0;
+        int nc = 0;
+        memcpy(seq, ids, sizeof(int32_t) * (size_t)n);
+        for (int t = 0; t < total - 1; t++) {
+            const float *l2 = qw_engine_step(e, seq[t], NULL);
+            if (!l2) return 1;
+            int best = 0;
+            for (int v = 1; v < 248320; v++) if (l2[v] > l2[best]) best = v;
+            if (t + 1 >= n) seq[t + 1] = best;
+            double ms = 0;
+            int32_t d = qw_engine_mtp_draft(e, seq[t + 1], t, &ms); // 猜 seq[t+2]
+            m1 += ms;
+            if (t + 1 >= n - 1) { // 生成區：dr[t+1] = 從 seq[t+1] 之後猜的 K 個
+                dr[t + 1][0] = d;
+                for (int k = 1; k < K; k++) {
+                    d = qw_engine_mtp_chain(e, d, t + k, &ms);
+                    mc += ms;
+                    nc++;
+                    dr[t + 1][k] = d;
+                }
+            }
+        }
+        // 生成遇到停止 token 就截斷（之後的內容沒有意義）
+        int tot2 = total;
+        for (int i = n; i < total; i++) if (seq[i] == 248046 || seq[i] == 248044) { tot2 = i + 1; break; }
+        const int total_ = total;
+        (void)total_;
+#define total tot2
+        // 核對：位置 a（已決定的 anchor）之後猜的 K 個 vs seq[a+1..a+K]
+        int hist[9] = {0}, cnt = 0, hitk[8] = {0};
+        for (int a = n - 1; a + K < total; a++) {
+            int j = 0;
+            while (j < K && dr[a][j] == seq[a + 1 + j]) j++;
+            hist[j]++;
+            cnt++;
+            for (int k = 0; k < K; k++) hitk[k] += dr[a][k] == seq[a + 1 + k];
+        }
+        // 模擬實際推測解碼的輪次：從 anchor 開始，每輪前進 1 + 接受數
+        int rounds = 0, adv = 0;
+        for (int a = n - 1; a + K < total;) {
+            int j = 0;
+            while (j < K && dr[a][j] == seq[a + 1 + j]) j++;
+            rounds++;
+            adv += 1 + j;
+            a += 1 + j;
+        }
+        if (getenv("QW_MTP_OUT")) { FILE *fo = fopen(getenv("QW_MTP_OUT"), "w"); for (int i = n; i < total; i++) fprintf(fo, "%d%s", seq[i], i + 1 < total ? "," : "\n"); fclose(fo); }
+        printf("MTP 鏈 K=%d：%d 個 anchor；連續猜中數分布", K, cnt);
+        for (int j = 0; j <= K; j++) printf(" %d:%d", j, hist[j]);
+        printf("\n各步猜中率（不管前面）：");
+        for (int k = 0; k < K; k++) printf(" 第%d個 %.1f%%", k + 1, 100.0 * hitk[k] / (cnt ? cnt : 1));
+        printf("\n模擬推測：%d 輪前進 %d 個 token，每輪 %.2f 個；MTP 第 1 步平均 %.2f ms、鏈每步 %.2f ms\n", rounds, adv,
+               (double)adv / (rounds ? rounds : 1), m1 / (total - 1), nc ? mc / nc : 0);
+#undef total
         qw_engine_close(e);
         return 0;
     }
