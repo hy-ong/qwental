@@ -59,6 +59,14 @@ The INT8 flags change prefill numerics. Measured on 300 scored positions after a
 
 Requirements: macOS 27, Xcode 27, M5 Max with 128 GB.
 
+Install with Homebrew (builds from source), then run `qwental-serve` in place of `./build/qwental-serve` below:
+
+```sh
+brew install hy-ong/tap/qwental
+```
+
+Or build in the repository:
+
 ```sh
 make build/qwental-serve   # optional: make install (copies the single binary to /usr/local/bin; PREFIX=… to change)
 mkdir -p models/iq3s-gguf

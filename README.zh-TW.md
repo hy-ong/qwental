@@ -59,6 +59,14 @@ INT8 旗標會改變 prefill 的數值。以程式碼、英文、中文三種內
 
 需要 macOS 27、Xcode 27、128 GB 的 M5 Max。
 
+用 Homebrew 安裝（從原始碼編譯），之後把下面的 `./build/qwental-serve` 換成 `qwental-serve`：
+
+```sh
+brew install hy-ong/tap/qwental
+```
+
+或在 repository 裡編譯：
+
 ```sh
 make build/qwental-serve   # 選用：make install（把單一執行檔複製到 /usr/local/bin；用 PREFIX=… 改位置）
 mkdir -p models/iq3s-gguf
