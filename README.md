@@ -60,7 +60,7 @@ The INT8 flags change prefill numerics. Measured on 300 scored positions after a
 Requirements: macOS 27, Xcode 27, M5 Max with 128 GB.
 
 ```sh
-make build/qwental-serve
+make build/qwental-serve   # optional: make install (copies the single binary to /usr/local/bin; PREFIX=… to change)
 mkdir -p models/iq3s-gguf
 ln -s /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000?-of-00002.gguf models/iq3s-gguf/
 ./build/qwental-serve --gguf models/iq3s-gguf --port 8080
@@ -77,7 +77,9 @@ Model files in `models/`:
 - Anthropic Messages API: `/v1/messages` (streaming, thinking, tool use) and `/v1/messages/count_tokens`
 - OpenAI Chat Completions: `/v1/chat/completions`
 - Prefix cache with multiple KV slots and SSD-backed snapshots; prefixes are shared across concurrent conversations
-- Concurrent requests (on by default, up to 16; `--parallel N` sets the bound, up to 64, `--parallel 1` serves one at a time): speculative decoding for a lone request, batched decoding when several are active, picked from measured speed. A long new prompt is prefilled in slices so running conversations keep streaming. Slot memory is capped (physical memory minus weights minus 16 GB, or `QW_SLOT_MEM_GB`).
+- Concurrent requests (on by default, up to 16; `--parallel N` sets the bound, up to 64, `--parallel 1` serves one at a time): speculative decoding for a lone request, batched decoding when several are active, picked from measured speed. A long new prompt is prefilled in slices so running conversations keep streaming, and it yields to newly arriving requests (also when it arrived alone). Slot memory is capped (physical memory minus weights minus 16 GB, or `QW_SLOT_MEM_GB`).
+- `GET /status`: version, profile, uptime, request and token totals, queue length, and with concurrency the current mode, slot memory and measured rates; `--help` lists the options
+- Experimental, off by default: batched speculative decoding for 2–3 concurrent requests (`QW_PAR_VSPEC=1`, GGUF only)
 - Use Claude Code or any Anthropic/OpenAI client as the front end
 - `--int8`: INT8 prefill for expert matrices (and dense matrices with `--gguf`), about 25–60% faster on long prompts. Decode is unchanged; outputs differ slightly from the default (see "What INT8 costs"). With `--gguf` it uses 3 GB more memory.
 - `--int8-qk` / `--int8-hyper`: on top of `--int8`, also run the attention Q·Kᵀ (`qk`) or the hyper-connection mix_down (`hyper`, `--gguf` only) in INT8. Each implies `--int8`. `--int8-qk` helps mostly on long prompts at about the same quality as `--int8`; `--int8-hyper` is experimental (it hurt English text in testing).

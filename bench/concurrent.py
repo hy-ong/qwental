@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # 同時多個請求的總吞吐量：K 個請求（8 個不同的 prompt 輪流用，temperature 0、各 400 個 token）一起送出（seq：一個接一個），
-# 印出總 token / 牆鐘時間；out 目錄存各請求的輸出（比對用）。用法：bench/concurrent.py <url> <K> [seq|par] [out 目錄]
+# 印出總 token / 牆鐘時間；out 目錄存各請求的輸出（比對用）。用法：bench/concurrent.py <url> <K> [seq|par] [out 目錄] [edit]
+# edit：改用改寫程式碼的 prompt（bench/prompts/code_edit.txt，各請求要改的名稱不同），照抄前文的比例高
 import json, os, sys, threading, time, urllib.request
 
 URL, K = sys.argv[1].rstrip("/"), int(sys.argv[2])
@@ -14,6 +15,9 @@ P = ["Explain how a hash map handles collisions, with an example in Python.",
      "Write a C function that reverses a singly linked list, and explain it step by step.",
      "用繁體中文介紹台灣的夜市文化，包括常見小吃。",
      "Explain gradient descent to a high school student, with a simple numeric example."]
+if len(sys.argv) > 5 and sys.argv[5] == "edit":
+    E = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts/code_edit.txt"), encoding="utf-8").read()
+    P = [E.replace("`Stock`", f"`{n}`") + "\nOutput the full modified module." for n in ("Stock", "Store", "Depot", "Warehouse", "Pantry", "Cellar", "Vault", "Shelf")]
 tot = [0] * K
 
 

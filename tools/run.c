@@ -229,6 +229,96 @@ int main(int argc, char **argv) {
             if (!skip_ref && par_hash(pl) != rh[i][0] && lgbad[i] < 0) lgbad[i] = 0;
         }
         tp = qw_now() - tp;
+        if (getenv("QW_PARV")) { // QW_PARV=k：一起推測解碼（每個對話最多猜 k 個；猜測 = 正確答案，每 3 輪故意弄錯一個），比每列 logits
+            const int K = atoi(getenv("QW_PARV")) > 0 ? atoi(getenv("QW_PARV")) : 1;
+            int cnt[PM], vbad[PM], rows = 0, rounds = 0, gen = 0, dsum = 0, asum = 0;
+            for (int i = 0; i < B; i++) { cnt[i] = 1; vbad[i] = -1; }
+            const bool usedf = getenv("QW_PARV_DF") != NULL; // 猜測用各對話自己的 DFlash2（信心 < 0.8 截斷），不用正確答案
+            if (usedf && qw_engine_par_vdraft(e, sid, last, B)) { fprintf(stderr, "par_vdraft 失敗\n"); return 1; }
+            double gs = 0, t0 = qw_now();
+            for (;;) {
+                int as[PM], na = 0;
+                for (int i = 0; i < B; i++) if (cnt[i] < N) as[na++] = i;
+                if (!na) break;
+                const int per = 8 / na - 1 < K ? 8 / na - 1 : K; // 每個對話最多猜幾個（共 ≤ 8 列）
+                if (na > 8) { fprintf(stderr, "QW_PARV：最多 8 個對話\n"); return 1; }
+                int s2[8], n2[8], nd[8];
+                int32_t tk[8], dr[8][8];
+                int r = 0;
+                for (int q = 0; q < na; q++) {
+                    const int i = as[q];
+                    nd[q] = per < N - 1 - cnt[i] ? per : N - 1 - cnt[i];
+                    if (nd[q] < 0) nd[q] = 0;
+                    s2[q] = sid[i];
+                    n2[q] = 1 + nd[q];
+                    tk[r++] = last[i];
+                    if (usedf) {
+                        int32_t pd[8];
+                        float pp[8];
+                        const int m = qw_engine_par_draft(e, sid[i], pd, pp);
+                        int k2 = 0;
+                        while (k2 < nd[q] && k2 < m && (k2 == 0 || pp[k2] >= 0.8f)) { dr[q][k2] = pd[k2]; k2++; }
+                        nd[q] = k2;
+                        n2[q] = 1 + k2;
+                        dsum += k2;
+                    }
+                    for (int t = 0; t < nd[q]; t++) {
+                        if (!usedf) {
+                            dr[q][t] = skip_ref ? last[i] : ref[i][cnt[i] + t];
+                            if (t == 1 && (rounds + i) % 3 == 0) dr[q][t] = (dr[q][t] + 1) % 248320; // 故意錯
+                        }
+                        tk[r++] = dr[q][t];
+                    }
+                }
+                if (rounds == 3) { t0 = qw_now(); gs = 0; gen = 0; } // 前 3 輪含 kernel 編譯，不算
+                double gm = 0;
+                const float *bl = qw_engine_par_vstep(e, s2, n2, tk, na, &gm);
+                if (!bl) { fprintf(stderr, "par_vstep 失敗\n"); return 1; }
+                gs += gm;
+                rounds++;
+                int acc[8];
+                int32_t nxa[8];
+                r = 0;
+                for (int q = 0; q < na; q++) {
+                    const int i = as[q];
+                    int am[8];
+                    for (int t = 0; t <= nd[q]; t++) {
+                        const float *lr = bl + (size_t)(r + t) * 248320;
+                        int bst = 0;
+                        for (int v = 1; v < 248320; v++) if (lr[v] > lr[bst]) bst = v;
+                        am[t] = bst;
+                        bool pre = got[i][cnt[i] - 1] == ref[i][cnt[i] - 1]; // 這列之前餵的都正確：logits 應與單獨跑相同
+                        for (int u = 0; u < t && pre; u++) pre = dr[q][u] == ref[i][cnt[i] + u];
+                        if (!skip_ref && pre) { rows++; if (par_hash(lr) != rh[i][cnt[i] + t] && vbad[i] < 0) vbad[i] = cnt[i] + t; }
+                    }
+                    int j = 0;
+                    while (j < nd[q] && am[j] == dr[q][j]) j++;
+                    for (int t = 0; t < j; t++) got[i][cnt[i] + t] = dr[q][t];
+                    got[i][cnt[i] + j] = am[j];
+                    last[i] = am[j];
+                    cnt[i] += j + 1;
+                    gen += j + 1;
+                    acc[q] = j;
+                    nxa[q] = am[j];
+                    asum += j;
+                    r += nd[q] + 1;
+                }
+                if (qw_engine_par_vaccept(e, acc, usedf ? nxa : NULL)) { fprintf(stderr, "par_vaccept 失敗\n"); return 1; }
+            }
+            const double tt = qw_now() - t0;
+            for (int i = 0; i < B; i++) {
+                int same = 0;
+                while (same < N && got[i][same] == ref[i][same]) same++;
+                printf("對話 %d（slot %d，prompt %d）：前 %d / %d 個 token 相同；%s\n", i, sid[i], pn[i], same, N,
+                       vbad[i] < 0 ? "比過的列 logits 都與單獨跑逐位元相同 ✓" : "logits 不同 ✗");
+                if (vbad[i] >= 0) printf("  第一個不同：位置 %d\n", vbad[i]);
+            }
+            if (usedf) printf("DFlash2：每個對話每輪平均猜 %.2f、接受 %.2f\n", (double)dsum / (rounds * B), (double)asum / (rounds * B));
+            printf("一起推測解碼 %d 個對話、每個最多猜 %d 個：%d 輪、比了 %d 列；GPU 每輪 %.2f ms；%.1f tok/s（含 CPU argmax）\n", B, K, rounds,
+                   rows, gs / (rounds - 3), gen / tt);
+            qw_engine_close(e);
+            return 0;
+        }
         double gsum = 0, tw = qw_now();
         for (int k = 1; k < N; k++) {
             if (k == 2) { tw = qw_now(); gsum = 0; } // 第一步含 kernel 編譯，不算

@@ -314,6 +314,8 @@ typedef struct job {
     bool preempt, cbstop, inb; // inb：在一起 decode 裡（last 還沒餵）
     bool pfing; // 分段 prefill 中（別人在跑時，長 prompt 一次只算一段）
     int pfd;    // 分段 prefill 算到哪
+    bool pfy;   // 單獨跑時 prompt 只 prefill 一部分就讓出了（之後分段接著算）
+    bool hasd;  // 一起推測解碼：engine 裡有從 last 猜好的一塊
     volatile bool yflag;
     double srate; // 這個對話推測解碼的實測速度（tok/s）
     int32_t last;
@@ -438,7 +440,14 @@ static job *chat_begin(conn *c, const char *body, size_t blen, bool openai) {
     return j;
 }
 
+// ---- /status：累計數字（兩種模式都有）
+static double T_START;
+static long long st_done, st_in, st_cached, st_out; // 完成的請求、prompt token、重用的 token、生成的 token
 static void chat_end(job *j) {
+    __atomic_fetch_add(&st_done, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&st_in, j->np, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&st_cached, j->st.cached, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&st_out, j->st.gen, __ATOMIC_RELAXED);
     conn *c = j->c;
     const bool openai = j->openai;
     gen_ctx *gg = &j->g;
@@ -575,7 +584,8 @@ static volatile int par_others; // 單獨跑的時候，另外還有幾個進行
 static volatile bool par_pfwait; // 有對話在分段 prefill：時間片縮短（prefill 多分一點時間）
 static double seg_t0;
 static double spec_rate;                 // 推測解碼的實測速度（tok/s，EMA，含切換）
-static double bat_rate[QW_PAR_MAX + 1];  // 一起 decode B 個的實測總速度（tok/s，EMA）
+static double bat_rate[QW_PAR_MAX + 1];  // 一起 decode B 個的實測總速度（tok/s，EMA；兩種一起的做法取快的）
+static double pl_rate[QW_PAR_MAX + 1], vs_rate[QW_PAR_MAX + 1]; // 一起 decode / 一起推測解碼 各自的實測（tok/s，EMA）
 static bool solo_cb(void *ctx, int32_t t) { // 要讓出時只設 yield：這一輪的 token 送完才停（模型狀態停在最後一個 token 之前）
     job *j = ctx;
     j->gen[j->got++] = t;
@@ -584,6 +594,7 @@ static bool solo_cb(void *ctx, int32_t t) { // 要讓出時只設 yield：這一
     return true;
 }
 static double ema(double o, double x, double w) { return o > 0 ? (1 - w) * o + w * x : x; }
+static bool solo_pfy(void *ctx) { (void)ctx; return q_pending(); } // 單獨跑的長 prompt：每段 prefill 之間有新請求就讓出
 // 推測解碼跑一段（到結束、有新請求、或時間片用完）。回傳 true = 還沒結束（狀態留在 slot，下次從 prompt + 已生成接續）
 static bool run_solo(job *j) {
     qw_gen g2 = j->gp;
@@ -591,12 +602,18 @@ static bool run_solo(job *j) {
     g2.seed = j->rng;
     j->preempt = j->cbstop = j->yflag = false;
     g2.yield = &j->yflag;
+    g2.pf_yield = solo_pfy;
     qw_gen_stats s2;
     const int got0 = j->got;
     const bool first = !j->st.prompt;
     seg_t0 = qw_now();
     const int fin = qw_engine_par_solo(E, j->sid, j->ids, j->np + j->got, &g2, solo_cb, j, &s2);
     double ms = (qw_now() - seg_t0) * 1e3;
+    if (fin == QW_FIN_YIELD && s2.pf_done > 0) { // prompt 還沒算完就讓出：之後分段 prefill 接著算（快照在 pf_done）
+        j->pfy = true;
+        j->st.cached = s2.cached;
+        return true;
+    }
     if (first) { j->st.prompt = j->np; j->st.cached = s2.cached; j->st.prefill_ms = s2.prefill_ms; ms -= s2.prefill_ms; } // 第一段扣掉 prompt
     const int ng = j->got - got0;
     if (ng >= 8 && ms > 1) { j->srate = ema(j->srate, ng * 1e3 / ms, 0.5); spec_rate = ema(spec_rate, ng * 1e3 / ms, 0.3); }
@@ -618,6 +635,7 @@ static bool join_batch(job *j) {
     if (!lg) { par_done(j, QW_FIN_ERROR); return false; }
     if (!j->st.prompt) { j->st.prompt = j->np; j->st.cached = cached; j->st.prefill_ms = (qw_now() - j->t0) * 1e3; j->tg0 = qw_now(); }
     j->inb = true;
+    j->hasd = false;
     return par_emit(j, qw_engine_sample(lg, &j->gp, &j->rng));
 }
 // 分段 prefill 一段：段長照實測速度調成約 QW_PAR_CHUNK_MS（預設 500 ms，其他對話最多停這麼久），64 的倍數、256…8192 個 token；
@@ -635,7 +653,7 @@ static bool pf_chunk(job *j) {
     const float *lg = qw_engine_par_prefill_to(E, j->sid, j->ids, j->np, ch, &j->pfd, &cached);
     if (lg && j->pfd - (first ? cached : d0) >= 256) rate = (j->pfd - (first ? cached : d0)) / ((qw_now() - t) * 1e3);
     if (!lg) { par_done(j, QW_FIN_ERROR); return false; }
-    if (first) j->st.cached = cached;
+    if (first && !j->pfy) j->st.cached = cached;
     if (j->pfd < j->np) return true;
     j->pfing = false;
     j->base = j->np;
@@ -643,16 +661,106 @@ static bool pf_chunk(job *j) {
     j->st.prefill_ms = (qw_now() - j->t0) * 1e3;
     j->tg0 = qw_now();
     j->inb = true;
+    j->hasd = false;
     return par_emit(j, qw_engine_sample(lg, &j->gp, &j->rng));
 }
 // 離開一起 decode：記快照（最後送出、還沒餵的 token 留給下一段當 prompt 結尾）
 static void leave_batch(job *j) {
     qw_engine_par_finish(E, j->sid, j->ids + j->base, j->np + j->got - j->base);
     j->inb = false;
+    j->hasd = false;
+}
+// ---- 一起推測解碼（實驗，QW_PAR_VSPEC=1；GGUF + DFlash2）：每個對話用自己的 DFlash2 猜一塊，2…VS_MAX 個對話時共 ≤ 8 列一起驗證。
+// 實測與一起 decode 差不多快（多驗證一列約 3 ms、猜中率約 70%，加上每輪猜測 / 接受的成本），所以預設關
+static int VS_MAX = 3; // 4 個以上一起 decode 已經夠快（實測推測解碼不會更快）
+static double vs_conf = 0.8; // 猜測的信心低於這個就截斷（同單獨推測解碼的 QW_DF_CONF）
+// 後綴猜測（同 qw_engine_generate_ex 的 prompt lookup）：最近 3 個 token 在前文出現過時，提出前文接在後面的（最多 7 個）。
+// 回傳個數，*mlen = 匹配長度
+static int suffix_draft(const int32_t *seq, int ns, int32_t *sf, int *mlen) {
+    int best_i = -1, best_m = 0, ks = 0;
+    if (ns >= 4)
+        for (int i = ns - 2; i >= 2 && best_m < 32; i--) {
+            if (seq[i] != seq[ns - 1] || seq[i - 1] != seq[ns - 2] || seq[i - 2] != seq[ns - 3]) continue;
+            int m = 3;
+            while (m < 32 && i - m >= 0 && seq[i - m] == seq[ns - 1 - m]) m++;
+            if (m > best_m) { best_m = m; best_i = i; }
+            if (best_m >= 8) break;
+        }
+    if (best_i >= 0) while (ks < 7 && best_i + 1 + ks < ns) { sf[ks] = seq[best_i + 1 + ks]; ks++; }
+    *mlen = best_m;
+    return ks;
+}
+// 一輪：沒有猜測的先猜 → 依信心分配列數 → 驗證 → 接受判定 → 狀態寫回並猜下一塊 → 送出 token。回傳還活著的放進 out
+static int vspec_round(job **bj, int nb, job **out) {
+    int sids[8], need[8], nn = 0, n[8], nd[8], cl[8];
+    int32_t anc[8], dr[8][8], toks[8];
+    float pp[8][8];
+    for (int i = 0; i < nb; i++) if (!bj[i]->hasd) { need[nn] = bj[i]->sid; anc[nn++] = bj[i]->last; }
+    if (nn && qw_engine_par_vdraft(E, need, anc, nn)) return -1;
+    int rows = nb;
+    for (int i = 0; i < nb; i++) {
+        bj[i]->hasd = true;
+        sids[i] = bj[i]->sid;
+        const int m = qw_engine_par_draft(E, sids[i], dr[i], pp[i]);
+        int k = 0;
+        while (k < m && k < 7 && (k == 0 || pp[i][k] >= vs_conf)) k++;
+        // 後綴：照抄（匹配 ≥ 20 且給得出 7 個）、或比 DFlash2 長且（匹配 ≥ 8、DFlash2 沒把握、或第一個一致）時改用（同單獨推測解碼）
+        int32_t sf[8];
+        int ml = 0;
+        const int ks = suffix_draft(bj[i]->ids, bj[i]->np + bj[i]->got, sf, &ml);
+        bool agree = true;
+        for (int q = 0; q < k && agree; q++) agree = sf[q] == dr[i][q];
+        const bool copy = ks == 7 && ml >= 20 && (k < 7 || agree);
+        if (ks >= 2 && (copy || (ks > k && (ml >= 8 || k < 2 || sf[0] == dr[i][0])))) { memcpy(dr[i], sf, sizeof(int32_t) * (size_t)ks); k = ks; }
+        cl[i] = k;
+        nd[i] = 0;
+    }
+    for (bool more = true; more && rows < 8;) { // 輪流加一列，給還有把握的猜測
+        more = false;
+        for (int i = 0; i < nb && rows < 8; i++) if (nd[i] < cl[i]) { nd[i]++; rows++; more = true; }
+    }
+    int r = 0;
+    for (int i = 0; i < nb; i++) {
+        n[i] = 1 + nd[i];
+        toks[r++] = bj[i]->last;
+        for (int t = 0; t < nd[i]; t++) toks[r++] = dr[i][t];
+    }
+    const double t0 = qw_now();
+    double gms = 0;
+    const float *lg = qw_engine_par_vstep(E, sids, n, toks, nb, &gms);
+    if (!lg) return -1;
+    int acc[8], r0[8];
+    int32_t nx[8];
+    for (int i = 0, q = 0; i < nb; i++) { r0[i] = q; q += n[i]; }
+    int *accp = acc, *r0p = r0, *ndp = nd;
+    int32_t *nxp = nx, (*drp)[8] = dr;
+    job **bjp = bj;
+    dispatch_apply((size_t)nb, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+        accp[i] = qw_engine_spec_accept(lg + (size_t)r0p[i] * QW_VOCAB, drp[i], ndp[i], &bjp[i]->gp, &bjp[i]->rng, &nxp[i]);
+    });
+    if (qw_engine_par_vaccept(E, acc, nx)) return -1;
+    const double dt = (qw_now() - t0) * 1e3;
+    int ntok = 0, no = 0;
+    for (int i = 0; i < nb; i++) ntok += acc[i] + 1;
+    if (dt > 0) vs_rate[nb] = ema(vs_rate[nb], ntok * 1e3 / dt, 0.1);
+    bat_rate[nb] = vs_rate[nb] > pl_rate[nb] ? vs_rate[nb] : pl_rate[nb];
+    static int prof = -1;
+    if (prof < 0) prof = getenv("QW_PAR_PROF") != NULL;
+    if (prof) { static int c = 0; if (++c % 20 == 0) fprintf(stderr, "[parv] B=%d %d 列：%.1f ms、%d 個 token（%.0f tok/s，GPU 驗證 %.1f ms）\n", nb, r, dt, ntok, ntok * 1e3 / dt, gms); }
+    for (int i = 0; i < nb; i++) {
+        job *j = bj[i];
+        bool alive = true;
+        for (int t = 0; t < acc[i] && alive; t++) alive = par_emit(j, dr[i][t]);
+        if (alive) alive = par_emit(j, nx[i]);
+        if (alive && j->np + j->got + 10 >= CTX) { par_done(j, QW_FIN_CTX); alive = false; }
+        if (alive) out[no++] = j;
+    }
+    return no;
 }
 // 這 n 個對話：輪流推測解碼比一起 decode 快嗎（cur = 目前的做法，差不多時不換，免得來回切）
 // ---- 記憶體保護：slot（KV、狀態、快照）合計不超過 SLOT_BUDGET；系統可用記憶體低於 10% 時再多放一組閒置的
 static size_t SLOT_BUDGET;
+static size_t st_mem; // /status：slot 目前佔的記憶體（mem_guard 更新）
 static size_t dir_bytes(const char *dir, const char *ext) {
     size_t t = 0;
     DIR *d = dir ? opendir(dir) : NULL;
@@ -672,6 +780,7 @@ static void mem_guard(job **act, int na) {
     unsigned long long busy = 0;
     for (int i = 0; i < na; i++) busy |= 1ull << act[i]->sid;
     const int n = qw_engine_par_trim(E, busy, SLOT_BUDGET, false);
+    st_mem = qw_engine_par_mem(E);
     if (n) fprintf(stderr, "[mem] slot 超過 %.1f GB：釋放 %d 組閒置的\n", SLOT_BUDGET / 1e9, n);
     static double last;
     int lvl = 100;
@@ -691,6 +800,49 @@ static bool want_slice(job **act, int n, bool cur) {
     if (rs <= 0 || rb <= 0) return false; // 沒數字：一起（2 個以上通常比較快）
     return rs > rb * (cur ? 0.95 : 1.05);
 }
+// /status 的即時狀態（par_loop 每輪更新）
+static pthread_mutex_t st_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { int np, cached, got; char state; } st_job[QW_PAR_MAX];
+static int st_n;
+static const char *st_mode = "idle";
+static void st_publish(job **act, int na, const char *mode) {
+    pthread_mutex_lock(&st_mu);
+    st_n = na;
+    for (int i = 0; i < na; i++) {
+        job *j = act[i];
+        st_job[i].np = j->np;
+        st_job[i].cached = j->st.cached;
+        st_job[i].got = j->got;
+        st_job[i].state = j->pfing ? 'p' : j->inb ? 'b' : 's';
+    }
+    if (mode) st_mode = mode;
+    pthread_mutex_unlock(&st_mu);
+}
+static void handle_status(conn *c) {
+    sbuf o = {0};
+    int queued = 0;
+    pthread_mutex_lock(&q_mu);
+    for (job *q = q_head; q; q = q->next) queued++;
+    pthread_mutex_unlock(&q_mu);
+    sb_printf(&o, "{\"version\":\"%s\",\"profile\":\"%s\",\"uptime_s\":%.0f,\"parallel\":%d,\"done\":%lld,\"prompt_tokens\":%lld,"
+                  "\"cached_tokens\":%lld,\"output_tokens\":%lld,\"queued\":%d",
+              QW_VERSION, getenv("QW_GGUF") ? "gguf" : "mlx", qw_now() - T_START, PAR, st_done, st_in, st_cached, st_out, queued);
+    if (PAR > 1) {
+        pthread_mutex_lock(&st_mu);
+        sb_printf(&o, ",\"mode\":\"%s\",\"slot_mem_gb\":%.2f,\"slot_budget_gb\":%.1f,\"active\":[", st_n ? st_mode : "idle", st_mem / 1e9,
+                  SLOT_BUDGET / 1e9);
+        for (int i = 0; i < st_n; i++)
+            sb_printf(&o, "%s{\"prompt\":%d,\"cached\":%d,\"generated\":%d,\"state\":\"%s\"}", i ? "," : "", st_job[i].np, st_job[i].cached,
+                      st_job[i].got, st_job[i].state == 'p' ? "prefill" : st_job[i].state == 'b' ? "batch" : "solo");
+        pthread_mutex_unlock(&st_mu);
+        sb_printf(&o, "],\"rate\":{\"spec\":%.1f", spec_rate);
+        for (int n = 2; n <= QW_PAR_MAX; n++) if (bat_rate[n] > 0) sb_printf(&o, ",\"batch%d\":%.1f", n, bat_rate[n]);
+        sb_printf(&o, "}");
+    }
+    sb_printf(&o, "}");
+    respond(c, 200, "application/json", o.p, o.n);
+    sb_free(&o);
+}
 static void *par_loop(void *arg) {
     (void)arg;
     job *act[QW_PAR_MAX];
@@ -701,6 +853,7 @@ static void *par_loop(void *arg) {
     static int prof = -1;
     if (prof < 0) prof = getenv("QW_PAR_PROF") != NULL;
     for (;;) {
+        if (!na) st_publish(act, 0, "idle");
         pthread_mutex_lock(&q_mu);
         while (!na && !q_head) pthread_cond_wait(&q_cv, &q_mu);
         job *adm[QW_PAR_MAX];
@@ -733,12 +886,15 @@ static void *par_loop(void *arg) {
             static double pf_last;
             int nready = 0;
             for (int i = 0; i < na; i++) nready += !act[i]->pfing;
-            int keep = 0, done1 = !(nready == 0 || (qw_now() - pf_last) * 1e3 >= SLICE_MS * 2 / 3);
-            for (int i = 0; i < na; i++) {
-                job *j = act[i];
-                if (j->pfing && !done1) { done1 = 1; const bool ok = pf_chunk(j); pf_last = qw_now(); if (!ok) continue; }
-                act[keep++] = j;
-            }
+            const bool go = nready == 0 || (qw_now() - pf_last) * 1e3 >= SLICE_MS * 2 / 3;
+            job *pj = NULL; // 剩最少的先算（短的新請求不必等長的算完）
+            for (int i = 0; go && i < na; i++)
+                if (act[i]->pfing && (!pj || act[i]->np - act[i]->pfd < pj->np - pj->pfd)) pj = act[i];
+            const bool ok = !pj || pf_chunk(pj);
+            if (pj) pf_last = qw_now();
+            int keep = 0;
+            for (int i = 0; i < na; i++)
+                if (ok || act[i] != pj) act[keep++] = act[i];
             na = keep;
         }
         job *rd[QW_PAR_MAX]; // 可以生成的（不在分段 prefill 中）
@@ -746,6 +902,7 @@ static void *par_loop(void *arg) {
         for (int i = 0; i < na; i++) if (!act[i]->pfing) rd[nr++] = act[i];
         if (!nr) continue;
         const bool s2 = want_slice(rd, nr, slice);
+        st_publish(act, na, s2 ? "spec" : "batch");
         if (s2 != slice && nr > 1) fprintf(stderr, "[par] %d 個對話：改成%s\n", nr, s2 ? "輪流推測解碼" : "一起 decode");
         slice = s2;
         if (slice) { // 推測解碼：輪流，一次一個（有人在分段 prefill 時也切時間片）
@@ -774,7 +931,35 @@ static void *par_loop(void *arg) {
         na = 0;
         for (int i = 0; i < npf; i++) act[na++] = pf[i];
         if (!nb) continue;
-        for (int i = 0; i < nb; i++) { sids[i] = bj[i]->sid; toks[i] = bj[i]->last; }
+        static int vs_on = -1;
+        if (vs_on < 0) {
+            vs_on = getenv("QW_PAR_VSPEC") && atoi(getenv("QW_PAR_VSPEC")); // 預設關：目前與一起 decode 差不多快（猜測、接受各多一次 GPU 往返）
+            if (getenv("QW_PAR_VSMAX")) VS_MAX = atoi(getenv("QW_PAR_VSMAX"));
+            if (getenv("QW_DF_CONF")) vs_conf = atof(getenv("QW_DF_CONF"));
+        }
+        // 一起推測解碼 vs 一起 decode：照實測選快的（差不到 5% 不換）；每 300 輪試另一種 8 輪，內容變了（例如改寫程式碼）也跟得上
+        static int vs_cnt[QW_PAR_MAX + 1], vs_cur[QW_PAR_MAX + 1];
+        bool use_vs = false;
+        if (vs_on > 0 && nb >= 2 && nb <= VS_MAX) {
+            const double a = vs_rate[nb], p2 = pl_rate[nb];
+            const int c = vs_cnt[nb]++ % 300;
+            if (a <= 0) use_vs = true;
+            else if (p2 <= 0) use_vs = c >= 30 && c < 38 ? false : true;
+            else {
+                const bool best = vs_cur[nb] ? a > p2 * 0.95 : a > p2 * 1.05;
+                use_vs = c >= 292 ? !best : best;
+                if (c < 292) { if (best != (bool)vs_cur[nb]) fprintf(stderr, "[par] %d 個對話：改成%s（%.0f vs %.0f tok/s）\n", nb, best ? "一起推測解碼" : "一起 decode", a, p2); vs_cur[nb] = best; }
+            }
+        }
+        if (use_vs) { // 一起推測解碼
+            job *alive[8];
+            const int no = vspec_round(bj, nb, alive);
+            if (no >= 0) { for (int i = 0; i < no; i++) act[na++] = alive[i]; continue; }
+            fprintf(stderr, "[par] 一起推測解碼不能用（不是 GGUF 或沒有 DFlash2）：改回一起 decode\n");
+            vs_on = 0; // 失敗只會在第一次（engine 不支援）發生，狀態沒有動過
+        }
+        for (int i = 0; i < nb; i++) { sids[i] = bj[i]->sid; toks[i] = bj[i]->last; bj[i]->hasd = false; }
+        qw_engine_par_keepdf(E, vs_on > 0 && nb >= 2 && nb <= VS_MAX);
         const double ts0 = qw_now();
         double gms = 0;
         const float *lg = qw_engine_par_step(E, sids, toks, nb, &gms);
@@ -786,7 +971,10 @@ static void *par_loop(void *arg) {
                 nx[i] = qw_engine_sample(lg + i * QW_VOCAB, &aj[i]->gp, &aj[i]->rng);
             });
         const double dt = (qw_now() - ts0) * 1e3;
-        if (lg && dt > 0) bat_rate[nb] = ema(bat_rate[nb], nb * 1e3 / dt, 0.1);
+        if (lg && dt > 0) {
+            pl_rate[nb] = ema(pl_rate[nb], nb * 1e3 / dt, 0.1);
+            bat_rate[nb] = vs_rate[nb] > pl_rate[nb] ? vs_rate[nb] : pl_rate[nb];
+        }
         if (prof) { static int c = 0; if (++c % 50 == 0) fprintf(stderr, "[par] B=%d：par_step %.2f ms（GPU %.2f）、取樣 %.2f ms；一起 %.0f tok/s、推測 %.0f tok/s\n", nb, (ts1 - ts0) * 1e3, gms, dt - (ts1 - ts0) * 1e3, bat_rate[nb], spec_rate); }
         for (int i = 0; i < nb; i++) {
             job *j = bj[i];
@@ -855,6 +1043,7 @@ static void *conn_main(void *arg) {
             const char *m = "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.8-flash-next\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"Qwen3.8 Flash Next (Qwental)\"}]}";
             respond(&c, 200, "application/json", m, strlen(m));
         } else if (!strcmp(path, "/health")) respond(&c, 200, "application/json", "{\"ok\":true}", 11);
+        else if (!strcmp(method, "GET") && !strcmp(path, "/status")) handle_status(&c);
         else respond_err(&c, 404, "not found");
         free(body);
     }
@@ -868,6 +1057,21 @@ int main(int argc, char **argv) {
     const char *host = "127.0.0.1", *cache_dir = "cache"; // 持久化前綴快取（SSD），"" = 不用
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--version")) { printf("qwental %s\n", QW_VERSION); return 0; }
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("qwental %s: Anthropic / OpenAI compatible server for Qwen3.8-Flash-Next on Apple M5 Max\n\n"
+                   "usage: qwental-serve [--gguf DIR] [--model DIR] [--port 8080] [--host 127.0.0.1] [--ctx 131072]\n"
+                   "                     [--cache-dir cache] [--parallel [N]] [--slots 3]\n"
+                   "                     [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--exact-spec] [--version]\n\n"
+                   "  --gguf DIR      run the IQ3_S GGUF in DIR (DFlash2 pack in dflash2/ next to it)\n"
+                   "  --model DIR     MLX weights (default models/Qwen3.8-Flash-Next-mixed-4-8bit)\n"
+                   "  --cache-dir D   SSD prefix cache (\"\" = off)\n"
+                   "  --parallel N    concurrent requests (default 16, 1 = one at a time)\n"
+                   "  --int8          INT8 prefill (faster long prompts; outputs differ slightly)\n\n"
+                   "endpoints: POST /v1/messages, /v1/messages/count_tokens, /v1/chat/completions; GET /v1/models, /health, /status\n",
+                   QW_VERSION);
+            return 0;
+        }
     bool i8 = false, i8qk = false, i8hy = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--int8")) { i8 = true; continue; }
@@ -964,6 +1168,7 @@ int main(int argc, char **argv) {
     if (getenv("QW_LM_TC") && atoi(getenv("QW_LM_TC"))) fprintf(stderr, "lm_head：矩陣單元版（--fast-head）\n");
     if (getenv("QW_EXACT_SPEC") && strcmp(getenv("QW_EXACT_SPEC"), "0"))
         fprintf(stderr, "推測解碼 = greedy（--exact-spec%s）\n", getenv("QW_GGUF") ? "；GGUF 本來就是，不影響" : "");
+    T_START = qw_now();
     const int ls = socket(AF_INET, SOCK_STREAM, 0);
     const int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -1006,6 +1211,7 @@ int main(int argc, char **argv) {
                 const char *m = "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.8-flash-next\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"Qwen3.8 Flash Next (Qwental)\"}]}";
                 respond(&c, 200, "application/json", m, strlen(m));
             } else if (!strcmp(path, "/health")) respond(&c, 200, "application/json", "{\"ok\":true}", 11);
+            else if (!strcmp(method, "GET") && !strcmp(path, "/status")) handle_status(&c);
             else respond_err(&c, 404, "not found");
             free(body);
         }

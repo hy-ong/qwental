@@ -1,7 +1,7 @@
 // Qwental 推論 engine（目前：decode 路徑，一次一個 token；prompt 也逐個 token 餵入）
 #pragma once
 
-#define QW_VERSION "1.3.0"
+#define QW_VERSION "1.4.0"
 #include <stdbool.h>
 #include <stdint.h>
 #include "gpu.h"
@@ -48,10 +48,12 @@ typedef struct {
     const int *persist;    // 處理到這些位置時把狀態存到 SSD（例如 system 訊息結尾）；需要 qw_engine_set_cache_dir
     int npersist;
     volatile bool *yield; // 非 NULL 且為 true 時：在推測解碼一輪結束（或不推測時一個 token）後停下，回傳 QW_FIN_YIELD（並發模式切換用）
+    bool (*pf_yield)(void *ctx); // 非 NULL：長 prompt 每 PF 個 token 一段，段與段之間問一次（ctx 同 cb），true 就存快照、回傳 QW_FIN_YIELD（st->pf_done = 算到哪）
 } qw_gen;
 typedef bool (*qw_tok_cb)(void *ctx, int32_t tok);
 typedef struct {
     int prompt, cached, gen, rounds, accepted, ngram_rounds;
+    int pf_done; // > 0：prompt 只 prefill 到這裡就讓出（pf_yield），還沒生成
     double prefill_ms, gen_ms;
 } qw_gen_stats;
 enum { QW_FIN_STOP, QW_FIN_LENGTH, QW_FIN_CALLBACK, QW_FIN_CTX, QW_FIN_YIELD, QW_FIN_ERROR = -1 };
@@ -86,4 +88,13 @@ int qw_engine_par_solo(qw_engine *e, int sid, const int32_t *prompt, int np, con
 double qw_engine_par_cost(qw_engine *e, int B); // B 個對話一起 decode 一步的預估牆鐘 ms（最佳分組；0 = 還沒量過）
 size_t qw_engine_par_mem(qw_engine *e); // 各 slot 佔的記憶體合計（位元組）
 int qw_engine_par_trim(qw_engine *e, unsigned long long busy, size_t budget, bool one); // 超過 budget 就釋放最久沒用的閒置 slot（one：只放一組）；回傳放了幾組
-int32_t qw_engine_sample(const float *logits, const qw_gen *g, unsigned long long *rng); // 同 qw_engine_generate_ex 的取樣（rng 會前進）
+const float *qw_engine_par_vstep(qw_engine *e, const int *sids, const int *n, const int32_t *toks, int B,
+                                 double *gpu_ms); // 並發推測解碼：對話 i 驗證 n[i] 個 token（toks 依序排，Σn ≤ 8；GGUF）；回傳 [Σn][vocab] logits
+int qw_engine_par_vaccept(qw_engine *e, const int *acc, const int32_t *nx); // 上一次 vstep 之後：對話 i 接受了 acc[i] 個猜測（狀態寫回、位置前進）；
+                                                                          // nx 非 NULL：接著從 nx[i] 猜下一塊（DFlash2，qw_engine_par_draft 取）
+int qw_engine_par_vdraft(qw_engine *e, const int *sids, const int32_t *anchors, int B); // 各對話從目前位置、anchor 猜一塊
+void qw_engine_par_keepdf(qw_engine *e, bool on); // 一起 decode 時也維持各對話的 DFlash2 上下文（之後要換成一起推測解碼時用）
+int qw_engine_par_draft(qw_engine *e, int sid, int32_t *dr, float *pr); // 這個對話最近一次的猜測（回傳個數；pr = 各位置的信心）
+int32_t qw_engine_sample(const float *logits, const qw_gen *g, unsigned long long *rng);
+int qw_engine_spec_accept(const float *lg, const int32_t *dr, int nd, const qw_gen *g, unsigned long long *rng,
+                          int32_t *nx); // 推測解碼的接受判定：回傳接受幾個猜測，*nx = 下一個 token // 同 qw_engine_generate_ex 的取樣（rng 會前進）

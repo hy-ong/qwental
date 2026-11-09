@@ -5,7 +5,8 @@ LDLIBS  := -framework Metal -framework Foundation -framework IOKit
 
 BUILD := build
 
-.PHONY: all clean ceiling
+.PHONY: all clean ceiling install uninstall
+PREFIX ?= /usr/local
 all: $(BUILD)/ceiling $(BUILD)/mslc $(BUILD)/qmv $(BUILD)/gdn $(BUILD)/stinspect $(BUILD)/ceiling2 $(BUILD)/qmm $(BUILD)/moe_prefill $(BUILD)/qsa $(BUILD)/moe_decode $(BUILD)/gdn_decode $(BUILD)/modelcheck $(BUILD)/run $(BUILD)/tokcheck $(BUILD)/chatcheck $(BUILD)/qwental-serve
 
 $(BUILD):
@@ -22,6 +23,14 @@ ceiling: $(BUILD)/ceiling
 
 clean:
 	rm -rf $(BUILD)
+
+# Metal kernel 已經 #embed 進執行檔：裝這一個檔案就好（模型檔另外放）
+install: $(BUILD)/qwental-serve
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 755 $(BUILD)/qwental-serve $(DESTDIR)$(PREFIX)/bin/qwental-serve
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/qwental-serve
 
 $(BUILD)/mslc: tools/mslc.c $(BUILD)/gpu_metal.o src/gpu.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/mslc.c $(BUILD)/gpu_metal.o -o $@ $(LDLIBS)

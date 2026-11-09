@@ -168,6 +168,9 @@ struct dn_epi {
     device float *so[7];      // 驗證：第 1…7 個 token 之後的 conv 狀態
     device const float *A;    // A_neg [48]
     device const bfloat *dtb; // dt_bias [48]
+#ifdef DN_SEG
+    uint chain;               // 第 t 位元：第 t 列接著第 t − 1 列（同一個對話的下一個 token）
+#endif
 };
 inline float dn_silu(float x) { return x / (1.0f + exp(-x)); }
 inline float dn_sigm(float x) { return 1.0f / (1.0f + exp(-x)); }
@@ -204,7 +207,19 @@ inline void dn_epi_rowT(uint g, thread const float *v, device float *st, device 
 }
 inline void dn_epi_row(uint g, thread const float *v, thread const dn_epi &ep, device half *yq, device half *yz, device float *la,
                        device float *be, constant dn_in_args &a) {
-#ifdef DN_MS
+#if defined(DN_SEG)
+    // 並發推測解碼：列分成幾段，每段是一個對話的連續幾個 token。第 t 列的 conv 狀態在 t == 0 ? st : so[t − 1]（就地更新）；
+    // 接著前一列時先複製前一列之後的狀態。每列用 NT = 1 的同一份程式（與 decode、驗證逐位元相同）
+    for (uint t = 0; t < NB; t++) {
+        device float *p = t == 0 ? ep.st : ep.so[t - 1];
+        if (g < 10240 && (ep.chain >> t & 1)) {
+            device const float *q = t == 1 ? ep.st : ep.so[t - 2];
+            p[g] = q[g]; p[10240 + g] = q[10240 + g]; p[20480 + g] = q[20480 + g];
+        }
+        dn_epi_rowT<1>(g, v + t, p, ep.so, ep.cw, ep.A, ep.dtb, yq + (ulong)t * a.ys[0], yz + (ulong)t * a.ys[1], la + t * a.ys[2],
+                       be + t * a.ys[3], a);
+    }
+#elif defined(DN_MS)
     // 並發（qwental-serve --parallel）：第 t 個 token 是另一個對話，conv 狀態各自一份（t = 0 是 st、t ≥ 1 是 so[t − 1]）；
     // 每個 token 用 NT = 1 的同一份程式（與 decode 逐位元相同）
     for (uint t = 0; t < NB; t++)
@@ -218,8 +233,14 @@ inline void dn_epi_row(uint g, thread const float *v, thread const dn_epi &ep, d
     device const bfloat *cw [[buffer(11)]], device float *st [[buffer(12)]], device const float *An [[buffer(13)]],             \
         device const bfloat *dtb [[buffer(14)]], device float *so1 [[buffer(15)]], device float *so2 [[buffer(16)]],            \
         device float *so3 [[buffer(17)]], device float *so4 [[buffer(18)]], device float *so5 [[buffer(19)]],                   \
-        device float *so6 [[buffer(20)]], device float *so7 [[buffer(21)]]
+        device float *so6 [[buffer(20)]], device float *so7 [[buffer(21)]] DN_SEG_ARG
+#ifdef DN_SEG
+#define DN_SEG_ARG , constant uint &chain [[buffer(22)]]
+#define DN_EPI_MAKE const dn_epi ep = {cw, st, {so1, so2, so3, so4, so5, so6, so7}, An, dtb, chain}
+#else
+#define DN_SEG_ARG
 #define DN_EPI_MAKE const dn_epi ep = {cw, st, {so1, so2, so3, so4, so5, so6, so7}, An, dtb}
+#endif
 
 template <int FQ, int FZ>
 kernel void dn_inf(device const uchar *Wq [[buffer(0)]], device const uchar *Wz [[buffer(1)]], device const uchar *Wa [[buffer(2)]],

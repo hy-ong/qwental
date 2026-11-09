@@ -60,7 +60,7 @@ INT8 旗標會改變 prefill 的數值。以程式碼、英文、中文三種內
 需要 macOS 27、Xcode 27、128 GB 的 M5 Max。
 
 ```sh
-make build/qwental-serve
+make build/qwental-serve   # 選用：make install（把單一執行檔複製到 /usr/local/bin；用 PREFIX=… 改位置）
 mkdir -p models/iq3s-gguf
 ln -s /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000?-of-00002.gguf models/iq3s-gguf/
 ./build/qwental-serve --gguf models/iq3s-gguf --port 8080
@@ -77,7 +77,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 - Anthropic Messages API：`/v1/messages`（串流、thinking、tool use）與 `/v1/messages/count_tokens`
 - OpenAI Chat Completions：`/v1/chat/completions`
 - Prefix cache：多組 KV slot，並把快照存到 SSD；同時進行的對話之間共用前綴
-- 同時多個請求（預設開，最多 16 個；`--parallel N` 改上限，最多 64，`--parallel 1` 一次一個）：只有一個請求時走推測解碼，多個時一起 decode，依實測速度自動選。新的長 prompt 分段 prefill，正在生成的對話不會停住。slot 的記憶體有上限（實體記憶體 − 權重 − 16 GB，或 `QW_SLOT_MEM_GB`）。
+- 同時多個請求（預設開，最多 16 個；`--parallel N` 改上限，最多 64，`--parallel 1` 一次一個）：只有一個請求時走推測解碼，多個時一起 decode，依實測速度自動選。新的長 prompt 分段 prefill，正在生成的對話不會停住；之後才到的請求也不必等它跑完（即使它是單獨進來的）。slot 的記憶體有上限（實體記憶體 − 權重 − 16 GB，或 `QW_SLOT_MEM_GB`）。
+- `GET /status`：版本、profile、執行時間、請求與 token 的累計、排隊數，同時多個請求時另有目前的模式、slot 記憶體與實測速度；`--help` 列出所有選項
+- 實驗性質、預設關閉：同時 2–3 個請求時的批次推測解碼（`QW_PAR_VSPEC=1`，限 GGUF）
 - 前端可以用 Claude Code 或任何 Anthropic / OpenAI 相容的 client
 - `--int8`：prefill 的 expert 矩陣（GGUF 再加上 dense 矩陣）改走 INT8，長 prompt 約快 25–60%。decode 不變；輸出與預設略有差異（見「INT8 的代價」）。搭配 `--gguf` 時多用 3 GB 記憶體。
 - `--int8-qk`／`--int8-hyper`：在 `--int8` 之外，attention 的 Q·Kᵀ（`qk`）或 hyper-connection 的 mix_down（`hyper`，限 `--gguf`）也改走 INT8。兩者都隱含 `--int8`。`--int8-qk` 主要對長 prompt 有幫助，品質與 `--int8` 相當；`--int8-hyper` 屬實驗性質（測試中英文內容變差）。

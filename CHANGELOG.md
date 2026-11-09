@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.4.0 — 2026-11-09
+
+A long prompt no longer holds up requests that arrive after it, and the server reports its state at `GET /status`. Without flags a single request's output is bit-identical to 1.0.0 on both the GGUF and the MLX profile, and concurrent GGUF output is bit-identical to running each request alone, as in 1.3.0.
+
+### Long prompts yield to new requests
+- In 1.3.0 a long prompt that arrived while nothing else ran was prefilled in one pass, and requests arriving meanwhile waited for it (about 19 s for a 30K-token prompt). Prefill now runs in segments of 4096 tokens (the same segments as one pass, so bit-identical) and yields between segments when a request is waiting; the rest of that prompt continues in slices alongside the new request.
+- A 30K-token prompt alone, a short request sent 2 s later: its first token after 0.38 s. Both requests' outputs are unchanged (GGUF and MLX).
+- Sliced prefill now serves the request with the fewest remaining prompt tokens first.
+
+### Server
+- `GET /status`: version, profile, uptime, totals of requests and of prompt, reused and generated tokens, and the queue length; with concurrency also the current mode, slot memory against its cap, the active requests and the measured rates.
+- `--help`.
+- `make install [PREFIX=/usr/local]` installs the single binary (the Metal kernels are embedded, so it runs from any directory).
+- `packaging/homebrew/qwental.rb`: a formula to publish in a tap.
+
+### Batched speculative decoding (experimental, off by default)
+- `QW_PAR_VSPEC=1` (GGUF only) uses speculative decoding for 2–3 concurrent requests. Each conversation keeps its own DFlash2 drafter context; the drafts of several conversations are verified together (up to 8 rows), and every row's logits are bit-identical to running alone (`build/run` `QW_PARV` / `QW_PARV_DF`).
+- Measured in alternating runs on a cool machine (total tok/s, 1.3.0 / 1.4.0 default / with `QW_PAR_VSPEC=1`): 2 requests 107.0 / 105.2 / 108.2; 3 requests 126.3 / 123.7 / 127.5; 4 requests 137.3 / 141.8 / 134.3.
+- Why it doesn't win: with several conversations already sharing each weight read, a plain batched step costs about 6–9 ms per token, while each extra verified row costs about 3 ms (each token reads its own experts), about 70% of drafts are accepted, and each round adds a drafting and acceptance step.
+
+### Tests and tools
+- `build/run`: `QW_PARV=k` (batched verification with oracle drafts that contain deliberate mistakes) and `QW_PARV_DF=1` (with real drafts).
+- `bench/concurrent.py`: an `edit` mode (code-edit prompts).
+
+### Known limits
+- Total throughput still stops growing past about 8 concurrent requests: each group of 8 reads the weights again. Running more than 8 rows at once would save little: from the measured cost per row (about 2.9 ms), 16 rows would take about 55 ms against 64 ms in two groups (about 14% less), not worth rewriting every 8-row kernel.
+- With `QW_GGUF_PARTS` selecting only some parts, requests are served one at a time.
+- MLX concurrent output can differ from run to run (batched rounding, as in 1.3.0).
+
 ## 1.3.0 — 2026-11-09
 
 Concurrent requests: several agents (for example Claude Code subagents) are served at once instead of one after another. A lone request runs as before; without flags its output is bit-identical to 1.0.0 on both the GGUF and the MLX profile.
