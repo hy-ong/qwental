@@ -13,7 +13,7 @@ A long prompt no longer holds up requests that arrive after it, and the server r
 - `GET /status`: version, profile, uptime, totals of requests and of prompt, reused and generated tokens, and the queue length; with concurrency also the current mode, slot memory against its cap, the active requests and the measured rates.
 - `--help`.
 - `make install [PREFIX=/usr/local]` installs the single binary (the Metal kernels are embedded, so it runs from any directory).
-- Homebrew: `brew install hy-ong/tap/qwental` (tap [hy-ong/homebrew-tap](https://github.com/hy-ong/homebrew-tap); builds from source).
+- Homebrew: `brew tap hy-ong/qwental https://github.com/hy-ong/qwental` then `brew install hy-ong/qwental/qwental` (formula in `Formula/`; builds from source).
 
 ### Batched speculative decoding (experimental, off by default)
 - `QW_PAR_VSPEC=1` (GGUF only) uses speculative decoding for 2–3 concurrent requests. Each conversation keeps its own DFlash2 drafter context; the drafts of several conversations are verified together (up to 8 rows), and every row's logits are bit-identical to running alone (`build/run` `QW_PARV` / `QW_PARV_DF`).

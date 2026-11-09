@@ -62,7 +62,8 @@ INT8 旗標會改變 prefill 的數值。以程式碼、英文、中文三種內
 用 Homebrew 安裝（從原始碼編譯），之後把下面的 `./build/qwental-serve` 換成 `qwental-serve`：
 
 ```sh
-brew install hy-ong/tap/qwental
+brew tap hy-ong/qwental https://github.com/hy-ong/qwental
+brew install hy-ong/qwental/qwental
 ```
 
 或在 repository 裡編譯：

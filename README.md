@@ -62,7 +62,8 @@ Requirements: macOS 27, Xcode 27, M5 Max with 128 GB.
 Install with Homebrew (builds from source), then run `qwental-serve` in place of `./build/qwental-serve` below:
 
 ```sh
-brew install hy-ong/tap/qwental
+brew tap hy-ong/qwental https://github.com/hy-ong/qwental
+brew install hy-ong/qwental/qwental
 ```
 
 Or build in the repository:
