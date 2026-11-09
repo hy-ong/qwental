@@ -20,6 +20,16 @@ Qwental 直接執行 Strata 預設的模型檔 ISTA-DASLab GSQ-RCO **IQ3_S GGUF*
 
 `--int8` 不影響解碼。不加 INT8 旗標時輸出是同一個模型：在 Strata 自己生成的 600 個位置上，Qwental 的第一名全部與 Strata 相同（`bench/vs_strata_*.py`），推測解碼的輸出也與 greedy 完全一致。
 
+另外也支援去審查版的 **SC117 IQ3_S**（[`SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF`](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)：同一份 GSQ-RCO 量化，其中 96 個投影改成 Q8_0），與 Strata 用同一個檔案對照（順序交錯兩輪取平均，tok/s）：
+
+| | Strata | Qwental |
+|---|---|---|
+| 解碼：英文文章／寫新程式碼／改程式碼 | 92.9／131.0／170.8 | **100.9／138.5／198.8** |
+| 10.7K／47K 之後的解碼 | 90.7／85.1 | **98.2／87.9** |
+| Prefill 10.7K／47K | 1330／1421 | **1629／1613** |
+
+`--int8` 在 SC117 上也能用：另一組交錯測試中，prefill 10.7K／47K 從 1949／1860 提高到 2802／2815 tok/s，解碼不變；與同一版不開 INT8 比較，第一名相同 99.0–99.3%，平均 KL 0.002–0.022（4K 與 34K 的 prompt）。
+
 與 oMLX 0.7.4.dev1 對照，用同一份 MLX 權重（mixed 4/8-bit，Qwental 不加 `--gguf`）：
 
 | | oMLX | Qwental | Qwental `--int8`／`--int8-qk` |
@@ -77,7 +87,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 ```
 
 `models/` 裡需要的模型檔：
-- IQ3_S GGUF（`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` 的兩個分片）；`--gguf` 時 tokenizer 直接從 GGUF 的 metadata 讀（token id 與 `tokenizer.json` 完全相同）
+- IQ3_S GGUF（`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` 的兩個分片）；`--gguf` 時 tokenizer 直接從 GGUF 的 metadata 讀（token id 與 `tokenizer.json` 完全相同）；SC117 的 IQ3_S（兩個分片）用法相同
 - `dflash2/`，放 DFlash2 猜測模型的打包檔（`…q4_0-selq4.pack`），與 GGUF 目錄同層（有 MLX 目錄時與 MLX 目錄同層）
 - 選用：`Qwen3.8-Flash-Next-mixed-4-8bit/`，來自 [`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit`](https://huggingface.co/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit)，只有跑 MLX 權重（不加 `--gguf`）時才需要。有這個目錄時用它的 tokenizer。
 

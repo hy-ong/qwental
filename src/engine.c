@@ -1760,7 +1760,9 @@ static bool dn_in_ok(const qw_deltanet *N) {
     return !getenv("QW_DN_GENERIC") && dn_fmt_ok(N->in_qkv.gq) && dn_fmt_ok(N->in_z.gq) && N->in_a.gq == 30 + 1 && N->in_b.gq == 30 + 1 &&
            N->in_qkv.in == 2560 && N->in_qkv.out == 10240 && N->in_z.out == 6144 && N->in_a.out == 48 && N->in_b.out == 48;
 }
-static bool dn_out_ok(const qw_deltanet *N) { return !getenv("QW_DN_GENERIC") && dn_fmt_ok(N->out.gq) && N->out.in == 6144 && N->out.out == 2560; }
+static bool dn_out_ok(const qw_deltanet *N) { // out_proj 另外接受 Q8_0（dn_out_8）
+    return !getenv("QW_DN_GENERIC") && (dn_fmt_ok(N->out.gq) || N->out.gq == 8 + 1) && N->out.in == 6144 && N->out.out == 2560;
+}
 static qw_kernel *dn_kernel(qw_engine *e, const char *base, int nb) { // base 例："dn_in_14_12"；每個 NB 編一個 library（含所有格式組合）
     char name[64], defs[160], err[8192];
     snprintf(name, sizeof name, "%s_n%d", base, nb);

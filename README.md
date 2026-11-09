@@ -20,6 +20,16 @@ Qwental runs Strata's default model file, the ISTA-DASLab GSQ-RCO **IQ3_S GGUF**
 
 `--int8` does not change decode. Without INT8 flags the output is the same model: over 600 positions of Strata's own output, Qwental's top-1 token matches Strata's every time (`bench/vs_strata_*.py`), and speculative decoding output is identical to greedy output.
 
+Also the abliterated **SC117 IQ3_S** ([`SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF`](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF): the same GSQ-RCO quantization with 96 projections re-encoded as Q8_0), against Strata on the same file (two alternating rounds, mean tokens/s):
+
+| | Strata | Qwental |
+|---|---|---|
+| Decode: prose / new code / code edits | 92.9 / 131.0 / 170.8 | **100.9 / 138.5 / 198.8** |
+| Decode after 10.7K / 47K | 90.7 / 85.1 | **98.2 / 87.9** |
+| Prefill 10.7K / 47K | 1330 / 1421 | **1629 / 1613** |
+
+`--int8` works on SC117 too: in a separate alternating run, prefill 10.7K / 47K went from 1949 / 1860 to 2802 / 2815 tok/s with decode unchanged; against the same build without INT8, top-1 matches 99.0–99.3% and mean KL is 0.002–0.022 (4K and 34K prompts).
+
 Against oMLX 0.7.4.dev1 on the same MLX weights (mixed 4/8-bit, Qwental without `--gguf`):
 
 | | oMLX | Qwental | Qwental `--int8` / `--int8-qk` |
@@ -77,7 +87,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 ```
 
 Model files in `models/`:
-- the IQ3_S GGUF (two shards of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`); with `--gguf`, the tokenizer is read from the GGUF metadata (token ids identical to `tokenizer.json`)
+- the IQ3_S GGUF (two shards of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`); with `--gguf`, the tokenizer is read from the GGUF metadata (token ids identical to `tokenizer.json`); the SC117 IQ3_S (two shards) works the same way
 - `dflash2/` with the DFlash2 drafter pack (`…q4_0-selq4.pack`), next to the GGUF directory (or next to the MLX directory when there is one)
 - optional: `Qwen3.8-Flash-Next-mixed-4-8bit/` from [`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit`](https://huggingface.co/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit), needed only to run the MLX weights (without `--gguf`). When it is present, its tokenizer is used.
 

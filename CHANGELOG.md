@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.0 — 2026-11-09
+
+Runs the abliterated SC117 IQ3_S GGUF ([`SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF`](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)) at full speed, concurrency included. On the original IQ3_S GGUF nothing changes: default, INT8 and speculative outputs are bit-identical to 1.4.0 (and so to 1.0.0).
+
+### SC117
+- SC117 is the ISTA-DASLab GSQ-RCO quantization with the abliterated write-to-residual projections transplanted in; 96 of them are Q8_0 (`ssm_out`, `attn_output`, `ffn_down_shexp`). The fused DeltaNet output projection did not accept Q8_0, so a lone request fell back to the generic path and concurrent decoding failed at warmup. `dn_proj` now has Q8_0 decoders (2-byte aligned loads) for the output projection.
+- Against Strata on the same file, two alternating rounds (tok/s, Strata → Qwental): decode prose 92.9 → 100.9, new code 131.0 → 138.5, code edits 170.8 → 198.8; after 10.7K / 47K 90.7 / 85.1 → 98.2 / 87.9; prefill 10.7K 1330 → 1629, 47K 1421 → 1613.
+- Concurrent output is bit-identical to running each request alone (1, 4, 8 and 16 at once); speculative output equals greedy. 8 at once: 162.8 tok/s total.
+- Greedy text against Strata on SC117: identical on the code-edit prompt; on the other two it diverges at a near-tie or where Qwental picks Strata's own top-1 token.
+- `--int8` on SC117 (alternating runs, same session): prefill 10.7K / 47K 1949 / 1860 → 2802 / 2815 tok/s, decode unchanged; against the same build without INT8, top-1 matches 99.0% (100 positions after 4K) and 99.3% (300 after 34K), mean KL 0.0024 / 0.0219.
+- The attention output projection stays on the generic matvec for Q8_0: a fused Q8_0 variant measured 12.44 → 12.43 ms per token and slower prefill.
+
 ## 1.4.0 — 2026-11-09
 
 A long prompt no longer holds up requests that arrive after it, and the server reports its state at `GET /status`. Without flags a single request's output is bit-identical to 1.0.0 on both the GGUF and the MLX profile, and concurrent GGUF output is bit-identical to running each request alone, as in 1.3.0.

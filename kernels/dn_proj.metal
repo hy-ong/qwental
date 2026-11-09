@@ -1,6 +1,6 @@
 // GGUF profile 的 DeltaNet 投影（decode 一個 token、驗證 NB 個 token）：K-quant / IQ4_XS / BF16 區塊直接解碼
 //   dn_in_{Fqkv}_{Fz}_n{NB}：in_proj_qkv、in_proj_z、in_proj_a、in_proj_b（a / b 是 BF16）一次 dispatch（K = 2560）
-//   dn_out_{F}_n{NB}：out_proj（K = 6144）
+//   dn_out_{F}_n{NB}：out_proj（K = 6144）；F 另外可以是 Q8_0（8：只有 out_proj）
 // 權重只讀一次、NB 個 token 共用解碼結果；每個 token 的運算順序與 NB 無關（驗證與 decode 逐位元相同）。
 // 每個 SIMD group 算 R 列；32 個 lane 分成兩半，各自處理偶數 / 奇數個 superblock（256 個值），
 // 半邊內 16 個 lane 各負責 superblock 裡 16 個值（4 組連續 4 個，x 用 half4 讀）。對照 llama.cpp 的 kernel_mul_mv_q6_K 等的分工。
@@ -19,8 +19,8 @@ using namespace mpp::tensor_ops;
 
 constant char dn_kv4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}; // IQ4_NL / IQ4_XS 的值表
 
-// 每個 superblock（256 個值）的位元組數
-constexpr uint dn_bb(int f) { return f == 12 ? 144 : f == 13 ? 176 : f == 14 ? 210 : f == 23 ? 136 : 512; } // BF16：512
+// 每個 superblock（256 個值）的位元組數（Q8_0：8 個 34 位元組的區塊當成一個 superblock）
+constexpr uint dn_bb(int f) { return f == 8 ? 272 : f == 12 ? 144 : f == 13 ? 176 : f == 14 ? 210 : f == 23 ? 136 : 512; } // BF16：512
 
 inline float dn_h(device const uchar *p) { return float(as_type<half>(*(device const ushort *)p)); } // 2 位元組對齊
 
@@ -89,6 +89,19 @@ template <> inline void dn_dq16<23>(device const uchar *b, uint j, thread float4
     }
     const uint base = 32 * ib + 8 * hh;
     o[0] = base; o[1] = base + 4; o[2] = base + 16; o[3] = base + 20;
+}
+
+// Q8_0：lane j → 第 j / 2 個區塊（34 位元組：d、qs[32]）的前 / 後 16 個值。區塊只有 2 位元組對齊：qs 用 ushort 讀
+template <> inline void dn_dq16<8>(device const uchar *b, uint j, thread float4 *w, thread uint *o) {
+    const uint ib = j / 2, hh = j % 2;
+    device const uchar *blk = b + 34 * ib;
+    const float d = dn_h(blk);
+    device const ushort *q = (device const ushort *)(blk + 2 + 16 * hh);
+    for (uint i = 0; i < 4; i++) {
+        const char2 c0 = as_type<char2>(q[2 * i]), c1 = as_type<char2>(q[2 * i + 1]);
+        w[i] = float4(d * float(c0.x), d * float(c0.y), d * float(c1.x), d * float(c1.y));
+        o[i] = 32 * ib + 16 * hh + 4 * i;
+    }
 }
 
 template <> inline void dn_dq16<30>(device const uchar *b, uint j, thread float4 *w, thread uint *o) { // BF16
@@ -356,6 +369,16 @@ template <> inline void dn_dq8<23>(device const uchar *b, uint c, uint l, thread
         w1[i] = dl * float(dn_kv4[(q >> (8 * i + 4)) & 15]);
     }
 }
+template <> inline void dn_dq8<8>(device const uchar *b, uint c, uint l, thread float4 &w0, thread float4 &w1) { // Q8_0（2 位元組對齊）
+    device const uchar *blk = b + 34 * (c / 32);
+    const float d = dn_h(blk);
+    device const ushort *q = (device const ushort *)(blk + 2 + l);
+    for (uint i = 0; i < 2; i++) {
+        const char2 a0 = as_type<char2>(q[i]), a1 = as_type<char2>(q[8 + i]);
+        w0[2 * i] = d * float(a0.x); w0[2 * i + 1] = d * float(a0.y);
+        w1[2 * i] = d * float(a1.x); w1[2 * i + 1] = d * float(a1.y);
+    }
+}
 template <> inline void dn_dq8<30>(device const uchar *b, uint c, uint l, thread float4 &w0, thread float4 &w1) {
     w0 = float4(*(device const bfloat4 *)(b + 2 * (c + l)));
     w1 = float4(*(device const bfloat4 *)(b + 2 * (c + l + 16)));
@@ -519,6 +542,7 @@ DN_OUT_SIG(12)
 DN_OUT_SIG(13)
 DN_OUT_SIG(14)
 DN_OUT_SIG(23)
+DN_OUT_SIG(8)
 typedef decltype(dn_inf<12, 12>) dn_inf_t;
 #define DN_INF_SIG(FQ, FZ) template [[host_name("dn_inf_" #FQ "_" #FZ "_n" NBS)]] kernel dn_inf_t dn_inf<FQ, FZ>;
 #define DN_INF_ROW(FQ) DN_INF_SIG(FQ, 12) DN_INF_SIG(FQ, 13) DN_INF_SIG(FQ, 14) DN_INF_SIG(FQ, 23)
@@ -546,3 +570,4 @@ DN_OUTT_SIG(12)
 DN_OUTT_SIG(13)
 DN_OUTT_SIG(14)
 DN_OUTT_SIG(23)
+DN_OUTT_SIG(8)
