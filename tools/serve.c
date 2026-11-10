@@ -2136,7 +2136,10 @@ static void *par_loop(void *arg) {
     double mode_t = 0;              // 上一次換做法的時間（MODE_HOLD_S）
     int rr_n = 0, rr_tok = 0;       // 輪流推測解碼的牆鐘實測：目前在量幾個對話、累計 token 與時間
     double rr_ms = 0;
+    void *pool = NULL;
     for (;;) {
+        qw_pool_pop(pool); // 每輪一個 autorelease pool（迴圈裡有 continue：在下一輪開頭清上一輪的）
+        pool = qw_pool_push();
         for (int i = 0; i < nrejoin; i++) act[na++] = rejoin[i]; // 思考收尾後重新加入
         nrejoin = 0;
         { // 用戶端斷線（連線執行緒偵測到）：結束這個請求，GPU 不再為它算、slot 放出來

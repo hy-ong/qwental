@@ -150,8 +150,16 @@ qw_kernel *qw_kernel_get(qw_gpu *g, const char *name) {
 unsigned qw_kernel_max_threads(const qw_kernel *k) { return (unsigned)k->pso.maxTotalThreadsPerThreadgroup; }
 unsigned qw_kernel_simd_width(const qw_kernel *k) { return (unsigned)k->pso.threadExecutionWidth; }
 
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *);
+void *qw_pool_push(void) { return objc_autoreleasePoolPush(); }
+void qw_pool_pop(void *pool) { if (pool) objc_autoreleasePoolPop(pool); }
+
 bool qw_buf_new(qw_gpu *g, size_t size, qw_buf *out) {
-    id<MTLBuffer> b = [g->dev newBufferWithLength:size options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+    id<MTLBuffer> b;
+    @autoreleasepool {
+        b = [g->dev newBufferWithLength:size options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+    }
     if (!b) return false;
     static size_t tot;
     tot += size;
@@ -166,10 +174,13 @@ bool qw_buf_wrap(qw_gpu *g, void *ptr, size_t len, qw_buf *out) {
     const size_t page = (size_t)getpagesize();
     if ((uintptr_t)ptr % page) return false;
     size_t plen = (len + page - 1) / page * page;
-    id<MTLBuffer> b = [g->dev newBufferWithBytesNoCopy:ptr
-                                                length:plen
-                                               options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked
-                                           deallocator:nil];
+    id<MTLBuffer> b;
+    @autoreleasepool {
+        b = [g->dev newBufferWithBytesNoCopy:ptr
+                                      length:plen
+                                     options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked
+                                 deallocator:nil];
+    }
     if (!b) return false;
     out->handle = (__bridge_retained void *)b;
     out->ptr = ptr;
@@ -179,7 +190,9 @@ bool qw_buf_wrap(qw_gpu *g, void *ptr, size_t len, qw_buf *out) {
 
 void qw_buf_free(qw_buf *b) {
     if (b && b->handle) {
-        CFRelease(b->handle); // 對應 qw_buf_new 的 __bridge_retained
+        @autoreleasepool {
+            CFRelease(b->handle); // 對應 qw_buf_new 的 __bridge_retained
+        }
         b->handle = NULL;
         b->ptr = NULL;
         b->size = 0;
@@ -233,15 +246,17 @@ qw_batch *qw_batch_begin(qw_gpu *g, bool concurrent) {
     qw_batch *b = calloc(1, sizeof *b);
     b->g = g;
     b->stream = g->prof ? 0 : g->stream; // profiling 只用串流 0
-    b->cb = [st_queue(g, b->stream) commandBufferWithUnretainedReferences];
-    [b->cb encodeWaitForEvent:st_event(g, b->stream) value:*st_evv(g, b->stream)];
-    if (g->prof) {
-        b->prof = true;
-        g->nprof = 0;
-        return b;
+    @autoreleasepool { // cb / enc 是 strong 欄位，pool 清掉之後仍在；不包的話 autorelease 的那份要等執行緒結束才放
+        b->cb = [st_queue(g, b->stream) commandBufferWithUnretainedReferences];
+        [b->cb encodeWaitForEvent:st_event(g, b->stream) value:*st_evv(g, b->stream)];
+        if (g->prof) {
+            b->prof = true;
+            g->nprof = 0;
+            return b;
+        }
+        b->conc = concurrent;
+        b->enc = [b->cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
     }
-    b->conc = concurrent;
-    b->enc = [b->cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
     return b;
 }
 

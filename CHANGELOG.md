@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.1 — 2026-11-10
+
+Fixes the memory leak that made the server die every 15–20 minutes under Claude Code with many subagents. Engine output unchanged.
+
+- The scheduler thread had no autorelease pool, so every command buffer and encoder lived until the thread ended, and GPU memory bound to them was not returned after `qw_buf_free`. The process footprint grew ~10–15 GB per minute (to 230 GB) until macOS killed it with SIGKILL; freeing or shrinking slots did not lower it. Each scheduler round now runs in its own pool, and buffer creation / release and command-buffer creation are wrapped too.
+- Same load (8 clients, slot budget 8 GB, `--int8`), footprint after 255 s: 71 GB and climbing → 41 GB and flat; it now drops when slots are freed. Not specific to `--int8`; slot churn (subagents, shared-prefix copies, KV shrinking) made it worse.
+
 ## 1.7.0 — 2026-11-10
 
 Subagents launched together no longer prefill the same prefix again and again, and a server that dies leaves a reason in the log. Engine output unchanged: on the original IQ3_S GGUF, default, INT8 and speculative outputs are bit-identical to 1.6.1 (and so to 1.0.0); concurrent output is bit-identical to running alone.

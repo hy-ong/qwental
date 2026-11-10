@@ -32,6 +32,10 @@ unsigned qw_kernel_simd_width(const qw_kernel *k);
 // 緩衝區（shared storage，CPU 和 GPU 共用）
 bool qw_buf_new(qw_gpu *g, size_t size, qw_buf *out);
 void qw_buf_free(qw_buf *b);
+// 長壽執行緒（serve.c 的 par_loop）沒有 autorelease pool：每輪 push / pop 一次，否則 command buffer、encoder 永遠不會釋放，
+// 綁過它們的 MTLBuffer 被 qw_buf_free 之後記憶體也還不回系統（1.7.0 實測 footprint 每分鐘 +10–15 GB 直到被 SIGKILL）
+void *qw_pool_push(void);
+void qw_pool_pop(void *pool);
 // 把已經 mmap 的記憶體（page 對齊）直接包成 Metal buffer，不複製。len 會補到 page 的倍數。
 bool qw_buf_wrap(qw_gpu *g, void *ptr, size_t len, qw_buf *out);
 
