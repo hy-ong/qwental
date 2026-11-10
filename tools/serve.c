@@ -5,7 +5,7 @@
 // greedy 輸出與單獨跑逐位元相同。
 // 串流時每 10 秒沒有輸出就送 keepalive（ping）；用戶端斷線就取消請求（GPU 停下、slot 放出來）。思考太長時收尾、留空間給回答
 // （同 Strata 的 answer_room；QW_NO_ANSWER_ROOM=1 關掉）。
-// 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--exact-spec] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--parallel [N]] [--version]
+// 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--exact-spec] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--stats-file PATH] [--parallel [N]] [--version]
 // --gguf：整個模型改用該目錄的 GGUF（Strata 的 IQ3_S 等；等同 QW_GGUF=目錄 QW_GGUF_PARTS=all）。
 //   這時 MLX 目錄（--model）是選用的：沒有時 tokenizer 讀 GGUF 的 metadata，dflash2/ 改找 GGUF 目錄的同層
 //   （QW_GGUF_PARTS 只選一部分時其餘權重仍來自 MLX 目錄）
@@ -764,6 +764,7 @@ static bool wrap_inject(job *j) {
 // ---- /status：累計數字（兩種模式都有）
 static double T_START;
 static long long st_done, st_in, st_cached, st_out, st_cancel, st_err; // 完成的請求、prompt token、重用的 token、生成的 token、用戶端斷線、錯誤
+static void lt_count(int np, int cached, int gen, bool dead, bool err); // 跨重啟的累計：加到今天的 bucket（下面）
 static void chat_end(job *j) {
     conn *c = j->c;
     const bool openai = j->openai, dead = conn_dead(c);
@@ -776,6 +777,7 @@ static void chat_end(job *j) {
     __atomic_fetch_add(&st_out, st.gen, __ATOMIC_RELAXED);
     if (dead) __atomic_fetch_add(&st_cancel, 1, __ATOMIC_RELAXED);
     if (fin == QW_FIN_ERROR) __atomic_fetch_add(&st_err, 1, __ATOMIC_RELAXED);
+    lt_count(np, st.cached, st.gen, dead, fin == QW_FIN_ERROR);
     // 被截斷（max_tokens、context 滿、取消）：沒寫完的 tool call 當成文字輸出、不變成 tool_use（parser.cut_call），stop_reason 是 max_tokens
     chat_parser_finish(&gg->parser, fin == QW_FIN_LENGTH || fin == QW_FIN_CTX || dead, on_event, gg);
     if (gg->nstops) stop_flush(gg);
@@ -1295,7 +1297,283 @@ static void st_publish(job **act, int na, const char *mode) {
     if (mode) st_mode = mode;
     pthread_mutex_unlock(&st_mu);
 }
-static void handle_status(conn *c) {
+// ---- 累計數字跨重啟保留（--cache-dir 裡的 stats.json，或 --stats-file）
+// 檔案存「之前幾次」的總和（base）與每天（本地時區的日期）的 bucket；這次的總數仍是 st_*，base + st_* 就是 lifetime。
+// 每個請求完成時加到當天的 bucket；服務時間（開始監聽之後）每 30 秒、/status 與存檔時記到當天，跨過午夜就拆到兩天。
+// 只留最近 LT_KEEP_DAYS 天的 bucket。每 30 秒檢查一次：數字變了（或距上次存超過 10 分鐘）就寫；SIGTERM / SIGINT 時先寫再結束。
+// 寫法：暫存檔 + fsync + rename
+enum { LT_KEEP_DAYS = 400, LT_DAYS_MAX = 512 };
+typedef struct {
+    long long since, done, in, cached, out, cancel, err; // since = 第一次記錄的 unix 時間
+    double uptime;                                        // 累計服務秒數
+} lt_stats;
+typedef struct {
+    char date[11]; // YYYY-MM-DD（本地時區）
+    long long done, in, cached, out, cancel, err;
+    double uptime;
+} lt_day;
+static char *LT_PATH;    // NULL = 不保留
+static lt_stats lt_base; // 載入時的值（之前幾次的總和）
+static pthread_mutex_t lt_mu = PTHREAD_MUTEX_INITIALIZER; // 保護 lt_days / lt_nd / lt_up_t / 存檔
+static lt_day lt_days[LT_DAYS_MAX];                       // 依日期排序（舊 → 新）
+static int lt_nd;
+static double lt_up_t;       // 服務時間記到哪個時間點（unix 秒；0 = 還沒開始服務）
+static long long lt_last[6]; // 上次存檔時的 done / in / cached / out / cancel / err
+static double lt_last_t;     // 上次存檔的時間（qw_now）
+static double wall_now(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1e6;
+}
+static void lt_date(double t, char out[11]) {
+    const time_t s = (time_t)t;
+    struct tm tm;
+    localtime_r(&s, &tm);
+    strftime(out, 11, "%Y-%m-%d", &tm);
+}
+static double lt_next_midnight(double t) { // t 之後的下一個本地午夜
+    const time_t s = (time_t)t;
+    struct tm tm;
+    localtime_r(&s, &tm);
+    tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+    tm.tm_mday++;
+    tm.tm_isdst = -1;
+    return (double)mktime(&tm);
+}
+static bool lt_date_ok(const char *s) {
+    if (!s || strlen(s) != 10 || s[4] != '-' || s[7] != '-') return false;
+    for (int i = 0; i < 10; i++)
+        if (i != 4 && i != 7 && (s[i] < '0' || s[i] > '9')) return false;
+    return true;
+}
+static void lt_prune(double now) { // 刪掉 LT_KEEP_DAYS 天以前的 bucket（lt_mu 持有）
+    char cut[11];
+    lt_date(now - LT_KEEP_DAYS * 86400.0, cut);
+    int k = 0;
+    while (k < lt_nd && strcmp(lt_days[k].date, cut) < 0) k++;
+    if (k) { memmove(lt_days, lt_days + k, sizeof *lt_days * (size_t)(lt_nd - k)); lt_nd -= k; }
+}
+static lt_day *lt_day_get(const char *date) { // date 的 bucket，沒有就照日期順序插入（lt_mu 持有）
+    int i = lt_nd;
+    while (i > 0 && strcmp(lt_days[i - 1].date, date) > 0) i--;
+    if (i > 0 && !strcmp(lt_days[i - 1].date, date)) return &lt_days[i - 1];
+    if (lt_nd == LT_DAYS_MAX) { // 滿了：丟最舊的（比全部都舊的就不收）
+        if (i == 0) return NULL;
+        memmove(lt_days, lt_days + 1, sizeof *lt_days * (size_t)(lt_nd - 1));
+        lt_nd--;
+        i--;
+    }
+    memmove(lt_days + i + 1, lt_days + i, sizeof *lt_days * (size_t)(lt_nd - i));
+    lt_days[i] = (lt_day){0};
+    memcpy(lt_days[i].date, date, 11);
+    lt_nd++;
+    return &lt_days[i];
+}
+static void lt_up_flush(double now) { // 服務時間記到各天（跨過午夜就拆開）（lt_mu 持有）
+    if (lt_up_t <= 0 || now <= lt_up_t) return;
+    for (double t = lt_up_t; t < now;) {
+        const double m = lt_next_midnight(t), e = m > t && m < now ? m : now;
+        char d[11];
+        lt_date(t, d);
+        lt_day *b = lt_day_get(d);
+        if (b) b->uptime += e - t;
+        t = e;
+    }
+    lt_up_t = now;
+}
+static void lt_serving(void) { // 開始監聽：服務時間從這裡起算
+    if (!LT_PATH) return;
+    pthread_mutex_lock(&lt_mu);
+    lt_up_t = wall_now();
+    pthread_mutex_unlock(&lt_mu);
+}
+static void lt_count(int np, int cached, int gen, bool dead, bool err) { // 一個請求完成：加到今天的 bucket
+    if (!LT_PATH) return;
+    char d[11];
+    lt_date(wall_now(), d);
+    pthread_mutex_lock(&lt_mu);
+    lt_day *b = lt_day_get(d);
+    if (b) { b->done++; b->in += np; b->cached += cached; b->out += gen; b->cancel += dead; b->err += err; }
+    pthread_mutex_unlock(&lt_mu);
+}
+static lt_stats lt_now(void) { // base + 這次的數字
+    lt_stats s = lt_base;
+    s.done += __atomic_load_n(&st_done, __ATOMIC_RELAXED);
+    s.in += __atomic_load_n(&st_in, __ATOMIC_RELAXED);
+    s.cached += __atomic_load_n(&st_cached, __ATOMIC_RELAXED);
+    s.out += __atomic_load_n(&st_out, __ATOMIC_RELAXED);
+    s.cancel += __atomic_load_n(&st_cancel, __ATOMIC_RELAXED);
+    s.err += __atomic_load_n(&st_err, __ATOMIC_RELAXED);
+    if (T_START > 0) s.uptime += qw_now() - T_START;
+    return s;
+}
+static bool lt_num(const js *v, const char *k, long long *o) { // 非負整數欄位
+    const double x = js_num(v, k, -1);
+    if (!(x >= 0 && x < 9e15)) return false;
+    *o = (long long)x;
+    return true;
+}
+// 讀 path（總數與每天的 bucket）：沒有檔案 → 從零開始；壞掉（不是 JSON、總數欄位缺少或是負的）→ 改名成 .bad、從零開始。
+// 都只記一行。不合格的單日 bucket 略過
+static bool lt_load(const char *path, lt_stats *out) {
+    *out = (lt_stats){.since = (long long)time(NULL)};
+    lt_nd = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (errno == ENOENT) fprintf(stderr, "[stats] %s 不存在：累計數字從零開始\n", path);
+        else fprintf(stderr, "[stats] 讀不到 %s（%s）：累計數字從零開始\n", path, strerror(errno));
+        return false;
+    }
+    enum { CAP = 8 << 20 };
+    char *buf = malloc(CAP);
+    const size_t n = buf ? fread(buf, 1, CAP - 1, f) : 0;
+    fclose(f);
+    char err[128] = "";
+    js *v = buf && n < CAP - 1 ? js_parse(buf, n, err, sizeof err) : NULL;
+    free(buf);
+    bool ok = v && v->t == JS_OBJ;
+    lt_stats s = {0};
+    if (ok) {
+        ok = lt_num(v, "since", &s.since) && lt_num(v, "done", &s.done) && lt_num(v, "prompt_tokens", &s.in) &&
+             lt_num(v, "cached_tokens", &s.cached) && lt_num(v, "output_tokens", &s.out) && lt_num(v, "cancelled", &s.cancel) &&
+             lt_num(v, "errors", &s.err);
+        s.uptime = js_num(v, "uptime_s", -1);
+        if (!(s.uptime >= 0 && s.uptime < 9e15)) ok = false;
+    }
+    if (ok) {
+        const js *days = js_get(v, "days");
+        if (days && days->t == JS_OBJ)
+            for (const js *k = days->kid; k; k = k->next) {
+                lt_day b = {0};
+                const double up = js_num(k, "uptime_s", 0);
+                if (k->t != JS_OBJ || !lt_date_ok(k->key) || !(up >= 0 && up < 9e15)) continue;
+                if (!(lt_num(k, "done", &b.done) && lt_num(k, "prompt_tokens", &b.in) && lt_num(k, "cached_tokens", &b.cached) &&
+                      lt_num(k, "output_tokens", &b.out)))
+                    continue;
+                lt_num(k, "cancelled", &b.cancel);
+                lt_num(k, "errors", &b.err);
+                lt_day *d = lt_day_get(k->key);
+                if (d) { d->done += b.done; d->in += b.in; d->cached += b.cached; d->out += b.out; d->cancel += b.cancel; d->err += b.err; d->uptime += up; }
+            }
+        lt_prune(wall_now());
+    }
+    js_free(v);
+    if (!ok) {
+        lt_nd = 0;
+        char bad[1100];
+        snprintf(bad, sizeof bad, "%s.bad", path);
+        rename(path, bad);
+        fprintf(stderr, "[stats] %s 格式不對（%s）：改名成 .bad，累計數字從零開始\n", path, *err ? err : "欄位缺少或不合理");
+        return false;
+    }
+    if (s.since <= 0) s.since = (long long)time(NULL);
+    *out = s;
+    return true;
+}
+// 總數；days > 0 時加上最近 days 天（含今天）的 bucket，days < 0 = 全部（lt_mu 持有）
+static void lt_json(sbuf *o, const lt_stats *s, int days) {
+    sb_printf(o, "{\"since\":%lld,\"uptime_s\":%.0f,\"done\":%lld,\"prompt_tokens\":%lld,\"cached_tokens\":%lld,\"output_tokens\":%lld,"
+                 "\"cancelled\":%lld,\"errors\":%lld",
+              s->since, s->uptime, s->done, s->in, s->cached, s->out, s->cancel, s->err);
+    if (days) {
+        char cut[11] = "";
+        if (days > 0) lt_date(wall_now() - (days - 1) * 86400.0, cut);
+        sb_puts(o, ",\"days\":{");
+        bool first = true;
+        for (int i = 0; i < lt_nd; i++) {
+            const lt_day *b = &lt_days[i];
+            if (strcmp(b->date, cut) < 0) continue;
+            sb_printf(o, "%s\"%s\":{\"done\":%lld,\"prompt_tokens\":%lld,\"cached_tokens\":%lld,\"output_tokens\":%lld,\"cancelled\":%lld,"
+                         "\"errors\":%lld,\"uptime_s\":%.0f}",
+                      first ? "" : ",", b->date, b->done, b->in, b->cached, b->out, b->cancel, b->err, b->uptime);
+            first = false;
+        }
+        sb_puts(o, "}");
+    }
+    sb_puts(o, "}");
+}
+// 寫到 path.tmp.<pid>、fsync、rename（不會留下寫一半的檔）。目錄不在時建一層（lt_mu 持有）
+static bool lt_write(const char *path, const lt_stats *s) {
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (!f && errno == ENOENT) {
+        char dir[1100];
+        snprintf(dir, sizeof dir, "%s", path);
+        char *sl = strrchr(dir, '/');
+        if (sl && sl != dir) { *sl = 0; mkdir(dir, 0755); f = fopen(tmp, "wb"); }
+    }
+    if (!f) return false;
+    sbuf o = {0};
+    lt_json(&o, s, -1);
+    sb_puts(&o, "\n");
+    bool ok = fwrite(o.p, 1, o.n, f) == o.n && fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = fclose(f) == 0 && ok;
+    sb_free(&o);
+    if (ok && rename(tmp, path) == 0) return true;
+    const int e = errno;
+    unlink(tmp);
+    errno = e;
+    return false;
+}
+// force = 一定寫（結束時）；否則數字變了、或距上次存超過 600 秒（只有服務時間變）才寫
+static void lt_save(bool force) {
+    if (!LT_PATH) return;
+    pthread_mutex_lock(&lt_mu);
+    const double w = wall_now();
+    lt_up_flush(w);
+    lt_prune(w);
+    const lt_stats s = lt_now();
+    const long long cur[6] = {s.done, s.in, s.cached, s.out, s.cancel, s.err};
+    const double now = qw_now();
+    if (force || memcmp(cur, lt_last, sizeof cur) || now - lt_last_t >= 600) {
+        if (lt_write(LT_PATH, &s)) { memcpy(lt_last, cur, sizeof cur); lt_last_t = now; }
+        else fprintf(stderr, "[stats] 寫不進 %s（%s）\n", LT_PATH, strerror(errno));
+    }
+    pthread_mutex_unlock(&lt_mu);
+}
+static void lt_init(const char *path) { // 載入；path NULL = 不保留
+    if (!path) return;
+    LT_PATH = strdup(path);
+    pthread_mutex_lock(&lt_mu);
+    const bool had = lt_load(LT_PATH, &lt_base);
+    pthread_mutex_unlock(&lt_mu);
+    const lt_stats b = lt_base;
+    const long long l[6] = {b.done, b.in, b.cached, b.out, b.cancel, b.err};
+    memcpy(lt_last, l, sizeof lt_last);
+    lt_last_t = qw_now();
+    if (had)
+        fprintf(stderr, "[stats] 累計（%s）：%lld 個請求、prompt %lld 個 token、生成 %lld 個 token；%d 天的紀錄\n", LT_PATH, b.done, b.in, b.out, lt_nd);
+}
+// 每 30 秒存一次；SIGTERM / SIGINT 先存再照預設行為結束（launcher 用 SIGTERM 停 server）。沒有保留時什麼都不裝
+static void lt_start(void) {
+    if (!LT_PATH) return;
+    dispatch_queue_t q = dispatch_queue_create("qwental.stats", DISPATCH_QUEUE_SERIAL);
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), 30 * NSEC_PER_SEC, 2 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(t, ^{ lt_save(false); });
+    dispatch_resume(t);
+    const int sigs[2] = {SIGTERM, SIGINT};
+    for (int i = 0; i < 2; i++) {
+        const int sig = sigs[i];
+        signal(sig, SIG_IGN); // 改由 dispatch source 接（I/O 不在 signal handler 裡做）
+        dispatch_source_t s = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)sig, 0, q);
+        dispatch_source_set_event_handler(s, ^{
+            lt_save(true);
+            fprintf(stderr, "[stats] 收到 %s：累計數字已存到 %s，結束\n", sig == SIGTERM ? "SIGTERM" : "SIGINT", LT_PATH);
+            signal(sig, SIG_DFL); // 照預設行為結束（結束狀態同以前：被 sig 終止）
+            sigset_t m;
+            sigemptyset(&m);
+            sigaddset(&m, sig);
+            pthread_sigmask(SIG_UNBLOCK, &m, NULL); // dispatch 的執行緒可能擋著 signal
+            raise(sig);
+            usleep(200 * 1000); // macOS 的 raise 不一定在回傳前送達：等一下；還在就用 shell 慣例的 128 + sig 結束
+            _exit(128 + sig);
+        });
+        dispatch_resume(s);
+    }
+}
+static void handle_status(conn *c, const char *qs) { // qs：查詢字串（days=N：lifetime 加上最近 N 天的 bucket）
     sbuf o = {0};
     int queued = 0;
     pthread_mutex_lock(&q_mu);
@@ -1304,6 +1582,18 @@ static void handle_status(conn *c) {
     sb_printf(&o, "{\"version\":\"%s\",\"profile\":\"%s\",\"uptime_s\":%.0f,\"parallel\":%d,\"done\":%lld,\"prompt_tokens\":%lld,"
                   "\"cached_tokens\":%lld,\"output_tokens\":%lld,\"queued\":%d,\"cancelled\":%lld,\"errors\":%lld",
               QW_VERSION, getenv("QW_GGUF") ? "gguf" : "mlx", qw_now() - T_START, PAR, st_done, st_in, st_cached, st_out, queued, st_cancel, st_err);
+    if (LT_PATH) { // 跨重啟的累計（含這次）；沒有保留時不送
+        const char *dq = qs ? strstr(qs, "days=") : NULL;
+        int nd = dq && (dq == qs || dq[-1] == '&') ? atoi(dq + 5) : 0;
+        if (nd < 0) nd = 0;
+        if (nd > LT_KEEP_DAYS + 1) nd = LT_KEEP_DAYS + 1;
+        pthread_mutex_lock(&lt_mu);
+        lt_up_flush(wall_now());
+        const lt_stats l = lt_now();
+        sb_puts(&o, ",\"lifetime\":");
+        lt_json(&o, &l, nd);
+        pthread_mutex_unlock(&lt_mu);
+    }
     if (PAR > 1) {
         pthread_mutex_lock(&st_mu);
         sb_printf(&o, ",\"mode\":\"%s\",\"slot_mem_gb\":%.2f,\"slot_budget_gb\":%.1f,\"active\":[", st_n ? st_mode : "idle", st_mem / 1e9,
@@ -1600,6 +1890,7 @@ static void serve_conn(int fd, bool par) {
     if (body) {
         char *q = strchr(path, '?');
         if (q) *q = 0;
+        const char *qs = q ? q + 1 : "";
         const char *p = path;
         if (!strncmp(p, "/v1/v1/", 7)) p += 3; // base URL 多寫了一次 /v1（同 Strata）
         const bool post = !strcmp(method, "POST"), get = !strcmp(method, "GET");
@@ -1611,7 +1902,7 @@ static void serve_conn(int fd, bool par) {
             respond(&c, 200, "application/json", m, strlen(m));
         } else if (!strcmp(p, "/health")) respond(&c, 200, "application/json", "{\"ok\":true}", 11);
         else if (get && (!strcmp(p, "/dashboard") || !strcmp(p, "/"))) respond(&c, 200, "text/html; charset=utf-8", dashboard_html, sizeof dashboard_html);
-        else if (get && !strcmp(p, "/status")) handle_status(&c);
+        else if (get && !strcmp(p, "/status")) handle_status(&c, qs);
         else {
             char m[1100];
             snprintf(m, sizeof m, "not found: %s %s", method, path);
@@ -1639,21 +1930,23 @@ int main(int argc, char **argv) {
     int port = 8080, ctx = 131072;
     setenv("QW_SLOTS", "3", 0); // 預設 3 組 KV slot（主對話、權限判斷等不同前綴的請求各自快取）
     const char *host = "127.0.0.1", *cache_dir = "cache"; // 持久化前綴快取（SSD），"" = 不用
+    const char *stats_file = NULL; // 累計數字的檔案：NULL = cache_dir/stats.json（cache_dir 是 "" 時不保留），"" = 不保留
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--version")) { printf("qwental %s\n", QW_VERSION); return 0; }
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("qwental %s: Anthropic / OpenAI compatible server for Qwen3.8-Flash-Next on Apple M5 Max\n\n"
                    "usage: qwental-serve [--gguf DIR] [--model DIR] [--port 8080] [--host 127.0.0.1] [--ctx 131072]\n"
-                   "                     [--cache-dir cache] [--parallel [N]] [--slots 3] [--anthropic-thinking on_request|always]\n"
+                   "                     [--cache-dir cache] [--stats-file PATH] [--parallel [N]] [--slots 3] [--anthropic-thinking on_request|always]\n"
                    "                     [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--exact-spec] [--version]\n\n"
                    "  --gguf DIR      run the IQ3_S GGUF in DIR (DFlash2 pack in dflash2/ next to it)\n"
                    "  --model DIR     MLX weights (default models/Qwen3.8-Flash-Next-mixed-4-8bit)\n"
-                   "  --cache-dir D   SSD prefix cache (\"\" = off)\n"
+                   "  --cache-dir D   SSD prefix cache (\"\" = off); also holds stats.json (lifetime totals)\n"
+                   "  --stats-file F  lifetime totals + per-day usage (default D/stats.json, \"\" = off); saved every 30 s and on SIGTERM/SIGINT\n"
                    "  --parallel N    concurrent requests (default 16, 1 = one at a time)\n"
                    "  --anthropic-thinking M  Anthropic requests that do not ask for thinking: on_request (default, no thinking) or always\n"
                    "  --int8          INT8 prefill (faster long prompts; outputs differ slightly)\n\n"
-                   "endpoints: POST /v1/messages, /v1/messages/count_tokens, /v1/chat/completions; GET /v1/models, /health, /status, /dashboard\n",
+                   "endpoints: POST /v1/messages, /v1/messages/count_tokens, /v1/chat/completions; GET /v1/models, /health, /status[?days=N], /dashboard\n",
                    QW_VERSION);
             return 0;
         }
@@ -1673,6 +1966,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--model")) MODEL_DIR = argv[i + 1];
         else if (!strcmp(argv[i], "--slots")) setenv("QW_SLOTS", argv[i + 1], 1);
         else if (!strcmp(argv[i], "--cache-dir")) cache_dir = argv[i + 1];
+        else if (!strcmp(argv[i], "--stats-file")) stats_file = argv[i + 1];
         else if (!strcmp(argv[i], "--parallel")) PAR = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--anthropic-thinking")) { // Anthropic 請求沒提思考時：on_request（預設，不思考）/ always（思考）
             if (strcmp(argv[i + 1], "always") && strcmp(argv[i + 1], "on_request")) { fprintf(stderr, "❌ --anthropic-thinking 要是 on_request 或 always\n"); return 1; }
@@ -1693,6 +1987,13 @@ int main(int argc, char **argv) {
     if (PAR > QW_PAR_MAX) PAR = QW_PAR_MAX;
     if (PAR > 1 && atoi(getenv("QW_SLOTS")) < PAR) { char v[8]; snprintf(v, sizeof v, "%d", PAR); setenv("QW_SLOTS", v, 1); } // 每個並發的對話一個 slot
     signal(SIGPIPE, SIG_IGN);
+    { // 累計數字（跨重啟）：--stats-file，或 cache_dir/stats.json
+        char sp[1100];
+        if (!stats_file) { if (*cache_dir) snprintf(sp, sizeof sp, "%s/stats.json", cache_dir); else sp[0] = 0; }
+        else snprintf(sp, sizeof sp, "%s", stats_file);
+        lt_init(*sp ? sp : NULL);
+        lt_start();
+    }
     char err[1024];
     TK = qw_tok_open_any(MODEL_DIR, getenv("QW_GGUF"), err, sizeof err); // 沒有 MLX 目錄時用 GGUF 的 tokenizer
     if (!TK) { fprintf(stderr, "❌ %s\n", err); return 1; }
@@ -1764,6 +2065,7 @@ int main(int argc, char **argv) {
     if (getenv("QW_EXACT_SPEC") && strcmp(getenv("QW_EXACT_SPEC"), "0"))
         fprintf(stderr, "推測解碼 = greedy（--exact-spec%s）\n", getenv("QW_GGUF") ? "；GGUF 本來就是，不影響" : "");
     T_START = qw_now();
+    lt_serving();
     const int ls = socket(AF_INET, SOCK_STREAM, 0);
     const int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);

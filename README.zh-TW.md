@@ -98,7 +98,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 - Prefix cache：多組 KV slot，並把快照存到 SSD；同時進行的對話之間共用前綴
 - 同時多個請求（預設開，最多 16 個；`--parallel N` 改上限，最多 64，`--parallel 1` 一次一個）：只有一個請求時走推測解碼，多個時一起 decode，依實測速度自動選。新的長 prompt 分段 prefill，正在生成的對話不會停住；之後才到的請求也不必等它跑完（即使它是單獨進來的）。slot 的記憶體有上限（實體記憶體 − 權重 − 16 GB，或 `QW_SLOT_MEM_GB`）。
 - `GET /status`：版本、profile、執行時間、請求與 token 的累計、排隊數，同時多個請求時另有目前的模式、slot 記憶體、實測速度與每個進行中的對話；`--help` 列出所有選項
-- `GET /dashboard`（也可以用 `/`）：根據 `/status` 即時更新的網頁，顯示進行中的對話、模式、tok/s、快取命中率、slot 記憶體與近 5 分鐘的走勢圖
+- `GET /dashboard`（也可以用 `/`）：根據 `/status` 即時更新的網頁，顯示進行中的對話、模式、tok/s、快取命中率、slot 記憶體、近 5 分鐘的走勢圖、API 計價（OpenRouter `qwen/qwen3.8-flash` 價格，可自訂）以及依日／週／月的用量；英文或繁體中文
+- `--stats-file PATH`：累計數字與每日用量跨重啟保存的位置（預設 `<cache-dir>/stats.json`，`""` 表示不保存）；`GET /status` 以 `lifetime` 回報，加 `?days=N` 附每日資料
 - 實驗性質、預設關閉：同時 2–3 個請求時的批次推測解碼（`QW_PAR_VSPEC=1`，限 GGUF）
 - 前端可以用 Claude Code 或任何 Anthropic / OpenAI 相容的 client。完整支援 Claude Code：`messages` 裡的 system 訊息、思考強度（`high` → xhigh）、subagent（任何 model 名稱都由同一個模型服務）、平行的 tool call、自動壓縮（"prompt is too long" 錯誤）、按 Esc 取消、長 prefill 期間的 keepalive ping、可重試的錯誤（529／SSE error），以及 `usage` 裡的快取欄位。檔案內容或工具輸出裡的特殊 token 字面維持一般文字。
 - `--anthropic-thinking on_request|always`：沒有要求 thinking 的 Anthropic 請求不思考（`on_request`，預設，同 Strata）或照樣思考（`always`）

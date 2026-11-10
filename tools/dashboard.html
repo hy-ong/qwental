@@ -59,6 +59,7 @@ header .meta b { color: var(--fg); font-weight: 500; font-family: var(--mono); }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
 .panel h2 { font-size: 13.5px; margin: 0 0 8px; font-weight: 600; display: flex; align-items: baseline; gap: 10px; }
 .panel h2 .note { color: var(--dim); font-weight: 400; font-size: 12px; }
+.panel h2 > span:first-child { white-space: nowrap; flex-shrink: 0; }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--dim); margin-left: auto; }
 .legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; background: var(--c); }
 .chartp { display: flex; flex-direction: column; }
@@ -84,6 +85,34 @@ td.cache { width: 26%; }
 .rates .r .v { text-align: right; font-family: var(--mono); }
 .rates .r.cur .k { color: var(--fg); font-weight: 600; }
 .rates .r .k { color: var(--dim); font-family: var(--mono); white-space: nowrap; min-width: 6.5em; }
+.seg { display: inline-flex; margin-left: auto; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; font-size: 12px; font-weight: 400; }
+.seg[hidden] { display: none; }
+.seg button { font: inherit; color: var(--dim); background: var(--panel); border: 0; padding: 2px 10px; cursor: pointer; white-space: nowrap; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.on { color: var(--fg); background: var(--panel2); font-weight: 600; }
+#cost, #hist { margin-bottom: 16px; }
+#hist .cbox { min-height: 150px; margin-bottom: 8px; }
+#hist td.cur, #hist tr.cur td { font-weight: 650; }
+#hist tr.cur td:first-child { box-shadow: inset 3px 0 var(--accent); }
+#hist td:first-child { padding-left: 10px; font-family: var(--sans); }
+.costg { display: grid; grid-template-columns: 1fr 1fr minmax(250px, .85fr); gap: 0; }
+.costg > div { padding: 2px 16px; min-width: 0; }
+.costg > div:first-child { padding-left: 0; }
+.costg > div + div { border-left: 1px solid var(--line); }
+.cs .lbl, .cp .lbl { color: var(--dim); font-size: 12.5px; }
+.cs .big { font-family: var(--mono); font-size: 28px; font-weight: 600; line-height: 1.2; margin: 2px 0 6px; white-space: nowrap; }
+.ck { display: grid; grid-template-columns: auto 1fr auto; gap: 2px 12px; font-size: 13px; margin: 0; }
+.ck dt { color: var(--dim); }
+.ck dd { margin: 0; text-align: right; font-family: var(--mono); }
+.ck dd.t { color: var(--faint); }
+.cs .sub { color: var(--dim); font-size: 12px; margin-top: 6px; }
+.cs .empty { text-align: left; padding: 8px 0; font-size: 12.5px; }
+.cp label { display: grid; grid-template-columns: 1fr 7.5em; align-items: center; gap: 8px; font-size: 13px; color: var(--dim); margin: 5px 0; }
+.cp input { font: 13px var(--mono); color: var(--fg); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; text-align: right; width: 100%; }
+.cp input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent); border-color: var(--accent); }
+.cp-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--dim); }
+.cp-foot button { margin-left: auto; font: inherit; color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; cursor: pointer; white-space: nowrap; }
+.cp-foot button:disabled { color: var(--faint); cursor: default; }
 footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; gap: 16px; flex-wrap: wrap; }
 @media (max-width: 1180px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 980px) { .row2 { grid-template-columns: 1fr; } }
@@ -146,7 +175,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       <div class="cbox"><canvas id="chart"></canvas></div>
     </div>
     <div class="panel">
-      <h2><span data-i18n="totals"></span> <span class="note" data-i18n="totalsNote"></span></h2>
+      <h2><span data-i18n="totals"></span> <span class="note" id="totals-note"></span>
+        <span class="seg" id="scope" role="group" hidden><button type="button" data-s="s" data-i18n="scopeS"></button><button type="button" data-s="l" data-i18n="scopeL" data-i18n-title="scopeLT"></button></span></h2>
       <dl class="kv">
         <dt data-i18n-title="tTotalT"><b data-i18n="tTotal"></b> <span class="note" data-i18n="tTotalNote"></span></dt><dd id="t-total"><b>—</b></dd>
         <dt data-i18n-title="tGpuT"><b data-i18n="tGpu"></b> <span class="note" data-i18n="tGpuNote"></span></dt><dd id="t-gpu"><b>—</b></dd>
@@ -162,6 +192,31 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
         <div id="rates-list"></div>
       </div>
     </div>
+  </section>
+
+  <section class="panel" id="cost">
+    <h2><span data-i18n="cost" data-i18n-title="costT"></span> <span class="note" data-i18n="costNote"></span></h2>
+    <div class="costg">
+      <div class="cs" id="cs-s"></div>
+      <div class="cs" id="cs-l"></div>
+      <div class="cp">
+        <div class="lbl" data-i18n="prices"></div>
+        <label><span data-i18n="pIn" data-i18n-title="pInT"></span><input id="p-in" type="number" min="0" step="any" inputmode="decimal"></label>
+        <label><span data-i18n="pCache"></span><input id="p-cache" type="number" min="0" step="any" inputmode="decimal"></label>
+        <label><span data-i18n="pOut"></span><input id="p-out" type="number" min="0" step="any" inputmode="decimal"></label>
+        <div class="cp-foot"><span id="p-src"></span><button type="button" id="p-reset" data-i18n="pReset"></button></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="hist" hidden>
+    <h2><span data-i18n="hist"></span> <span class="note" id="hist-note"></span>
+      <span class="seg" id="per" role="group"><button type="button" data-p="d" data-i18n="pD"></button><button type="button" data-p="w" data-i18n="pW"></button><button type="button" data-p="m" data-i18n="pM"></button></span></h2>
+    <div class="cbox"><canvas id="hchart"></canvas></div>
+    <table>
+      <thead><tr><th class="l" data-i18n="hPer"></th><th data-i18n="tDone"></th><th data-i18n="tIn"></th><th data-i18n="tCached"></th><th data-i18n="tOut"></th><th data-i18n="cost"></th></tr></thead>
+      <tbody id="hbody"></tbody>
+    </table>
   </section>
 
   <section class="panel">
@@ -228,6 +283,17 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       srcA: "Data from ", srcB: ", polled every second", lastUpd: "Last update {t}",
       foot: "spec = each conversation decodes speculatively on its own; batch = several conversations decode together",
       du: { d: "d", h: "h", m: "m", s: "s" },
+      scopeS: "This run", scopeL: "All time", scopeLT: "Kept across server restarts (stats.json)",
+      sinceL: "Since {d} · {u} of uptime", sinceD: "Since {d}",
+      cost: "API cost", costT: "(prompt − cached) × input + cached × cache read + output × output, per 1M tokens",
+      costNote: "Priced at OpenRouter qwen/qwen3.8-flash rates",
+      cIn: "Input (uncached)", cCache: "Cache read", cOut: "Output",
+      cAvg: "Average {v} per hour of uptime", cRecent: "Last {n} min: {v} per hour",
+      cNoLife: "All-time totals appear when the server keeps stats.json (--cache-dir or --stats-file).",
+      prices: "Price per 1M tokens (USD)", pIn: "Input", pInT: "Prompt tokens not served from cache", pCache: "Cache read", pOut: "Output",
+      pReset: "Reset to defaults", pDef: "Default prices", pCustom: "Custom prices, saved in this browser",
+      hist: "Usage by period", histNote: "Local time; weeks start on Monday", pD: "Day", pW: "Week", pM: "Month", hPer: "Period",
+      wkOf: "Week of {d}", cur: { d: "today", w: "this week", m: "this month" },
     },
     "zh-TW": {
       _name: "中文", _lang: "語言", title: "Qwental 儀表板",
@@ -265,6 +331,17 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       srcA: "資料來源 ", srcB: "，每秒輪詢", lastUpd: "最後更新 {t}",
       foot: "spec = 每個對話各自推測解碼；batch = 多個對話一起解碼",
       du: { d: " 天", h: " 小時", m: " 分", s: " 秒" },
+      scopeS: "當前啟動", scopeL: "全部", scopeLT: "伺服器重啟後仍保留（stats.json）",
+      sinceL: "自 {d} 起 · 共執行 {u}", sinceD: "自 {d} 起",
+      cost: "API 計價", costT: "（prompt − 快取）× 輸入價 + 快取 × 快取讀取價 + 輸出 × 輸出價，以每 100 萬 token 計",
+      costNote: "依 OpenRouter qwen/qwen3.8-flash 價格計算",
+      cIn: "輸入（未命中快取）", cCache: "快取讀取", cOut: "輸出",
+      cAvg: "執行期間平均每小時 {v}", cRecent: "近 {n} 分鐘：每小時 {v}",
+      cNoLife: "伺服器保留 stats.json 時（--cache-dir 或 --stats-file）才會顯示全部的累計。",
+      prices: "每 100 萬 token 價格（美元）", pIn: "輸入", pInT: "沒命中快取的 prompt token", pCache: "快取讀取", pOut: "輸出",
+      pReset: "恢復預設", pDef: "預設價格", pCustom: "自訂價格，存在這個瀏覽器",
+      hist: "依期間統計", histNote: "本地時間；每週從週一開始", pD: "日", pW: "週", pM: "月", hPer: "期間",
+      wkOf: "{d} 當週", cur: { d: "今天", w: "本週", m: "本月" },
     },
   };
   const LOCALES = Object.keys(I18N);
@@ -284,7 +361,37 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     NF1 = new Intl.NumberFormat(L, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
     NF2 = new Intl.NumberFormat(L, { maximumFractionDigits: 2 });
     PCT = new Intl.NumberFormat(L, { style: "percent", minimumFractionDigits: 1, maximumFractionDigits: 1 });
+    const cur = (o) => new Intl.NumberFormat(L, { style: "currency", currency: "USD", ...o });
+    USD = [cur({ minimumFractionDigits: 2, maximumFractionDigits: 2 }), cur({ minimumFractionDigits: 3, maximumFractionDigits: 3 }),
+      cur({ minimumFractionDigits: 4, maximumFractionDigits: 4 }), cur({ maximumSignificantDigits: 2 })];
   }
+  let USD;
+  // USD: 2 decimals from $10, 3 from $1, 4 below (e.g. $0.0423), 2 significant digits for tiny non-zero amounts
+  function money(v) {
+    v = num(v); if (v === null) return "—";
+    const a = Math.abs(v);
+    return (a >= 10 || a === 0 ? USD[0] : a >= 1 ? USD[1] : a >= 0.0001 ? USD[2] : USD[3]).format(v);
+  }
+
+  // ---- API cost: prices per 1M tokens, editable, kept in localStorage ----
+  const DEF_PRICE = { in: 0.15, cache: 0.016, out: 0.47 }; // OpenRouter qwen/qwen3.8-flash
+  let PRICE = { ...DEF_PRICE };
+  try {
+    const p = JSON.parse(localStorage.getItem("qw-prices") || "null");
+    if (p && typeof p === "object") for (const k in DEF_PRICE) if (num(p[k]) !== null && p[k] >= 0) PRICE[k] = p[k];
+  } catch (e) { /* storage blocked or bad JSON: defaults */ }
+  const isDefPrice = () => Object.keys(DEF_PRICE).every((k) => PRICE[k] === DEF_PRICE[k]);
+  // T = /status or its "lifetime" object: same field names
+  function costOf(T) {
+    const pin = num(T?.prompt_tokens), cch = num(T?.cached_tokens) ?? 0, out = num(T?.output_tokens);
+    if (pin === null || out === null) return null;
+    const u = Math.max(0, pin - cch);
+    const c = { uTok: u, cTok: cch, oTok: out, in: (u * PRICE.in) / 1e6, cache: (cch * PRICE.cache) / 1e6, out: (out * PRICE.out) / 1e6 };
+    c.total = c.in + c.cache + c.out;
+    return c;
+  }
+  let scope = "s"; // totals panel: "s" = this session, "l" = all time
+  try { if (localStorage.getItem("qw-scope") === "l") scope = "l"; } catch (e) { /* ignore */ }
 
   function human(n, d) {
     n = num(n); if (n === null) return "—";
@@ -444,15 +551,46 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       tr("budget", { b: NF1.format(bud), p: pct(mem / bud) }) + (over ? tr("over") : "");
     $("k-mem-sub").classList.toggle("over-txt", over);
 
-    $("t-total").innerHTML = pin !== null && out !== null ? "<b>" + human(pin + out) + "</b>" : "—";
-    $("t-gpu").innerHTML = pin !== null && cch !== null && out !== null ? "<b>" + human(pin - cch + out) + "</b>" : "—";
-    $("t-done").textContent = human(d.done);
-    $("t-in").textContent = human(pin);
-    $("t-cached").textContent = human(cch) + (hit !== null ? `  (${pct(hit)})` : "");
-    $("t-pf").textContent = pin !== null && cch !== null ? human(pin - cch) : "—";
-    $("t-out").textContent = human(out);
-    const dn = num(d.done);
-    $("t-avg").textContent = dn && out !== null ? human(out / dn) + " " + tr("tok") : "—";
+    // Totals: this session (top-level fields) or all time ("lifetime", only when the server keeps stats.json)
+    const life = d.lifetime && typeof d.lifetime === "object" ? d.lifetime : null;
+    $("scope").hidden = !life;
+    for (const b of $("scope").children) { const on = b.dataset.s === (life ? scope : "s"); b.classList.toggle("on", on); b.setAttribute("aria-pressed", on); }
+    const sinceD = life && num(life.since) ? new Date(life.since * 1000).toLocaleDateString(L, { year: "numeric", month: "short", day: "numeric" }) : "—";
+    const lifeNote = life ? tr("sinceL", { d: sinceD, u: dur(life.uptime_s) }) : "";
+    $("totals-note").textContent = life && scope === "l" ? tr("sinceD", { d: sinceD }) : tr("totalsNote");
+    const T = life && scope === "l" ? life : d;
+    const tin = num(T.prompt_tokens), tc = num(T.cached_tokens), to = num(T.output_tokens), thit = tin ? (tc ?? 0) / tin : null;
+    $("t-total").innerHTML = tin !== null && to !== null ? "<b>" + human(tin + to) + "</b>" : "—";
+    $("t-gpu").innerHTML = tin !== null && tc !== null && to !== null ? "<b>" + human(tin - tc + to) + "</b>" : "—";
+    $("t-done").textContent = human(T.done);
+    $("t-in").textContent = human(tin);
+    $("t-cached").textContent = human(tc) + (thit !== null ? `  (${pct(thit)})` : "");
+    $("t-pf").textContent = tin !== null && tc !== null ? human(tin - tc) : "—";
+    $("t-out").textContent = human(to);
+    const dn = num(T.done);
+    $("t-avg").textContent = dn && to !== null ? human(to / dn) + " " + tr("tok") : "—";
+
+    // API cost: both scopes side by side
+    const costCol = (name, note, T2, up, recent) => {
+      const c = costOf(T2);
+      if (!c) return `<div class="lbl">${esc(name)}</div><div class="big">—</div>`;
+      const row = (k, n, v) => `<dt>${esc(tr(k))}</dt><dd class="t">${human(n)} ${esc(tr("tok"))}</dd><dd>${money(v)}</dd>`;
+      return `<div class="lbl">${esc(name)}${note ? ` <span style="color:var(--faint)">· ${esc(note)}</span>` : ""}</div>` +
+        `<div class="big">${money(c.total)}</div>` +
+        `<dl class="ck">${row("cIn", c.uTok, c.in)}${row("cCache", c.cTok, c.cache)}${row("cOut", c.oTok, c.out)}</dl>` +
+        (num(up) > 0 ? `<div class="sub">${esc(tr("cAvg", { v: money((c.total / up) * 3600) }))}</div>` : "") +
+        (recent !== null ? `<div class="sub">${esc(recent)}</div>` : "");
+    };
+    let recent = null;
+    const cw = windowed(HIST_S);
+    if (cw && cw.dt >= 60 && cw.a.out !== null && cw.b.out !== null && cw.a.in !== null && cw.b.in !== null) {
+      const ca = costOf({ prompt_tokens: cw.a.in, cached_tokens: cw.a.cached, output_tokens: cw.a.out });
+      const cb = costOf({ prompt_tokens: cw.b.in, cached_tokens: cw.b.cached, output_tokens: cw.b.out });
+      if (ca && cb) recent = tr("cRecent", { n: NF0.format(Math.round(cw.dt / 60)), v: money(Math.max(0, cb.total - ca.total) / cw.dt * 3600) });
+    }
+    $("cs-s").innerHTML = costCol(tr("scopeS"), "", d, num(d.uptime_s), recent);
+    $("cs-l").innerHTML = life ? costCol(tr("scopeL"), lifeNote, life, num(life.uptime_s), null)
+      : `<div class="lbl">${esc(tr("scopeL"))}</div><div class="empty">${esc(tr("cNoLife"))}</div>`;
 
     // Measured rates: the server sends "rate"; "rates" is accepted too
     const rt = d.rate && typeof d.rate === "object" ? d.rate : d.rates && typeof d.rates === "object" ? d.rates : null;
@@ -490,8 +628,82 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     $("tbl-note").textContent = active && matched.length
       ? tr("count", { n: NF0.format(matched.length) }) + (hasId ? "" : tr("noId")) : "";
 
+    paintHist();
     drawChart();
   }
+
+  // ---- usage by period (from lifetime.days, summed in the page) ----
+  let DAYS = {}, daysAt = 0, per = "d", hrows = [];
+  try { if (/^[dwm]$/.test(localStorage.getItem("qw-per"))) per = localStorage.getItem("qw-per"); } catch (e) { /* ignore */ }
+  const p2 = (n) => String(n).padStart(2, "0");
+  const dkey = (x) => `${x.getFullYear()}-${p2(x.getMonth() + 1)}-${p2(x.getDate())}`;
+  function periods() {
+    const n = new Date(), y = n.getFullYear(), m = n.getMonth(), dd = n.getDate(), out = [];
+    const df = (o) => new Intl.DateTimeFormat(L, o);
+    if (per === "d") {
+      const f = df({ weekday: "short", month: "short", day: "numeric" }), fs = df({ month: "numeric", day: "numeric" });
+      for (let i = 13; i >= 0; i--) { const a = new Date(y, m, dd - i); out.push([a, new Date(y, m, dd - i + 1), f.format(a), fs.format(a)]); }
+    } else if (per === "w") {
+      const mon = dd - ((n.getDay() + 6) % 7), f = df({ month: "short", day: "numeric" }), fs = df({ month: "numeric", day: "numeric" });
+      for (let i = 11; i >= 0; i--) { const a = new Date(y, m, mon - 7 * i); out.push([a, new Date(y, m, mon - 7 * i + 7), tr("wkOf", { d: f.format(a) }), fs.format(a)]); }
+    } else {
+      const f = df({ year: "numeric", month: "long" }), fs = df({ month: "short" });
+      for (let i = 11; i >= 0; i--) { const a = new Date(y, m - i, 1); out.push([a, new Date(y, m - i + 1, 1), f.format(a), fs.format(a)]); }
+    }
+    return out.map(([a, b, label, short]) => {
+      const ka = dkey(a), kb = dkey(b), r = { label, short, done: 0, prompt_tokens: 0, cached_tokens: 0, output_tokens: 0 };
+      for (const [k, v] of Object.entries(DAYS)) if (k >= ka && k < kb && v) for (const f of ["done", "prompt_tokens", "cached_tokens", "output_tokens"]) r[f] += num(v[f]) ?? 0;
+      r.cost = costOf(r).total;
+      return r;
+    });
+  }
+  function paintHist() {
+    const on = !!view?.d?.lifetime;
+    $("hist").hidden = !on;
+    if (!on) return;
+    for (const b of $("per").children) { const o = b.dataset.p === per; b.classList.toggle("on", o); b.setAttribute("aria-pressed", o); }
+    $("hist-note").textContent = tr("histNote");
+    hrows = periods();
+    const cur = hrows.length - 1;
+    $("hbody").innerHTML = hrows.map((r, i) => i).reverse().map((i) => {
+      const r = hrows[i];
+      return `<tr${i === cur ? ' class="cur"' : ""}><td class="l">${esc(r.label)}${i === cur ? ` <span class="pill s-batch">${esc(S.cur[per])}</span>` : ""}</td>` +
+        `<td>${human(r.done)}</td><td>${human(r.prompt_tokens)}</td><td>${human(r.cached_tokens)}</td><td>${human(r.output_tokens)}</td><td>${money(r.cost)}</td></tr>`;
+    }).join("");
+    drawHist();
+  }
+  function drawHist() {
+    const cv = $("hchart");
+    if ($("hist").hidden || !cv.clientWidth) return;
+    const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+    if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const padL = 74, padR = 8, padT = 6, padB = 18, pw = W - padL - padR, ph = H - padT - padB, n = hrows.length;
+    const mx = niceMax(Math.max(0.01, ...hrows.map((r) => r.cost)));
+    g.font = `11px ${cssVar("--mono")}`; g.fillStyle = cssVar("--faint"); g.strokeStyle = cssVar("--line"); g.lineWidth = 1;
+    for (let k = 0; k <= 4; k++) {
+      const y = padT + ph * (1 - k / 4);
+      g.beginPath(); g.moveTo(padL, y + .5); g.lineTo(padL + pw, y + .5); g.stroke();
+      const v = (mx * k) / 4; g.textAlign = "right"; g.fillText(v >= 1 || !v ? USD[0].format(v) : money(v), padL - 6, y + 4);
+    }
+    const bw = pw / n, acc = cssVar("--accent");
+    g.font = `11px ${cssVar("--sans")}`; g.textAlign = "center";
+    hrows.forEach((r, i) => {
+      const h = (r.cost / mx) * ph, x0 = padL + i * bw + bw * 0.18;
+      g.fillStyle = acc; g.globalAlpha = i === n - 1 ? 1 : 0.45;
+      g.fillRect(x0, padT + ph - h, bw * 0.64, h);
+      g.globalAlpha = 1; g.fillStyle = cssVar(i === n - 1 ? "--fg" : "--faint");
+      g.fillText(r.short, padL + (i + 0.5) * bw, H - 4);
+    });
+  }
+  $("per").addEventListener("click", (e) => {
+    const k = e.target.closest("button")?.dataset.p;
+    if (!k || k === per) return;
+    per = k;
+    try { localStorage.setItem("qw-per", k); } catch (er) { /* storage blocked */ }
+    paintHist();
+  });
 
   // ---- chart ----
   function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
@@ -572,12 +784,17 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     inflight = true;
     const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 3000);
     try {
-      const r = await fetch("/status", { cache: "no-store", signal: ctl.signal });
+      // days=1 (today's bucket) every second; the full history (400 days) at start and every minute
+      const full = Date.now() - daysAt > 60000;
+      const r = await fetch("/status?days=" + (full ? 400 : 1), { cache: "no-store", signal: ctl.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const d = await r.json();
       if (!d || typeof d !== "object") { const e = new Error(); e.kind = "json"; throw e; }
       const t = Date.now();
       last = d; lastOk = t; connState = true; err = null;
+      const dd = d.lifetime?.days;
+      if (dd && typeof dd === "object") { if (full) { DAYS = {}; daysAt = t; } Object.assign(DAYS, dd); }
+      else if (!d.lifetime) DAYS = {};
       paintConn();
       render(d, t);
     } catch (e) {
@@ -606,8 +823,34 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     box.innerHTML = LOCALES.map((k) =>
       `<button type="button" lang="${k}" data-l="${k}" class="${k === L ? "on" : ""}" aria-pressed="${k === L}">${esc(I18N[k]._name)}</button>`).join("");
     paintConn();
+    paintPrices();
     paint();
   }
+  function paintPrices(keepInputs) {
+    if (!keepInputs) for (const k in DEF_PRICE) $("p-" + k).value = PRICE[k];
+    const def = isDefPrice();
+    $("p-src").textContent = tr(def ? "pDef" : "pCustom");
+    $("p-reset").disabled = def;
+  }
+  for (const k in DEF_PRICE) $("p-" + k).addEventListener("input", (e) => {
+    const v = e.target.valueAsNumber;
+    if (!isFinite(v) || v < 0) return; // keep the last valid price while typing
+    PRICE[k] = v;
+    try { localStorage.setItem("qw-prices", JSON.stringify(PRICE)); } catch (er) { /* storage blocked */ }
+    paintPrices(true); paint();
+  });
+  $("p-reset").addEventListener("click", () => {
+    PRICE = { ...DEF_PRICE };
+    try { localStorage.removeItem("qw-prices"); } catch (er) { /* storage blocked */ }
+    paintPrices(); paint();
+  });
+  $("scope").addEventListener("click", (e) => {
+    const s = e.target.closest("button")?.dataset.s;
+    if (!s || s === scope) return;
+    scope = s;
+    try { localStorage.setItem("qw-scope", s); } catch (er) { /* storage blocked */ }
+    paint();
+  });
   $("lang").addEventListener("click", (e) => {
     const k = e.target.closest("button")?.dataset.l;
     if (!k || k === L || !I18N[k]) return;
@@ -616,7 +859,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     applyLang();
   });
 
-  window.addEventListener("resize", drawChart);
+  window.addEventListener("resize", () => { drawChart(); drawHist(); });
   matchMedia("(prefers-color-scheme: light)").addEventListener?.("change", drawChart);
   applyLang();
   poll();

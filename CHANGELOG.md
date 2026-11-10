@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.4 — 2026-11-10
+
+Usage that survives restarts, and API pricing on the dashboard. Engine output unchanged.
+
+- Totals are kept across restarts in `<cache-dir>/stats.json` (`--stats-file PATH` to move it, `""` to disable): requests, prompt / cached / output tokens, cancellations, errors and uptime, plus one bucket per local day (kept 400 days). Saved atomically every 30 s and on SIGTERM / SIGINT; a corrupt file is renamed to `.bad`.
+- `GET /status` adds a `lifetime` object; `/status?days=N` includes the last N daily buckets.
+- Dashboard: "API cost" priced at OpenRouter `qwen/qwen3.8-flash` rates ($0.15 input, $0.016 cache read, $0.47 output per 1M tokens; editable and remembered), for this run and all time with the cost per hour; totals switch between this run and all time; usage by day, week (Monday first) or month with a cost chart and the current period highlighted.
+
 ## 1.5.3 — 2026-11-10
 
 Dashboard layout only.
