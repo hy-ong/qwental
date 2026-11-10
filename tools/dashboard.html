@@ -45,14 +45,14 @@ header .meta b { color: var(--fg); font-weight: 500; font-family: var(--mono); }
 .card .lbl { color: var(--dim); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .big { font-family: var(--mono); font-size: 30px; font-weight: 600; line-height: 1.15; margin-top: 4px; white-space: nowrap; }
 .card .big small { font-size: 15px; color: var(--dim); font-weight: 400; }
-.card .sub { color: var(--dim); font-size: 12px; margin-top: 4px; font-family: var(--mono); text-wrap: balance; overflow-wrap: anywhere; }
+.card .sub { color: var(--dim); font-size: 12px; margin-top: 4px; font-family: var(--mono); text-wrap: balance; overflow-wrap: anywhere; word-break: keep-all; }
 .card .hint { color: var(--dim); font-size: 12px; margin-top: 4px; text-wrap: balance; }
 .bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 8px; position: relative; }
 .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
 .bar.over > span { background: var(--bad); }
 .over-txt { color: var(--bad) !important; }
-#k-mem-sub, #k-sys { white-space: normal; }
-#k-sys { font-family: var(--sans); }
+#k-mem-sub { white-space: normal; }
+#k-sys { font-family: var(--mono); white-space: normal; text-wrap: balance; }
 .pf { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; vertical-align: middle; font-size: 12px; color: var(--dim); }
 .pf .bar { width: 64px; height: 3px; margin: 0; }
 .pf .bar > span { background: var(--warn); }
@@ -269,8 +269,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       hitRecent: "Last {n} s: {p}", hitNone: "No requests completed recently",
       mem: "Slot memory used / budget", memT: "KV-cache memory held by conversation slots, against the slot budget",
       budget: "Budget {b} GB · {p}", budgetNone: "Budget —", over: " · over budget, idle slots will be released",
-      sys: "System memory level {l} · swap {s} GB", sysL: "System memory level {l}", sysS: "Swap {s} GB",
-      sysT: "macOS memory level (0–100, lower is worse) and swap in use", sysLow: " · system memory is low, generation will slow down",
+      sys: "Free memory {l}% · swap {s} GB", sysL: "Free memory {l}%", sysS: "Swap {s} GB",
+      sysT: "Free system memory (macOS memory level) and swap in use; red when memory is low and generation may slow down", sysLow: " · low",
       chart: "Last 5 minutes", chartNote: "Sampled every second, kept only in this tab",
       lgTps: "Output tok/s", lgAct: "Active conversations", axNow: "now", axMin: "-{m}m",
       totals: "Totals", totalsNote: "Since server start",
@@ -320,8 +320,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       hitRecent: "近 {n} 秒 {p}", hitNone: "近期尚無完成請求",
       mem: "Slot 記憶體 用量 / 預算", memT: "各對話 slot 佔用的 KV cache 記憶體，對照 slot 預算",
       budget: "預算 {b} GB · {p}", budgetNone: "預算 —", over: " · 超過預算，會釋放閒置 slot",
-      sys: "系統記憶體水位 {l} · swap {s} GB", sysL: "系統記憶體水位 {l}", sysS: "Swap {s} GB",
-      sysT: "macOS 記憶體水位（0–100，越低越吃緊）與已使用的 swap", sysLow: " · 系統記憶體不足，速度會變慢",
+      sys: "可用記憶體 {l}% · swap {s} GB", sysL: "可用記憶體 {l}%", sysS: "Swap {s} GB",
+      sysT: "系統可用記憶體（macOS 記憶體水位）與已使用的 swap；記憶體不足時變紅，速度可能變慢", sysLow: " · 偏低",
       chart: "近 5 分鐘", chartNote: "每秒取樣，只存在這個分頁",
       lgTps: "輸出 tok/s", lgAct: "進行中對話", axNow: "現在", axMin: "-{m} 分",
       totals: "累計", totalsNote: "伺服器啟動以來",

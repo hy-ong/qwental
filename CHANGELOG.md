@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.1 — 2026-11-10
+
+Dashboard wording and layout only.
+
+- The system memory line reads "Free memory 31% · swap 5.1 GB" (was "System memory level 31", which wrapped and did not say what the number is); when memory is low it adds "· low" and turns red, with the explanation in the tooltip.
+- Chinese card sub-lines no longer break in the middle of a word.
+
 ## 1.6.0 — 2026-11-10
 
 Faster under Claude Code with many subagents, from an analysis of a day of real use. Engine output unchanged: on the original IQ3_S GGUF, default, INT8 and speculative outputs are bit-identical to 1.5.4 (and so to 1.0.0); concurrent output is bit-identical to running alone.
