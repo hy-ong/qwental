@@ -1,7 +1,7 @@
 // Qwental 推論 engine（目前：decode 路徑，一次一個 token；prompt 也逐個 token 餵入）
 #pragma once
 
-#define QW_VERSION "1.5.4"
+#define QW_VERSION "1.6.0"
 #include <stdbool.h>
 #include <stdint.h>
 #include "gpu.h"
@@ -88,6 +88,14 @@ int qw_engine_par_solo(qw_engine *e, int sid, const int32_t *prompt, int np, con
 double qw_engine_par_cost(qw_engine *e, int B); // B 個對話一起 decode 一步的預估牆鐘 ms（最佳分組；0 = 還沒量過）
 size_t qw_engine_par_mem(qw_engine *e); // 各 slot 佔的記憶體合計（位元組）
 int qw_engine_par_trim(qw_engine *e, unsigned long long busy, size_t budget, bool one); // 超過 budget 就釋放閒置 slot（重算成本 × 近期度最小的先放；one：只放一組）；回傳放了幾組
+// 縮小閒置的 slot（busy 位元 = 正在用，不動）：KV 容量縮到 max(kvlen, pos) + 餘量、對齊 4096；快照只留最長的 QW_IDLE_SNAPS 份（預設 2）。
+// 要在 GPU 閒置時呼叫（引擎執行緒、兩步之間）。回傳省下的位元組。par_trim 在超過 budget / one 模式時會先呼叫它，
+// 平常也會縮閒置超過 QW_SHRINK_IDLE 秒（預設 60）的；serve 一般不必自己叫
+size_t qw_engine_par_shrink(qw_engine *e, unsigned long long busy);
+// 分段 prefill（par_prefill_to）中途停下時（客戶端取消、逾時）呼叫：slot sid 停在段尾（pos == kvlen）就把狀態記成快照，
+// 同一個 prompt 重送時 par_pick 會選回這組、par_prefill_to（*done = 0）從這裡接續，結果與一次算完逐位元相同。
+// 沒載入的 slot 也可以。回傳 true = 這組現在有長度 kvlen 的快照；false = 不在段界（例如已在生成，改用 par_finish）或 sid 無效
+bool qw_engine_par_snap(qw_engine *e, int sid);
 const float *qw_engine_par_vstep(qw_engine *e, const int *sids, const int *n, const int32_t *toks, int B,
                                  double *gpu_ms); // 並發推測解碼：對話 i 驗證 n[i] 個 token（toks 依序排，Σn ≤ 8；GGUF）；回傳 [Σn][vocab] logits
 int qw_engine_par_vaccept(qw_engine *e, const int *acc, const int32_t *nx); // 上一次 vstep 之後：對話 i 接受了 acc[i] 個猜測（狀態寫回、位置前進）；

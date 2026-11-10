@@ -137,7 +137,7 @@ struct qw_engine {
     uint64_t vb_flush; // vb_encode 在這些層（位元）之後先送出已編好的部分（qw_batch_flush），CPU 編碼與 GPU 執行重疊；0 = 不分
     qw_buf dfprm; // df_accept 寫的參數（GPU 決定接受幾個時，猜下一塊的位置與 anchor 由這裡讀）
     qw_kernel *df_k[16];
-    int kvcap; // 目前 KV（Kc / Vc / rawk / kblk）每份 attention 的容量（token 數），不夠時 kv_reserve 加倍
+    int kvcap; // 目前 KV（Kc / Vc / rawk / kblk）每份 attention 的容量（token 數），不夠時 kv_reserve 擴大（kv_grow_cap）
     double last_ms;
     // 殘差流與共用暫存
     qw_buf h, nh, nf, d, d2, u, x, inj, inj2, out, dump; // inj / inj2：inject 部分和 [HC][HC]，輪流使用
@@ -844,8 +844,8 @@ static bool alloc(qw_engine *e, qw_buf *b, size_t bytes) {
     return true;
 }
 
-// KV 依需要配置：一開始小，不夠時加倍（記憶體吃緊時，3 組 slot 都照最大 context 配置會讓 GPU 一直換頁）
-enum { DF_RING_ = 2064 }; // DFlash2 環狀 KV 的槽數（與下方 DF_RING 相同）
+// KV 依需要配置：一開始小，不夠時以 1.25 倍（至少 KV_STEP）成長（記憶體吃緊時，3 組 slot 都照最大 context 配置會讓 GPU 一直換頁）
+enum { DF_RING_ = 2064, KV_STEP = 4096 }; // DFlash2 環狀 KV 的槽數（與下方 DF_RING 相同）
 
 static size_t kv_bytes(int cap, int which) {
     const size_t L = (size_t)cap;
@@ -866,31 +866,55 @@ static bool kv_alloc(qw_engine *e, qw_buf *K, qw_buf *V, qw_buf *R, qw_buf *B, i
     return true;
 }
 
-// 確保目前的 KV 至少容納 need 個 token；要在 GPU 閒置時呼叫（直接在 CPU 端搬資料）
-static bool kv_reserve(qw_engine *e, int need) {
-    if (need <= e->kvcap) return true;
-    int cap = e->kvcap;
-    while (cap < need) cap *= 2;
-    cap = (cap + 4095) / 4096 * 4096;
-    if (cap > e->max_ctx) cap = e->max_ctx;
-    if (cap <= e->kvcap) return need <= e->kvcap;
+// KV 換成容量 cap 的新 buffer：前 min(舊, 新) 列照抄、其餘清零（擴大與縮小共用；要在 GPU 閒置時呼叫，直接在 CPU 端搬資料）。
+// 每份 attention 的資料在 buffer 裡的位移照容量算（ai × rows），所以換容量一定要整份重排，不能只截尾
+static bool kv_resize(qw_engine *e, qw_buf *K, qw_buf *V, qw_buf *R, qw_buf *B, int *kvcap, int cap) {
     qw_buf nb[4];
-    qw_buf *ob[4] = {&e->Kc, &e->Vc, &e->rawk, &e->kblk};
+    qw_buf *ob[4] = {K, V, R, B};
     for (int w = 0; w < 4; w++) {
         if (!qw_buf_new(e->g, kv_bytes(cap, w), &nb[w])) {
             for (int q = 0; q < w; q++) qw_buf_free(&nb[q]);
             return false;
         }
-        const size_t row = kv_row(w), on = kv_rows(e->kvcap, w), nn = kv_rows(cap, w);
+    }
+    for (int w = 0; w < 4; w++) {
+        const size_t row = kv_row(w), on = kv_rows(*kvcap, w), nn = kv_rows(cap, w), cp = on < nn ? on : nn;
         for (int ai = 0; ai <= NATT; ai++) {
-            memcpy((char *)nb[w].ptr + ai * nn * row, (char *)ob[w]->ptr + ai * on * row, on * row);
-            memset((char *)nb[w].ptr + (ai * nn + on) * row, 0, (nn - on) * row);
+            memcpy((char *)nb[w].ptr + ai * nn * row, (char *)ob[w]->ptr + ai * on * row, cp * row);
+            memset((char *)nb[w].ptr + (ai * nn + cp) * row, 0, (nn - cp) * row);
         }
         qw_buf_free(ob[w]);
         *ob[w] = nb[w];
     }
-    if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[cache] KV 容量 %d → %d\n", e->kvcap, cap);
-    e->kvcap = cap;
+    *kvcap = cap;
+    return true;
+}
+
+// KV 成長：每次加 max(4096, 目前容量 / 4)（至少到 need），對齊 4096。原本是加倍（16K → 32K → 64K），33K 的對話要佔 64K 的容量；
+// 改成 1.25 倍後浪費 ≤ 25%（閒置時 qw_engine_par_shrink 再縮到實際長度），而重配次數只多一點：16K → 100K 約 8 次，
+// 累計搬動量 ≈ 4 × 最終大小（CPU memcpy，100K 時累計約 13 GB、0.3 s 量級，分散在幾次；prefill 前先照整個 prompt 預留，通常一次到位）。
+// 每次擴大是先配好四份新的再搬（失敗時原本的不動），尖峰暫時多一份新容量
+// QW_KV_DOUBLE=1：照舊加倍
+static int kv_grow_cap(const qw_engine *e, int need) {
+    static int dbl = -1;
+    if (dbl < 0) dbl = getenv("QW_KV_DOUBLE") && atoi(getenv("QW_KV_DOUBLE")) ? 1 : 0;
+    int cap = e->kvcap;
+    if (dbl) while (cap < need) cap *= 2;
+    else {
+        const int step = cap / 4 > KV_STEP ? cap / 4 : KV_STEP;
+        cap = cap + step > need ? cap + step : need;
+    }
+    cap = (cap + KV_STEP - 1) / KV_STEP * KV_STEP;
+    return cap > e->max_ctx ? e->max_ctx : cap;
+}
+
+// 確保目前的 KV 至少容納 need 個 token；要在 GPU 閒置時呼叫（直接在 CPU 端搬資料）
+static bool kv_reserve(qw_engine *e, int need) {
+    if (need <= e->kvcap) return true;
+    const int cap = kv_grow_cap(e, need), old = e->kvcap;
+    if (cap <= e->kvcap) return need <= e->kvcap;
+    if (!kv_resize(e, &e->Kc, &e->Vc, &e->rawk, &e->kblk, &e->kvcap, cap)) return false;
+    if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[cache] KV 容量 %d → %d\n", old, cap);
     return true;
 }
 
@@ -8069,16 +8093,102 @@ static double slot_recency(const struct qw_slot *s, double now) {
 static void slot_stamp(qw_engine *e, unsigned long long busy, double now) { // 正在用的 slot：記成剛用過
     for (int i = 0; i < QW_PAR_MAX; i++) if (busy >> i & 1) e->slots[i].tuse = now;
 }
+// ---- 縮小閒置的 slot（不影響數值：只動容量與用不到的快照，接續點仍是逐 token 比對過的快照）
+// 閒置的 slot 保留幾份快照（QW_IDLE_SNAPS，預設 2，最少 1）：最長的（多半是生成結束 par_finish / 取消時 par_snap 存的）與次長的
+// （多半是上一個 prompt 的結尾：下一輪的 prompt 把上一輪生成的部分重新排版、思考內容拿掉時，共同前綴停在這裡）。
+// 更短的（prompt 結尾前 2048 / 512 / 128 的檢查點、持久化點）丟掉：持久化點在算的時候已寫到 SSD（par_pf_persist），
+// 別的 slot 要共用前綴時由 dc_load 讀回
+static int idle_snaps(void) {
+    static int v = -1;
+    if (v < 0) { v = getenv("QW_IDLE_SNAPS") ? atoi(getenv("QW_IDLE_SNAPS")) : 2; if (v < 1) v = 1; if (v > CKMAX) v = CKMAX; }
+    return v;
+}
+static size_t snap_prune(struct qw_snap *sn, int kvlen, int keep) {
+    size_t fr = 0;
+    for (int k = 0; k < CKMAX; k++) { // 長度第 1…keep 名（有效的：0 < len ≤ kvlen）留下
+        if (!sn[k].S.ptr) continue;
+        int rank = 0;
+        const bool ok = sn[k].len > 0 && sn[k].len <= kvlen;
+        if (ok)
+            for (int q = 0; q < CKMAX; q++)
+                if (q != k && sn[q].S.ptr && sn[q].len > 0 && sn[q].len <= kvlen && (sn[q].len > sn[k].len || (sn[q].len == sn[k].len && q < k))) rank++;
+        if (ok && rank < keep) continue;
+        fr += sn[k].S.size + sn[k].conv.size + sn[k].ple.size;
+        qw_buf_free(&sn[k].S); qw_buf_free(&sn[k].conv); qw_buf_free(&sn[k].ple);
+        sn[k].len = 0;
+        sn[k].age = 0;
+    }
+    return fr;
+}
+size_t qw_engine_par_shrink(qw_engine *e, unsigned long long busy) {
+    if (par_cur < 0) return 0;
+    const size_t m0 = qw_engine_par_mem(e);
+    const int ks = idle_snaps();
+    for (int i = 0; i < QW_PAR_MAX; i++) {
+        struct qw_slot *s = &e->slots[i];
+        if (!s->init || busy >> i & 1) continue;
+        const bool cur = i == par_cur; // 目前載入的 slot：資料在 engine 自己的欄位
+        qw_buf *K = cur ? &e->Kc : &s->Kc, *V = cur ? &e->Vc : &s->Vc, *R = cur ? &e->rawk : &s->rawk, *B = cur ? &e->kblk : &s->kblk;
+        int *cap = cur ? &e->kvcap : &s->kvcap;
+        const int kvlen = cur ? e->kvlen : s->kvlen, pos = cur ? e->pos : s->pos;
+        const int used = kvlen > pos ? kvlen : pos;
+        int want = (used + 2 * VBMAX + 8 + KV_STEP - 1) / KV_STEP * KV_STEP; // 同 kv_reserve 的餘量（驗證會寫到 pos + VBMAX 之後）
+        if (want > e->max_ctx) want = e->max_ctx;
+        const int old = *cap;
+        if (want < *cap && kv_resize(e, K, V, R, B, cap, want) && getenv("QW_CACHE_DBG"))
+            fprintf(stderr, "[mem] slot %d 的 KV 容量 %d → %d（用到 %d）\n", i, old, want, used);
+        snap_prune(cur ? e->snap : s->snap, kvlen, ks);
+        if (cur) par_save(e, i); // slots[par_cur] 的副本跟著更新（buffer 換過）
+    }
+    const size_t m1 = qw_engine_par_mem(e), fr = m0 > m1 ? m0 - m1 : 0;
+    if (fr >= (size_t)64 << 20) fprintf(stderr, "[mem] 縮小閒置的 slot：%.2f GB → %.2f GB\n", m0 / 1e9, m1 / 1e9);
+    return fr;
+}
+// 分段 prefill 中途停下（例如客戶端取消）：slot sid 的即時狀態停在一段的段尾（pos == kvlen，KV / DeltaNet 狀態都只含
+// kvtok[0..kvlen)），把它記成快照，之後同一個 prompt（或它的延伸）再來時 par_pick 選回這組、par_prefill_to 從這裡接續。
+// 段尾本來就是 prefill 的分段點（chunk 是 GDN 分塊的倍數），接續與一次算完逐位元相同（同 pf_yield 讓出時記的快照）。
+// 沒載入的 slot 也可以（先換進來）；回傳 true = 這組現在有長度 kvlen 的快照（剛存的或原本就有），false = 狀態不在段界或沒東西可存
+bool qw_engine_par_snap(qw_engine *e, int sid) {
+    if (sid < 0 || sid >= QW_PAR_MAX || par_cur < 0 || !e->slots[sid].init) return false;
+    const struct qw_slot *s = &e->slots[sid];
+    const int kvlen = sid == par_cur ? e->kvlen : s->kvlen, pos = sid == par_cur ? e->pos : s->pos;
+    if (kvlen <= 0 || pos != kvlen || kvlen > e->max_ctx) return false; // 生成中（pos > kvlen）或還沒算：不是一致的段界
+    const struct qw_snap *sn = sid == par_cur ? e->snap : s->snap;
+    for (int k = 0; k < CKMAX; k++)
+        if (sn[k].len == kvlen && sn[k].S.ptr) return true;
+    if (!par_use(e, sid)) return false;
+    snap_save(e, kvlen); // 內含 dn_flush（延後寫回的 DeltaNet 狀態先補上）
+    for (int k = 0; k < CKMAX; k++)
+        if (e->snap[k].len == kvlen && e->snap[k].S.ptr) {
+            if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[cache] slot %d 停在 %d：記快照\n", sid, kvlen);
+            return true;
+        }
+    return false;
+}
 // 超過 budget 位元組時釋放閒置的 slot（busy 位元 = 正在用；目前載入的 slot 不動）。回傳釋放了幾組
 // 先放「重算成本 × 還會回來的權重」最小的：value = keep / (1 + 閒置秒數 / H)，同分時最久沒用的先放。
 // 短的（權限判斷、標題）與早就結束的先走，等 subagent 回來的長主對話留到最後；真的要放長對話時先寫到 SSD（有 cache 目錄、
-// keep ≥ QW_EVICT_PERSIST_MIN（預設 16384）、檔案不超過 QW_CACHE_GB 的一半；系統記憶體吃緊的 one 模式不寫，免得再加壓）
+// keep ≥ QW_EVICT_PERSIST_MIN（預設 4096：寫一份約 0.4 s，重算 subagent 的幾千～幾萬 token 要數十秒）、檔案不超過 QW_CACHE_GB 的一半；
+// 系統記憶體吃緊的 one 模式不寫，免得再加壓）
+// 釋放之前先縮（qw_engine_par_shrink）：超過 budget 或 one 模式時縮全部閒置的 slot；另外閒置超過 QW_SHRINK_IDLE 秒（預設 60，
+// 0 = 不主動縮）的 slot 平常也縮。one 模式縮出 ≥ 256 MB 時這次就不釋放 slot（回傳 0，下次再看）
 int qw_engine_par_trim(qw_engine *e, unsigned long long busy, size_t budget, bool one) {
     int n = 0;
     const double now = qw_now();
     slot_stamp(e, busy, now);
     static int pmin = -1;
-    if (pmin < 0) pmin = getenv("QW_EVICT_PERSIST_MIN") ? atoi(getenv("QW_EVICT_PERSIST_MIN")) : 16384;
+    if (pmin < 0) pmin = getenv("QW_EVICT_PERSIST_MIN") ? atoi(getenv("QW_EVICT_PERSIST_MIN")) : 4096;
+    static double sidle = -1;
+    if (sidle < 0) { sidle = getenv("QW_SHRINK_IDLE") ? atof(getenv("QW_SHRINK_IDLE")) : 60; if (sidle < 0) sidle = 0; }
+    if (one || qw_engine_par_mem(e) > budget) {
+        const size_t fr = qw_engine_par_shrink(e, busy);
+        if (one && fr >= (size_t)256 << 20) return 0;
+    } else if (sidle > 0) {
+        unsigned long long keep = busy; // 最近用過的不縮（下一輪多半馬上回來）
+        for (int i = 0; i < QW_PAR_MAX; i++)
+            if (e->slots[i].init && !(e->slots[i].tuse > 0 && now - e->slots[i].tuse >= sidle)) keep |= 1ull << i;
+        qw_engine_par_shrink(e, keep);
+    }
     for (;;) {
         if (!one && qw_engine_par_mem(e) <= budget) return n;
         int pick = -1;
@@ -8299,6 +8409,8 @@ const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prom
         e->pending = false;
     } else qw_engine_reset(e);
     if (cached) *cached = start;
+    // 分段時 qw_engine_prefill 每次只預留這一段：第一段就照整個 prompt 預留，KV 一次到位（1.25 倍成長下逐段擴大會多搬好幾次整份 KV）
+    kv_reserve(e, np + 2 * VBMAX + 8 < e->max_ctx ? np + 2 * VBMAX + 8 : e->max_ctx);
     const int end = chunk > 0 && np - start > chunk + 64 ? start + chunk : np;
     memcpy(e->kvtok, prompt, sizeof(int32_t) * (size_t)end);
     e->kvlen = end;

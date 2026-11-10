@@ -51,7 +51,11 @@ header .meta b { color: var(--fg); font-weight: 500; font-family: var(--mono); }
 .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
 .bar.over > span { background: var(--bad); }
 .over-txt { color: var(--bad) !important; }
-#k-mem-sub { white-space: normal; }
+#k-mem-sub, #k-sys { white-space: normal; }
+#k-sys { font-family: var(--sans); }
+.pf { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; vertical-align: middle; font-size: 12px; color: var(--dim); }
+.pf .bar { width: 64px; height: 3px; margin: 0; }
+.pf .bar > span { background: var(--warn); }
 .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-family: var(--sans); border: 1px solid currentColor; line-height: 1.5; }
 .m-spec { color: var(--violet); } .m-batch { color: var(--accent); } .m-idle { color: var(--faint); }
 .s-prefill { color: var(--warn); } .s-solo { color: var(--violet); } .s-batch { color: var(--accent); } .s-other { color: var(--dim); }
@@ -165,6 +169,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       <div class="big"><span id="k-mem">—</span><small> GB</small></div>
       <div class="bar" id="k-mem-barw"><span id="k-mem-bar" style="width:0"></span></div>
       <div class="sub" id="k-mem-sub">—</div>
+      <div class="sub" id="k-sys" data-i18n-title="sysT" hidden></div>
     </div>
   </section>
 
@@ -254,15 +259,18 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       unreach: "Server unreachable", retry: ". Retrying every second", staleNote: "; showing the last data received below", end: ".",
       timeout: "timed out", net: "network error", notJson: "response is not a JSON object", agoOk: ", last success {d} ago",
       act: "Active / parallel", actT: "Conversations being served now / maximum concurrent conversations (--parallel)",
-      queued: "Queued", queuedT: "Requests waiting because every slot is busy",
-      qWait: "At the conversation limit; waiting for a free slot", qNone: "No requests waiting",
+      queued: "Queued", queuedT: "Requests received but not started yet",
+      qLimit: "At the conversation limit; waiting for a conversation to finish", qBusy: "Starting at the next scheduling step",
+      qWait: "Waiting to start", qNone: "No requests waiting",
       mode: "Decode mode", modeT: "How the server is decoding right now; it picks whichever measured rate is higher",
-      tps: "Output tok/s", tpsT: "Output tokens per second across all conversations",
-      tpsSub: "Last {n} s", perConv: " · ≈ {v} per conversation",
+      tps: "Output tok/s", tpsT: "Output tokens per second across all conversations, counted as they are generated",
+      tpsSub: "Last {n} s", perConv: " · ≈ {v} per generating conversation",
       hit: "Cache hit rate", hitT: "Share of prompt tokens reused from the prefix cache since server start",
       hitRecent: "Last {n} s: {p}", hitNone: "No requests completed recently",
       mem: "Slot memory used / budget", memT: "KV-cache memory held by conversation slots, against the slot budget",
       budget: "Budget {b} GB · {p}", budgetNone: "Budget —", over: " · over budget, idle slots will be released",
+      sys: "System memory level {l} · swap {s} GB", sysL: "System memory level {l}", sysS: "Swap {s} GB",
+      sysT: "macOS memory level (0–100, lower is worse) and swap in use", sysLow: " · system memory is low, generation will slow down",
       chart: "Last 5 minutes", chartNote: "Sampled every second, kept only in this tab",
       lgTps: "Output tok/s", lgAct: "Active conversations", axNow: "now", axMin: "-{m}m",
       totals: "Totals", totalsNote: "Since server start",
@@ -273,7 +281,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       rates: "Measured rates (EMA, used to pick the mode)", ratesT: "spec ×1 = speculative decoding of one conversation; batch ×N = N conversations decoded together; slice ×N = N conversations taking turns",
       tbl: "Active conversations",
       thState: "State", thPrompt: "Prompt", thCached: "Cached", thHit: "Hit", thHitT: "Share of this prompt served from cache",
-      thNeed: "To prefill", thNeedT: "prompt − cached: tokens that must still be computed", thGen: "Generated", thTps: "tok/s", thTpsT: "Output speed of this conversation",
+      thNeed: "To prefill", thNeedT: "prompt − cached: tokens that must still be computed", thGen: "Generated", thTps: "tok/s", thTpsT: "Output speed of this conversation", pfT: "Prompt tokens read so far / prompt length",
       waiting: "Waiting for data…", par1: "parallel = 1: the server does not report individual conversations",
       noActive: "The server did not report the active field", none: "No active conversations",
       count: "{n} active", noId: " · no stable id; tok/s inferred by matching prompt + cached",
@@ -302,15 +310,18 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       unreach: "連不到伺服器", retry: "。每秒自動重試", staleNote: "；下方是最後一次成功取得的資料", end: "。",
       timeout: "逾時", net: "網路錯誤", notJson: "回應不是 JSON 物件", agoOk: "，上次成功是 {d}前",
       act: "進行中對話 / 上限", actT: "目前正在處理的對話數 / 最多可同時處理的對話數（--parallel）",
-      queued: "排隊中", queuedT: "所有 slot 都在忙，正在等待的請求",
-      qWait: "對話數已達上限，等待空出的 slot", qNone: "沒有等待中的請求",
+      queued: "排隊中", queuedT: "已收到、尚未開始處理的請求",
+      qLimit: "對話數已達上限，等其他對話結束", qBusy: "下一個排程點就開始",
+      qWait: "等待開始", qNone: "沒有等待中的請求",
       mode: "解碼模式", modeT: "伺服器目前的解碼方式；會依實測速度選比較快的那種",
-      tps: "輸出速度 tok/s", tpsT: "所有對話合計每秒輸出的 token 數",
-      tpsSub: "近 {n} 秒", perConv: " · 每對話 ≈ {v}",
+      tps: "輸出速度 tok/s", tpsT: "所有對話合計每秒輸出的 token 數，邊生成邊計算",
+      tpsSub: "近 {n} 秒", perConv: " · 每個生成中對話 ≈ {v}",
       hit: "快取命中率", hitT: "伺服器啟動以來，prompt token 從前綴快取重用的比例",
       hitRecent: "近 {n} 秒 {p}", hitNone: "近期尚無完成請求",
       mem: "Slot 記憶體 用量 / 預算", memT: "各對話 slot 佔用的 KV cache 記憶體，對照 slot 預算",
       budget: "預算 {b} GB · {p}", budgetNone: "預算 —", over: " · 超過預算，會釋放閒置 slot",
+      sys: "系統記憶體水位 {l} · swap {s} GB", sysL: "系統記憶體水位 {l}", sysS: "Swap {s} GB",
+      sysT: "macOS 記憶體水位（0–100，越低越吃緊）與已使用的 swap", sysLow: " · 系統記憶體不足，速度會變慢",
       chart: "近 5 分鐘", chartNote: "每秒取樣，只存在這個分頁",
       lgTps: "輸出 tok/s", lgAct: "進行中對話", axNow: "現在", axMin: "-{m} 分",
       totals: "累計", totalsNote: "伺服器啟動以來",
@@ -321,7 +332,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       rates: "實測速度（EMA，用來選模式）", ratesT: "spec ×1 = 單一對話推測解碼；batch ×N = N 個對話一起解碼；slice ×N = N 個對話輪流推測解碼",
       tbl: "進行中對話",
       thState: "狀態", thPrompt: "Prompt", thCached: "快取", thHit: "命中", thHitT: "這個 prompt 從快取取用的比例",
-      thNeed: "需 prefill", thNeedT: "prompt − 快取：還要實際計算的 token", thGen: "已生成", thTps: "tok/s", thTpsT: "這個對話的輸出速度",
+      thNeed: "需 prefill", thNeedT: "prompt − 快取：還要實際計算的 token", thGen: "已生成", thTps: "tok/s", thTpsT: "這個對話的輸出速度", pfT: "已讀入的 prompt token / prompt 長度",
       waiting: "等待資料…", par1: "parallel = 1：伺服器不回報個別對話",
       noActive: "伺服器沒有回報 active 欄位", none: "目前沒有進行中的對話",
       count: "{n} 個", noId: " · 無穩定 id，tok/s 以 prompt + 快取配對推算",
@@ -419,7 +430,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
   const MODE_CLS = { spec: "m-spec", batch: "m-batch", idle: "m-idle", single: "m-idle" };
 
   // ---- state ----
-  let samples = [];     // {t, out, in, cached, act, tps}
+  let samples = [];     // {t, out, in, cached, act, prod, mono, tps}
   let prevRows = [];    // [{prompt, cached, gen, t, tps}]
   let last = null, lastOk = 0, inflight = false, connState = null, err = null;
   let view = null;      // last rendered snapshot, repainted on language switch
@@ -435,17 +446,17 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
           if (best < 0 || Math.abs(p.gen - r.gen) < Math.abs(pool[best].gen - r.gen)) best = i;
         }
       }
-      let tps = null, since = t, gen0 = r.gen;
+      let tps = null, since = t, gen0 = r.gen, pgen = null;
       if (best >= 0) {
         const p = pool[best]; pool[best] = null;
-        since = p.since; gen0 = p.gen0;
+        since = p.since; gen0 = p.gen0; pgen = p.gen;
         const dt = (t - p.t) / 1000;
         if (dt > 0) {
           const inst = (r.gen - p.gen) / dt;
           tps = p.tps === null ? inst : p.tps * 0.5 + inst * 0.5;
         }
       }
-      return { ...r, t, tps, since, gen0 };
+      return { ...r, t, tps, since, gen0, pgen };
     });
   }
 
@@ -458,27 +469,29 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     return { a, b: lastS, dt: (lastS.t - a.t) / 1000 };
   }
 
-  // Ingest one /status response: update history and per-row rates, then paint
+  // Ingest one /status response: update history and per-row rates, then paint.
+  // output_tokens only grows when a request completes, so the live rate counts tokens as they are generated:
+  // produced = output_tokens + live_output_tokens (or the sum of active[].generated). A job that completes between
+  // polls moves its tokens from active into output_tokens (the sum is unchanged); a cancelled job drops them, so a
+  // step never counts less than what the conversations still running produced, and never goes negative.
   function render(d, t) {
     const out = num(d.output_tokens), pin = num(d.prompt_tokens), cch = num(d.cached_tokens);
     const active = Array.isArray(d.active) ? d.active : null;
     const nAct = active ? active.length : null;
 
-    // Counters went down (server restart): drop the history
-    const prevS = samples[samples.length - 1];
-    if (prevS && out !== null && prevS.out !== null && out < prevS.out) { samples = []; prevRows = []; }
-    samples.push({ t, out, in: pin, cached: cch, act: nAct, tps: null });
-    while (samples.length && t - samples[0].t > HIST_S * 1000 + 2000) samples.shift();
-
-    let tps = null;
-    const w = windowed(TPS_WIN);
-    if (w && w.a.out !== null && w.b.out !== null && w.dt > 0) tps = Math.max(0, (w.b.out - w.a.out) / w.dt);
-
     const rows = (active || []).map((a) => ({
       prompt: num(a?.prompt) ?? 0, cached: num(a?.cached) ?? 0, gen: num(a?.generated) ?? 0,
       state: typeof a?.state === "string" ? (STATE_ALIAS[a.state] || a.state) : "?", id: a?.id,
-      stps: num(a?.tps),
+      stps: num(a?.tps), pf: num(a?.prefilled),
     }));
+    const live = num(d.live_output_tokens) ?? rows.reduce((acc, r) => acc + r.gen, 0);
+    const prod = out === null ? null : out + live;
+
+    // Counters went down (server restart): drop the history
+    let prevS = null;
+    for (let i = samples.length - 1; i >= 0 && !prevS; i--) if (samples[i].prod !== null) prevS = samples[i];
+    if (prevS && out !== null && out < prevS.out) { samples = []; prevRows = []; prevS = null; }
+
     const hasId = rows.some((r) => r.id !== undefined && r.id !== null);
     let matched;
     if (hasId) {
@@ -487,10 +500,22 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
         const p = byId.get(String(r.id));
         let tpsR = null;
         if (p) { const dt = (t - p.t) / 1000; if (dt > 0) { const inst = (r.gen - p.gen) / dt; tpsR = p.tps === null ? inst : p.tps * 0.5 + inst * 0.5; } }
-        return { ...r, t, tps: tpsR };
+        return { ...r, t, tps: tpsR, pgen: p ? p.gen : null };
       });
     } else matched = matchRows(rows, t);
     prevRows = matched;
+
+    let mono = prevS ? prevS.mono : 0;
+    if (prevS && prod !== null) {
+      const cont = matched.reduce((acc, r) => acc + (r.pgen === null ? 0 : Math.max(0, r.gen - r.pgen)), 0);
+      mono += Math.max(0, prod - prevS.prod, cont);
+    }
+    samples.push({ t, out, in: pin, cached: cch, act: nAct, prod, mono: prod === null ? null : mono, tps: null });
+    while (samples.length && t - samples[0].t > HIST_S * 1000 + 2000) samples.shift();
+
+    let tps = null;
+    const w = windowed(TPS_WIN);
+    if (w && w.a.mono !== null && w.b.mono !== null && w.dt > 0) tps = Math.max(0, (w.b.mono - w.a.mono) / w.dt);
 
     // Fallback when the output counter is missing: sum the per-row rates
     if (tps === null && matched.length && samples.length > 1) {
@@ -521,7 +546,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     const q = num(d.queued);
     $("k-q").textContent = q === null ? "—" : NF0.format(q);
     $("k-q").style.color = q ? "var(--warn)" : "";
-    $("k-q-hint").textContent = tr(q ? "qWait" : "qNone");
+    const QR = { limit: "qLimit", busy: "qBusy" };
+    $("k-q-hint").textContent = tr(q ? QR[d.queue_reason] || "qWait" : "qNone");
 
     const mode = typeof d.mode === "string" ? d.mode : (par === 1 ? "single" : null);
     const mi = S.md[mode] || [mode ?? "—", "—"];
@@ -529,7 +555,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     $("k-mode-hint").textContent = mi[1];
 
     $("k-tps").textContent = fmtTps(tps);
-    const perConv = tps !== null && nAct ? tps / nAct : null;
+    const nGen = matched.filter((r) => r.state === "batch" || r.state === "solo").length;
+    const perConv = tps !== null && nGen ? tps / nGen : null;
     $("k-tps-sub").textContent = tr("tpsSub", { n: NF0.format(TPS_WIN) }) + (perConv !== null ? tr("perConv", { v: fmtTps(perConv) }) : "");
 
     const hit = pin ? (cch ?? 0) / pin : null;
@@ -550,6 +577,12 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     $("k-mem-sub").textContent = bud === null ? tr("budgetNone") :
       tr("budget", { b: NF1.format(bud), p: pct(mem / bud) }) + (over ? tr("over") : "");
     $("k-mem-sub").classList.toggle("over-txt", over);
+    const ml = num(d.mem_level), sw = num(d.swap_used_gb), sys = $("k-sys");
+    sys.hidden = ml === null && sw === null;
+    const low = (ml !== null && ml < 20) || (sw !== null && sw > 20);
+    const mlT = ml === null ? "" : NF0.format(ml), swT = sw === null ? "" : NF1.format(sw);
+    sys.textContent = tr(ml === null ? "sysS" : sw === null ? "sysL" : "sys", { l: mlT, s: swT }) + (low ? tr("sysLow") : "");
+    sys.classList.toggle("over-txt", low);
 
     // Totals: this session (top-level fields) or all time ("lifetime", only when the server keeps stats.json)
     const life = d.lifetime && typeof d.lifetime === "object" ? d.lifetime : null;
@@ -617,7 +650,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
         const h = r.prompt ? r.cached / r.prompt : 0;
         const rt2 = r.stps ?? r.tps;
         return `<tr><td class="l" style="color:var(--faint)">${hasId ? esc(r.id) : i + 1}</td>` +
-          `<td class="l"><span class="pill ${STATE_CLS[r.state] || "s-other"}"${st[1] ? ` title="${esc(st[1])}"` : ""}>${esc(st[0])}</span></td>` +
+          `<td class="l"><span class="pill ${STATE_CLS[r.state] || "s-other"}"${st[1] ? ` title="${esc(st[1])}"` : ""}>${esc(st[0])}</span>` +
+          (r.state === "prefill" && r.pf !== null && r.prompt ? `<span class="pf" title="${esc(tr("pfT"))}"><span class="bar"><span style="width:${Math.min(100, (r.pf / r.prompt) * 100).toFixed(1)}%"></span></span>${human(r.pf)} / ${human(r.prompt)}</span>` : "") + `</td>` +
           `<td>${human(r.prompt)}</td><td>${human(r.cached)}</td>` +
           `<td class="cache"><div class="cbar"><div class="bar"><span style="width:${(h * 100).toFixed(1)}%"></span></div><span class="pct">${pct(h)}</span></div></td>` +
           `<td>${human(Math.max(0, r.prompt - r.cached))}</td>` +
@@ -802,7 +836,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       err = e.name === "AbortError" ? { kind: "timeout" } : e.kind ? { kind: e.kind } : e.name === "SyntaxError" ? { kind: "json" } : e.name === "TypeError" ? { kind: "net" } : { kind: "msg", msg: e.message || String(e) };
       paintConn();
       // Leave a gap in the chart: push a null sample
-      samples.push({ t: Date.now(), out: null, in: null, cached: null, act: null, tps: null });
+      samples.push({ t: Date.now(), out: null, in: null, cached: null, act: null, prod: null, mono: null, tps: null });
       while (samples.length && Date.now() - samples[0].t > HIST_S * 1000 + 2000) samples.shift();
       prevRows = [];
       drawChart();

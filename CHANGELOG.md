@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.0 — 2026-11-10
+
+Faster under Claude Code with many subagents, from an analysis of a day of real use. Engine output unchanged: on the original IQ3_S GGUF, default, INT8 and speculative outputs are bit-identical to 1.5.4 (and so to 1.0.0); concurrent output is bit-identical to running alone.
+
+### Less recomputation
+- A prompt cancelled during sliced prefill keeps its progress: a snapshot is saved at the segment boundary and the retry resumes there with bit-identical output. In 1.5.1, 13 long prompts were cancelled and retried 10 times each from zero (5.8M tokens recomputed).
+- Admission control: a request whose prompt processing would wait more than 90 s behind others gets 529 with `retry-after` instead of timing out after minutes (`QW_MAX_WAIT_S`); a prompt alone is always accepted, and a prompt refused for long enough is accepted.
+- More persist points: where the tool list diverges from other recent requests, and after the leading system-reminder blocks of the first user message (sibling subagents of one kind share up to there).
+
+### Memory
+- KV capacity grows by a quarter (at least 4,096 tokens) instead of doubling; idle slots shrink to what they hold after 60 s and keep their two longest snapshots. Same scenario (60K-token main conversation + 3 subagents): slot memory 17.8 → 13.0 GB; a 33K-token conversation ≈ 2.8 → 1.6 GB.
+- Slots of 4,096 tokens or more are written to the SSD cache before eviction (was 16,384).
+- The slot budget leaves 24 GB outside (was 16 GB): with 16 GB the machine filled 79 of 80 GB of swap. Under system memory pressure (`QW_MEM_LEVEL_MIN`, default 20%, was 10%) idle slots are shrunk, then evicted.
+
+### Scheduling
+- Prefill segments target 200 ms and decoding conversations get at least as long between segments (was 500 ms vs 200 ms, so decode got at most 29% while anyone prefilled).
+
+### Observability
+- `/status`: `mem_level`, `swap_used_gb`, `rejected`, `queue_reason` (`limit` / `busy`), `live_output_tokens`, `prefill_backlog_tokens`, `rate.prefill`, `active[].prefill_left`; `active[].generated` now updates live.
+- Log lines add thinking tokens, queue time and prefill compute time.
+- Dashboard: output tok/s is computed from tokens as they are generated (was from completed requests only, which showed 0 and then 1,000+ spikes); the queue card states the real reason; system memory level and swap are shown and turn red when low; prefill progress per conversation.
+
 ## 1.5.4 — 2026-11-10
 
 Usage that survives restarts, and API pricing on the dashboard. Engine output unchanged.
