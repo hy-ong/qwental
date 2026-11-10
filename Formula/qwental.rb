@@ -1,8 +1,8 @@
 class Qwental < Formula
   desc "Metal inference engine and API server for Qwen3.8-Flash-Next on Apple M5 Max"
   homepage "https://github.com/hy-ong/qwental"
-  url "https://github.com/hy-ong/qwental/archive/refs/tags/v1.6.1.tar.gz"
-  sha256 "7c40655e86f74a7d6de490041b1e666a12d5348d28cc5c4b9faba288f9eb03bc"
+  url "https://github.com/hy-ong/qwental/archive/refs/tags/v1.7.0.tar.gz"
+  sha256 "b6a62467e6ea63cf9da028bb3c20028c8c2302741a8d09b6989f5f0ab2f1a908"
   license "MIT"
   head "https://github.com/hy-ong/qwental.git", branch: "main"
 
