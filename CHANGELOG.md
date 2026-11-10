@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.2 — 2026-11-10
+
+Dashboard only; engine and server behavior unchanged.
+
+- `/dashboard` is localized in English and Traditional Chinese: English by default, Chinese when the browser prefers it, an EN / 中文 toggle that is remembered, and `?lang=en|zh-TW`. Every label is in one language; numbers and times follow the locale.
+- The totals panel shows the sums directly: total (prompt + output) and GPU computed (prefill + output).
+
 ## 1.5.1 — 2026-11-10
 
 Claude Code works fully, also with subagents. Engine output is unchanged: on the original IQ3_S GGUF, default, INT8 and speculative outputs are bit-identical to 1.5.0 (and so to 1.0.0); concurrent output is still bit-identical to running each request alone.
