@@ -7,7 +7,10 @@
 // （同 Strata 的 answer_room；QW_NO_ANSWER_ROOM=1 關掉）。
 // 並發時：預估 prompt 要等超過 QW_MAX_WAIT_S 秒（預設 90，0 = 關）才算完就先回 529 + retry-after；有人在生成時分段 prefill
 // 一段約 QW_PAR_CHUNK_MS（預設 200）、兩段之間生成至少 max(一段的時間, QW_PAR_DECODE_MS（預設 200）)；系統可用記憶體低於
-// QW_MEM_LEVEL_MIN %（預設 20）時逐一釋放閒置的 slot。
+// QW_MEM_LEVEL_MIN %（預設 20）時逐一釋放閒置的 slot。同時在 prefill、共用至少 QW_COAL_MIN（預設 2048，0 = 關）個 token 前綴的 prompt
+// 只算一次共用的部分，其他的從那個 slot 複製（coal_plan）。
+// QW_PAR_MIX=1（實驗，預設關）：mixed step，分段 prefill 的一段在 GPU 上跑的同時其他對話照常一起 decode（第二條 GPU 串流；
+// 兩邊結果與分開跑逐位元相同），段長改成約 QW_PAR_MIX_CHUNK_MS（預設 1000），兩段之間不再停下來只跑生成。
 // 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--exact-spec] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--stats-file PATH] [--parallel [N]] [--version]
 // --gguf：整個模型改用該目錄的 GGUF（Strata 的 IQ3_S 等；等同 QW_GGUF=目錄 QW_GGUF_PARTS=all）。
 //   這時 MLX 目錄（--model）是選用的：沒有時 tokenizer 讀 GGUF 的 metadata，dflash2/ 改找 GGUF 目錄的同層
@@ -40,6 +43,8 @@
 #include "gpu.h"
 #include "json.h"
 #include "tok.h"
+// ---- diag（遺言 / 記憶體紀錄；tools/diag.h）
+#include "diag.h"
 
 static const char dashboard_html[] = { // GET /dashboard（與 /）：即時狀態頁（讀 /status）
 #embed "dashboard.html"
@@ -546,6 +551,15 @@ typedef struct job {
     double tc; // 收到請求的時間（/status 的 age_s）
     double pfc_ms; // prefill 實際計算的時間（ms；不含排隊、分段之間等別人）
     int est_new;   // 進場時估的要新算的 prompt token 數（admission control、/status 的排隊估計）
+    // 合併同時在 prefill、前綴相同的 prompt（coal_plan）：lead = 等著的領頭請求 id（0 = 沒有），lead_at = 交接點（共用前綴，64 的倍數）；
+    // coal_copy = 領頭的已經算到交接點、下一段從它的 slot 複製；coal_done = 跟過一次了（不再跟，免得來回）；
+    // coal_pts = 自己當領頭時要停下來記快照的交接點；pfx = 單獨跑讓出時 prompt 算到哪（排領頭順序用）；
+    // cl_* = 與其他請求的共用前綴長度（逐 token 比對一次就記住，prompt 在 prefill 中不會變）
+    int lead, lead_at, pfx;
+    bool coal_copy, coal_done;
+    int coal_pts[QW_PAR_SNAPAT_MAX], ncoal_pts;
+    int ncl, cl_id[QW_PAR_MAX], cl_n[QW_PAR_MAX];
+    bool out_moved; // 生成的 token 數已經在 par_done 從 /status 的 active 移到 output_tokens（chat_end 不再加）
     atomic_bool done; // engine 做完了（在 c->mu 裡設，之後 engine 不再碰這個 job）
     struct job *next;
 } job;
@@ -873,7 +887,7 @@ static void chat_end(job *j) {
     __atomic_fetch_add(&st_done, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&st_in, np, __ATOMIC_RELAXED);
     __atomic_fetch_add(&st_cached, st.cached, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&st_out, st.gen, __ATOMIC_RELAXED);
+    if (!j->out_moved) __atomic_fetch_add(&st_out, st.gen, __ATOMIC_RELAXED); // --parallel：par_done 已經加了（st_retire）
     if (dead) __atomic_fetch_add(&st_cancel, 1, __ATOMIC_RELAXED);
     if (fin == QW_FIN_ERROR) __atomic_fetch_add(&st_err, 1, __ATOMIC_RELAXED);
     lt_count(np, st.cached, st.gen, dead, fin == QW_FIN_ERROR);
@@ -1106,6 +1120,35 @@ static int rc_lcp(const int32_t *t, int n) { // 與最近算過的最長共用�
     pthread_mutex_unlock(&rc_mu);
     return best;
 }
+// 進行中（排隊、prefill、生成）的 prompt：同時進來、前綴相同的請求只算一次共用的部分（coal_plan），進場估計也不算那段。
+// 連線執行緒在排進佇列時記下、結束時拿掉（自己一份複製，engine 結束 job 之後也安全）
+enum { INF_MAX = QW_PAR_MAX + QUEUE_MAX };
+static struct { int id; int32_t *t; int n; } inf[INF_MAX];
+static void inf_put(const job *j) {
+    if (j->np < 256) return;
+    pthread_mutex_lock(&rc_mu);
+    for (int i = 0; i < INF_MAX; i++)
+        if (!inf[i].t) {
+            inf[i].t = malloc(sizeof(int32_t) * (size_t)j->np);
+            if (inf[i].t) { memcpy(inf[i].t, j->ids, sizeof(int32_t) * (size_t)j->np); inf[i].n = j->np; inf[i].id = j->id; }
+            break;
+        }
+    pthread_mutex_unlock(&rc_mu);
+}
+static void inf_del(int id) {
+    pthread_mutex_lock(&rc_mu);
+    for (int i = 0; i < INF_MAX; i++)
+        if (inf[i].t && inf[i].id == id) { free(inf[i].t); inf[i].t = NULL; inf[i].n = 0; inf[i].id = 0; }
+    pthread_mutex_unlock(&rc_mu);
+}
+static int inf_lcp(const int32_t *t, int n) { // 與進行中的 prompt 的最長共用前綴
+    int best = 0;
+    pthread_mutex_lock(&rc_mu);
+    for (int i = 0; i < INF_MAX; i++)
+        if (inf[i].t) { const int l = lcp32(inf[i].t, inf[i].n, t, n); if (l > best) best = l; }
+    pthread_mutex_unlock(&rc_mu);
+    return best;
+}
 // rem[i]：前面各請求還要 prefill 的 token 數；own：這個請求要 prefill 的；dec：有對話在生成（prefill 只分到約一半的時間）；
 // rate：prefill 速度（token / ms；0 = 還沒量過，用 0.8）。排程是「剩最少的先算」：比自己多的只算到和自己一樣多（加上 aging 的輪流，近似處理器分享）。
 // 回傳預估幾秒後這個請求的 prompt 算完；*ahead_s = 其中因為前面的請求多等的秒數
@@ -1141,10 +1184,12 @@ static bool rej_overdue(unsigned long long h, double now, double limit) {
     return due;
 }
 
+static void st_retire(job *j); // /status：生成的 token 數從 active 移到 output_tokens（下面）
 static void par_done(job *j, int fin) {
     j->fin = fin;
     j->st.gen = j->got;
     j->st.gen_ms = (qw_now() - j->tg0) * 1e3;
+    st_retire(j);
     if (j->sid >= 0) qw_engine_par_finish(E, j->sid, j->ids + j->base, j->np + j->got - j->base);
     // 算過的前綴（進場控制估重用）：完成的 = prompt + 生成；分段 prefill 中取消的 = 算到的位置（有 par_snap 存快照時才接得上）
     int kept = j->st.prompt ? j->np + j->got : 0;
@@ -1255,6 +1300,7 @@ static bool run_solo(job *j, int *ng_out, double *pf_out) {
     *pf_out = 0;
     if (fin == QW_FIN_YIELD && s2.pf_done > 0) { // prompt 還沒算完就讓出：之後分段 prefill 接著算（快照在 pf_done）
         j->pfy = true;
+        j->pfx = s2.pf_done;
         j->st.cached = s2.cached;
         j->pfc_ms += ms;
         pf_rate_note(s2.pf_done - s2.cached, ms);
@@ -1314,17 +1360,151 @@ static bool join_batch(job *j) {
     j->hasd = false;
     return par_emit(j, qw_engine_sample(lg, &j->gp, &j->rng));
 }
+// ---- 合併同時在 prefill、前綴相同的 prompt（coalescing）
+// Claude Code 一次派出好幾個同一種 subagent：工具、system、開頭的 system-reminder 都相同（約 14K token），只差任務文字。
+// 它們同時進來時誰都還沒算完那段前綴，以前每個都自己從頭算一次（實測 11 個各等 40–117 秒、重用 0）。
+// 現在：B 與一個「進度比較前面」的 A 共用至少 COAL_MIN（QW_COAL_MIN，預設 2048；0 = 關）個 token 時，B 先不算，
+// 等 A 算到交接點（共用前綴往下對齊到 64 的倍數）；A 的分段在交接點停下並記快照（qw_engine_par_snapat），
+// 之後 B 的下一段由 par_prefill_to 的 xs_copy 從 A 的 slot 複製那段前綴（KV 前 L 列只由這些 token 決定、快照在合法的分段點：
+// 與自己從頭算逐位元相同），只算自己的後綴。10 個相同的 14K 前綴 ≈ 1 × 14K + 10 × 後綴。
+// 排程：等著的 B 不排 prefill；A 算到交接點之後，B 先跑（複製）、A 暫停到它的 B 都複製完（A 往後的檢查點不會把交接快照擠掉）。
+// 不會卡死：只跟「進度（prog，同進度時 id 小的）比自己前面」的，順序固定 → 沒有環；A 被取消 / 結束 → B 下一輪重新選（或自己算）；
+// 交接快照不在了（被擠掉）→ xs_copy 找不到就照常從頭算（coal_done：只跟一次，不會來回）
+static int COAL_MIN = 2048;
+static long long st_coal, st_coal_n; // /status：從領頭的請求複製的 token 數、跟過的請求數
+static int coal_prog(const job *j) { return j->pfd > j->pfx ? j->pfd : j->pfx; } // prompt 算到哪（單獨跑讓出的進度也算）
+static bool coal_ahead(const job *a, const job *b) { // a 排在 b 前面（嚴格的全序：進度多的、同進度時 id 小的）
+    const int pa = coal_prog(a), pb = coal_prog(b);
+    return pa > pb || (pa == pb && a->id < b->id);
+}
+static int coal_lcp(job *a, job *b) { // 共用前綴長度（記在兩邊，同一對只比一次）
+    for (int i = 0; i < a->ncl; i++) if (a->cl_id[i] == b->id) return a->cl_n[i];
+    const int l = lcp32(a->ids, a->np, b->ids, b->np);
+    job *jj[2] = {a, b};
+    for (int k = 0; k < 2; k++) {
+        job *x = jj[k];
+        if (x->ncl >= QW_PAR_MAX) x->ncl = 0; // 滿了：重新記（id 不會重複，舊的只是用不到）
+        x->cl_id[x->ncl] = k ? a->id : b->id;
+        x->cl_n[x->ncl++] = l;
+    }
+    return l;
+}
+static job *coal_find(job **act, int na, int id) {
+    for (int i = 0; i < na; i++) if (act[i]->id == id) return act[i];
+    return NULL;
+}
+static bool coal_waiting(const job *j) { return j->lead && !j->coal_copy; }
+// 每輪排 prefill 之前：決定誰跟誰、誰可以複製了，並算出每個領頭的要停下來記快照的交接點
+static void coal_plan(job **act, int na) {
+    for (int i = 0; i < na; i++) act[i]->ncoal_pts = 0;
+    if (COAL_MIN <= 0) return;
+    for (int i = 0; i < na; i++) {
+        job *j = act[i];
+        if (!j->pfing) { j->lead = 0; j->coal_copy = false; continue; }
+        if (j->coal_copy) continue; // 等著複製（下一段）
+        if (j->lead) {
+            job *L = coal_find(act, na, j->lead);
+            if (L && L->pfing && coal_prog(L) + 64 <= j->lead_at) continue; // 領頭的還沒到交接點：繼續等
+            if (L) { // 到了（或已經算完整個 prompt）：下一段複製
+                // 領頭的剛好停在交接點附近（≤ 交接點的段尾）但沒有那裡的快照時補記（已經有就直接回傳）
+                if (L->pfing && L->pfd > 0 && L->pfd <= j->lead_at) qw_engine_par_snap(E, L->sid);
+                j->coal_copy = true;
+                j->coal_done = true;
+                continue;
+            }
+            fprintf(stderr, "[par] #%d 等的 #%d 不在了（取消或結束）：重新找\n", j->id, j->lead);
+            j->lead = 0;
+        }
+        if (j->coal_done) continue;
+        job *best = NULL;
+        int bs = 0;
+        for (int k = 0; k < na; k++) {
+            job *L = act[k];
+            if (L == j || !L->pfing || !coal_ahead(L, j)) continue;
+            int sh = coal_lcp(j, L);
+            if (sh > j->np - 1) sh = j->np - 1; // 至少留最後一個 token 自己算（要它的 logits）
+            sh = sh / 64 * 64;
+            if (sh < COAL_MIN || sh < coal_prog(j) + COAL_MIN) continue; // 省不了多少
+            if (coal_prog(L) + 64 > sh) continue; // 已經過了交接點（那裡多半沒有快照）：不用等，xs_copy 有什麼就用什麼
+            if (!best || sh > bs || (sh == bs && coal_ahead(L, best))) { best = L; bs = sh; }
+        }
+        if (best) {
+            j->lead = best->id;
+            j->lead_at = bs;
+            fprintf(stderr, "[par] #%d 與 #%d 共用前綴 %d 個 token（prompt %d / %d）：等 #%d 算到那裡再複製，不重算\n", j->id, best->id, bs, j->np,
+                    best->np, best->id);
+        }
+    }
+    for (int i = 0; i < na; i++) { // 領頭的交接點：還沒到的、由小到大、不重複，最多 QW_PAR_SNAPAT_MAX 個
+        job *f = act[i];
+        if (!coal_waiting(f)) continue;
+        job *L = coal_find(act, na, f->lead);
+        if (!L || f->lead_at <= coal_prog(L)) continue;
+        int k = 0;
+        while (k < L->ncoal_pts && L->coal_pts[k] < f->lead_at) k++;
+        if (k < L->ncoal_pts && L->coal_pts[k] == f->lead_at) continue;
+        if (L->ncoal_pts == QW_PAR_SNAPAT_MAX) { if (k == QW_PAR_SNAPAT_MAX) continue; L->ncoal_pts--; } // 滿了：丟最遠的
+        memmove(&L->coal_pts[k + 1], &L->coal_pts[k], sizeof(int) * (size_t)(L->ncoal_pts - k));
+        L->coal_pts[k] = f->lead_at;
+        L->ncoal_pts++;
+    }
+}
+// 領頭的暫停：有跟它的請求等著複製（先讓它們複製，免得往後的檢查點把交接快照擠掉）
+static bool coal_held(const job *L, job **act, int na) {
+    for (int i = 0; i < na; i++) if (act[i]->lead == L->id && act[i]->coal_copy) return true;
+    return false;
+}
+// 選這一輪要 prefill 的：等著複製的先（最早來的）；否則剩最少的先算（短的新請求不必等長的算完），
+// 等超過 PF_AGE_S 秒的最舊的每隔一段輪到一次（不會一直被插隊；領頭的年紀算它和跟它的請求裡最早的）。
+// 等著領頭的、暫停中的領頭不選。沒有可以算的回傳 NULL
+static job *pf_pick(job **act, int na, double now) {
+    job *pj = NULL, *old = NULL, *cp = NULL;
+    double ot = 0;
+    for (int i = 0; i < na; i++) {
+        job *j = act[i];
+        if (!j->pfing) continue;
+        if (j->coal_copy) { if (!cp || j->t0 < cp->t0) cp = j; continue; }
+        if (coal_waiting(j) || coal_held(j, act, na)) continue;
+        if (!pj || j->np - j->pfd < pj->np - pj->pfd) pj = j;
+        double t = j->t0;
+        for (int k = 0; k < na; k++) if (act[k]->lead == j->id && act[k]->t0 < t) t = act[k]->t0;
+        if (now - t > PF_AGE_S && (!old || t < ot)) { old = j; ot = t; }
+    }
+    if (cp) return cp;
+    static bool age_turn;
+    if (old && old != pj && (age_turn = !age_turn)) pj = old;
+    return pj;
+}
+// 跟隨的請求複製完（pf_chunk 之後）：記數字、清掉跟隨狀態
+static void coal_after(job *j, int copied) {
+    if (copied > 0) {
+        __atomic_fetch_add(&st_coal, copied, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&st_coal_n, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, "[par] #%d 跟著 #%d：複製共用前綴 %d 個 token（交接點 %d），只算後綴 %d 個\n", j->id, j->lead, copied, j->lead_at, j->np - copied);
+    } else fprintf(stderr, "[par] #%d：#%d 的交接快照不在了，照常 prefill\n", j->id, j->lead);
+    j->lead = 0;
+    j->coal_copy = false;
+}
 // 分段 prefill 一段：段長照實測速度調成約 PF_SEG_MS（QW_PAR_CHUNK_MS，預設 200 ms：其他對話最多停這麼久），64 的倍數、256…8192 個 token
 // （engine 再對齊到 GDN 分塊與檢查點）；整段算完就取第一個 token、進入一起 decode。回傳 false = 這個請求結束了
+static bool pf_mixing; // 這一段是 mixed step（段長用 PF_MIX_MS）
+static double PF_MIX_MS = 1000;
 static bool pf_chunk(job *j) {
-    int ch = pf_rate > 0 ? (int)(pf_rate * PF_SEG_MS) / 64 * 64 : 256;
+    int ch = pf_rate > 0 ? (int)(pf_rate * (pf_mixing ? PF_MIX_MS : PF_SEG_MS)) / 64 * 64 : 256;
     ch = ch < 256 ? 256 : ch > 8192 ? 8192 : ch;
+    const bool copy = j->coal_copy;
+    if (copy) { // 領頭的算到交接點了：pfd 歸零 → par_prefill_to 重新找快照，xs_copy 從它的 slot 複製最長的可用前綴
+        if (j->pfd > 0) qw_engine_par_snap(E, j->sid); // 自己已經算的部分先記快照（複製不成時從這裡接）
+        j->pfd = 0;
+    }
     int cached = 0;
     const bool first = j->pfd == 0;
     const int d0 = j->pfd;
     const double t = qw_now();
     qw_engine_par_persist(E, j->gp.persist, j->gp.npersist);
+    qw_engine_par_snapat(E, j->coal_pts, j->ncoal_pts); // 當領頭時：段尾停在交接點、記快照
     const float *lg = qw_engine_par_prefill_to(E, j->sid, j->ids, j->np, ch, &j->pfd, &cached);
+    if (copy) coal_after(j, lg ? qw_engine_par_copied(E) : 0);
     const double dt = (qw_now() - t) * 1e3;
     j->pfc_ms += dt;
     pf_seg_ms = dt;
@@ -1340,6 +1520,43 @@ static bool pf_chunk(job *j) {
     j->inb = true;
     j->hasd = false;
     return par_emit(j, qw_engine_sample(lg, &j->gp, &j->rng));
+}
+// ---- mixed step（QW_PAR_MIX=1）：分段 prefill 的一段送到 GPU 之後、跑完之前，engine 反覆呼叫 mix_round：已在一起 decode 中的對話
+// 走一步（qw_engine_par_step，第二條 GPU 串流，與 prefill 同時跑）。只做 par_step、取樣、送出（不 join_batch、不推測解碼：
+// 那些要 prefill / 驗證，會用到 prefill 正在用的暫存）；還沒加入的對話等這段算完照常加入。結束的請求從 act 拿掉
+static int PAR_MIX;
+static struct { job **act; int *na; int steps, toks; } mx;
+static bool mix_round(void *ctx) {
+    (void)ctx;
+    job *bj[QW_PAR_MAX];
+    int nb = 0, sids[QW_PAR_MAX];
+    int32_t toks[QW_PAR_MAX], nxa[QW_PAR_MAX], *nx = nxa;
+    for (int i = 0; i < *mx.na; i++) {
+        job *j = mx.act[i];
+        if (j->inb && !j->pfing && !conn_dead(j->c)) bj[nb++] = j; // 斷線的留給下一輪開頭處理（記進度、放 slot）
+    }
+    if (!nb) return false;
+    for (int i = 0; i < nb; i++) { sids[i] = bj[i]->sid; toks[i] = bj[i]->last; bj[i]->hasd = false; }
+    double gms = 0;
+    const float *lg = qw_engine_par_step(E, sids, toks, nb, &gms);
+    if (!lg) return false; // 這一段算完之後照常的 par_step 會再試（真的失敗時在那裡結束請求）
+    job **aj = bj;
+    dispatch_apply((size_t)nb, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+        nx[i] = qw_engine_sample(lg + i * QW_VOCAB, &aj[i]->gp, &aj[i]->rng);
+    });
+    mx.steps++;
+    mx.toks += nb;
+    for (int i = 0; i < nb; i++) { // 同 par_loop 的一起 decode
+        job *j = bj[i];
+        bool alive;
+        if (j->np + j->got + 2 >= CTX) { par_done(j, QW_FIN_CTX); alive = false; }
+        else alive = par_emit(j, nx[i]);
+        if (alive) continue;
+        int keep = 0; // 結束（或等著收尾後重新加入）：之後不能再碰
+        for (int q = 0; q < *mx.na; q++) if (mx.act[q] != j) mx.act[keep++] = mx.act[q];
+        *mx.na = keep;
+    }
+    return true;
 }
 // 離開一起 decode：記快照（最後送出、還沒餵的 token 留給下一段當 prompt 結尾）
 static void leave_batch(job *j) {
@@ -1472,19 +1689,19 @@ static void mem_guard(job **act, int na) {
     for (int i = 0; i < na; i++) busy |= 1ull << act[i]->sid;
     if (qw_engine_par_mem(E) > SLOT_BUDGET) { // 先縮閒置 slot 的 KV 容量（不丟快取的內容），還是超過才整組釋放
         const size_t f = qw_engine_par_shrink(E, busy);
-        if (f) fprintf(stderr, "[mem] slot 超過 %.1f GB：縮小閒置 slot 的 KV，放掉 %.2f GB\n", SLOT_BUDGET / 1e9, f / 1e9);
+        if (f) { fprintf(stderr, "[mem] slot 超過 %.1f GB：縮小閒置 slot 的 KV，放掉 %.2f GB\n", SLOT_BUDGET / 1e9, f / 1e9); diag_mem("[mem] 縮小 KV 之後"); }
     }
     const int n = qw_engine_par_trim(E, busy, SLOT_BUDGET, false);
     st_mem = qw_engine_par_mem(E);
-    if (n) fprintf(stderr, "[mem] slot 超過 %.1f GB：釋放 %d 組閒置的\n", SLOT_BUDGET / 1e9, n);
+    if (n) { fprintf(stderr, "[mem] slot 超過 %.1f GB：釋放 %d 組閒置的\n", SLOT_BUDGET / 1e9, n); diag_mem("[mem] 釋放 slot 之後"); }
     static double last;
     if (qw_now() - last > 1) {
         last = qw_now();
         const int lvl = mem_level();
         if (lvl >= 0 && lvl < MEM_LEVEL_MIN) {
             const size_t f = qw_engine_par_shrink(E, busy);
-            if (f) { fprintf(stderr, "[mem] 系統可用記憶體 %d%%：縮小閒置 slot 的 KV，放掉 %.2f GB\n", lvl, f / 1e9); st_mem = qw_engine_par_mem(E); return; }
-            if (qw_engine_par_trim(E, busy, 0, true)) fprintf(stderr, "[mem] 系統可用記憶體 %d%%：釋放一組閒置的 slot\n", lvl);
+            if (f) { fprintf(stderr, "[mem] 系統可用記憶體 %d%%：縮小閒置 slot 的 KV，放掉 %.2f GB\n", lvl, f / 1e9); diag_mem("[mem] 縮小 KV 之後"); st_mem = qw_engine_par_mem(E); return; }
+            if (qw_engine_par_trim(E, busy, 0, true)) { fprintf(stderr, "[mem] 系統可用記憶體 %d%%：釋放一組閒置的 slot\n", lvl); diag_mem("[mem] 釋放 slot 之後"); }
             st_mem = qw_engine_par_mem(E);
         }
     }
@@ -1507,6 +1724,7 @@ static pthread_mutex_t st_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct {
     int id, np, cached, got, prefilled;
     int rem; // 還要 prefill 幾個 token（估計；進場控制用）
+    int follows; // 等著複製哪個請求的前綴（id；0 = 沒有）
     char state;
     double tps, t0;
     char model[64]; // 複製（job 結束後就被釋放）
@@ -1527,12 +1745,30 @@ static void st_publish(job **act, int na, const char *mode) {
         st_job[i].prefilled = j->pfing ? j->pfd : j->st.prompt ? j->np : 0;
         st_job[i].rem = j->st.prompt ? 0 : j->pfing && j->pfd > 0 ? j->np - j->pfd : j->est_new;
         st_job[i].state = j->pfing ? 'p' : j->inb ? 'b' : 's';
+        st_job[i].follows = j->pfing ? j->lead : 0;
         // 每個對話的速度：一起 decode 時 = 實測總速度 ÷ 人數；輪流時 = 它自己推測解碼的實測（一段之內）
         st_job[i].tps = j->inb ? (ninb > 0 && bat_rate[ninb] > 0 ? bat_rate[ninb] / ninb : 0) : j->srate;
         st_job[i].t0 = j->tc;
         snprintf(st_job[i].model, sizeof st_job[i].model, "%s", j->g.model);
     }
     if (mode) st_mode = mode;
+    pthread_mutex_unlock(&st_mu);
+}
+// 請求結束（par_done）：在同一個 st_mu 區段裡把它的 token 數加到 output_tokens、並從 active 拿掉。
+// dashboard 的即時輸出速度 = Δ(output_tokens + Σ active[].generated)（live_output_tokens），兩邊要同時換手：
+// 以前 output_tokens 在連線執行緒的 chat_end 才加、active 等到下一次 st_publish 才拿掉，中間那段時間（一段 prefill、
+// 只剩 prefill 的對話時更久）同一批 token 被算兩次、或先少算再補回來；dashboard 只累計增加的部分（mono），
+// 所以每結束一個請求就多算一次它全部的輸出 → 藍線尖峰（約 900 tok/s）
+static void st_retire(job *j) {
+    pthread_mutex_lock(&st_mu);
+    __atomic_fetch_add(&st_out, j->got, __ATOMIC_RELAXED);
+    j->out_moved = true;
+    for (int i = 0; i < st_n; i++)
+        if (st_job[i].id == j->id) {
+            memmove(&st_job[i], &st_job[i + 1], sizeof st_job[0] * (size_t)(st_n - i - 1));
+            st_n--;
+            break;
+        }
     pthread_mutex_unlock(&st_mu);
 }
 // 輪流推測解碼的一段可能很長（只有一個對話時直到結束）：生成的 token 數每 0.2 秒更新一次（dashboard 用 generated 的增量算即時輸出速度）
@@ -1808,6 +2044,7 @@ static void lt_start(void) {
         signal(sig, SIG_IGN); // 改由 dispatch source 接（I/O 不在 signal handler 裡做）
         dispatch_source_t s = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)sig, 0, q);
         dispatch_source_set_event_handler(s, ^{
+            diag_signal_note(sig, NULL); // diag：先寫遺言（含時間、記憶體）再存
             lt_save(true);
             fprintf(stderr, "[stats] 收到 %s：累計數字已存到 %s，結束\n", sig == SIGTERM ? "SIGTERM" : "SIGINT", LT_PATH);
             signal(sig, SIG_DFL); // 照預設行為結束（結束狀態同以前：被 sig 終止）
@@ -1828,9 +2065,15 @@ static void handle_status(conn *c, const char *qs) { // qs：查詢字串（days
     pthread_mutex_lock(&q_mu);
     for (job *q = q_head; q; q = q->next) queued++;
     pthread_mutex_unlock(&q_mu);
+    // output_tokens 與 live_output_tokens 在同一個 st_mu 區段裡讀（st_retire 在裡面換手：兩者的和不會跳）
+    long long out, live = 0, backlog = 0;
+    pthread_mutex_lock(&st_mu);
+    out = __atomic_load_n(&st_out, __ATOMIC_RELAXED);
+    for (int i = 0; i < st_n; i++) { live += st_job[i].got; backlog += st_job[i].rem; }
+    pthread_mutex_unlock(&st_mu);
     sb_printf(&o, "{\"version\":\"%s\",\"profile\":\"%s\",\"uptime_s\":%.0f,\"parallel\":%d,\"done\":%lld,\"prompt_tokens\":%lld,"
                   "\"cached_tokens\":%lld,\"output_tokens\":%lld,\"queued\":%d,\"cancelled\":%lld,\"errors\":%lld",
-              QW_VERSION, getenv("QW_GGUF") ? "gguf" : "mlx", qw_now() - T_START, PAR, st_done, st_in, st_cached, st_out, queued, st_cancel, st_err);
+              QW_VERSION, getenv("QW_GGUF") ? "gguf" : "mlx", qw_now() - T_START, PAR, st_done, st_in, st_cached, out, queued, st_cancel, st_err);
     // 系統記憶體（dashboard 顯示 swap 警告）：mem_level = kern.memorystatus_level（可用 %），swap_used_gb = vm.swapusage 的已用
     const int ml = mem_level();
     const double sw = swap_used_gb();
@@ -1856,17 +2099,18 @@ static void handle_status(conn *c, const char *qs) { // qs：查詢字串（days
         // queue_reason：為什麼有請求在排隊。進場只看並發上限（engine 每輪開頭收到 PAR 個為止），不看記憶體：
         //   "limit" = 已經有 PAR 個在跑；"busy" = 還沒到上限，engine 正在跑一段工作（一段 prefill、輪流的時間片、加入 batch、SSD 寫入），
         //   下一個排程點就收；null = 沒有排隊
-        long long live = 0, backlog = 0;
-        for (int i = 0; i < st_n; i++) { live += st_job[i].got; backlog += st_job[i].rem; }
         sb_printf(&o, ",\"queue_reason\":%s,\"live_output_tokens\":%lld,\"prefill_backlog_tokens\":%lld",
                   !queued ? "null" : st_n >= PAR ? "\"limit\"" : "\"busy\"", live, backlog);
+        sb_printf(&o, ",\"coalesced_tokens\":%lld,\"coalesced_requests\":%lld", __atomic_load_n(&st_coal, __ATOMIC_RELAXED),
+                  __atomic_load_n(&st_coal_n, __ATOMIC_RELAXED));
         sb_printf(&o, ",\"mode\":\"%s\",\"slot_mem_gb\":%.2f,\"slot_budget_gb\":%.1f,\"active\":[", st_n ? st_mode : "idle", st_mem / 1e9,
                   SLOT_BUDGET / 1e9);
         const double now = qw_now();
         for (int i = 0; i < st_n; i++) {
-            sb_printf(&o, "%s{\"id\":%d,\"prompt\":%d,\"cached\":%d,\"prefilled\":%d,\"generated\":%d,\"state\":\"%s\",\"tps\":%.1f,\"age_s\":%.1f,\"prefill_left\":%d,\"model\":",
+            sb_printf(&o, "%s{\"id\":%d,\"prompt\":%d,\"cached\":%d,\"prefilled\":%d,\"generated\":%d,\"state\":\"%s\",\"tps\":%.1f,\"age_s\":%.1f,\"prefill_left\":%d,\"follows\":%d,\"model\":",
                       i ? "," : "", st_job[i].id, st_job[i].np, st_job[i].cached, st_job[i].prefilled, st_job[i].got,
-                      st_job[i].state == 'p' ? "prefill" : st_job[i].state == 'b' ? "batch" : "solo", st_job[i].tps, now - st_job[i].t0, st_job[i].rem);
+                      st_job[i].state == 'p' ? "prefill" : st_job[i].state == 'b' ? "batch" : "solo", st_job[i].tps, now - st_job[i].t0, st_job[i].rem,
+                      st_job[i].follows);
             sb_json_str(&o, st_job[i].model, strlen(st_job[i].model), false);
             sb_puts(&o, "}");
         }
@@ -1947,19 +2191,22 @@ static void *par_loop(void *arg) {
         }
         { // 兩段之間至少讓其他對話生成 max(上一段的時間, DEC_MIN_MS)（pf_gap_ms；沒有別人可以生成時直接下一段）
             static double pf_last;
-            int nready = 0;
-            for (int i = 0; i < na; i++) nready += !act[i]->pfing;
-            const bool go = nready == 0 || (qw_now() - pf_last) * 1e3 >= pf_gap_ms();
-            job *pj = NULL, *old = NULL; // 剩最少的先算（短的新請求不必等長的算完）；等超過 PF_AGE_S 秒的最舊的每隔一段輪到一次（不會一直被插隊）
+            int nready = 0, ninb = 0;
+            for (int i = 0; i < na; i++) { nready += !act[i]->pfing; ninb += !act[i]->pfing && act[i]->inb; }
+            // mixed step：一起 decode 中的對話在 prefill 這段跑的同時就會前進，不必在兩段之間另外讓時間
+            const bool go = nready == 0 || (PAR_MIX && ninb > 0) || (qw_now() - pf_last) * 1e3 >= pf_gap_ms();
             const double now = qw_now();
-            for (int i = 0; go && i < na; i++) {
-                if (!act[i]->pfing) continue;
-                if (!pj || act[i]->np - act[i]->pfd < pj->np - pj->pfd) pj = act[i];
-                if (now - act[i]->t0 > PF_AGE_S && (!old || act[i]->t0 < old->t0)) old = act[i];
-            }
-            static bool age_turn;
-            if (old && old != pj && (age_turn = !age_turn)) pj = old;
+            coal_plan(act, na); // 前綴相同的：誰等誰、誰可以複製了
+            job *pj = go ? pf_pick(act, na, now) : NULL;
+            const bool mixd = pj && PAR_MIX && ninb > 0;
+            if (mixd) { mx.act = act; mx.na = &na; mx.steps = mx.toks = 0; pf_mixing = true; qw_engine_par_mix(E, mix_round, NULL); }
             const bool ok = !pj || pf_chunk(pj);
+            if (mixd) {
+                qw_engine_par_mix(E, NULL, NULL);
+                pf_mixing = false;
+                if (prof) fprintf(stderr, "[mix] prefill 一段 %.0f ms：期間 decode %d 步、%d 個 token（%.1f tok/s）\n", pf_seg_ms, mx.steps, mx.toks,
+                                  pf_seg_ms > 0 ? mx.toks * 1e3 / pf_seg_ms : 0.0);
+            }
             if (pj) { pf_last = qw_now(); pf_ms += (pf_last - now) * 1e3; }
             int keep = 0;
             for (int i = 0; i < na; i++)
@@ -1973,6 +2220,7 @@ static void *par_loop(void *arg) {
         bool s2 = want_slice(rd, nr, slice);
         // 換做法之後至少維持 MODE_HOLD_S 秒（只有一個對話、或超過 SLICE_MAX_N 個時照規則直接換）
         if (s2 != slice && nr > 1 && nr <= SLICE_MAX_N && qw_now() - mode_t < MODE_HOLD_S) s2 = slice;
+        if (PAR_MIX && na > nr) s2 = false; // mixed step：有人在分段 prefill 時一起 decode（輪流推測解碼不能與 prefill 重疊）
         st_publish(act, na, s2 ? "spec" : "batch");
         if (s2 != slice) {
             mode_t = qw_now();
@@ -2130,7 +2378,10 @@ static void par_chat(conn *c, const char *body, size_t blen, bool openai) {
         job_free(j);
         return;
     }
-    j->est_new = j->np - rc_lcp(j->ids, j->np);
+    { // 要新算的：最近算過的、或進行中的請求共用的前綴不算（後者由 coal_plan 合併；COAL_MIN 以下的不合併）
+        const int lr = rc_lcp(j->ids, j->np), li = COAL_MIN > 0 ? inf_lcp(j->ids, j->np) : 0;
+        j->est_new = j->np - (li >= COAL_MIN && li > lr ? li : lr);
+    }
     int ra = 0;
     double est = 0, ahead = 0;
     if (adm_reject(j, &ra, &est, &ahead)) {
@@ -2145,6 +2396,7 @@ static void par_chat(conn *c, const char *body, size_t blen, bool openai) {
         return;
     }
     stream_start(j);
+    inf_put(j);
     pthread_mutex_lock(&q_mu);
     if (q_tail) q_tail->next = j;
     else q_head = j;
@@ -2157,6 +2409,7 @@ static void par_chat(conn *c, const char *body, size_t blen, bool openai) {
         pump_step(c, &j->done);
         if (conn_dead(c) && !atomic_load(&j->done) && q_cancel(j)) break;
     }
+    inf_del(j->id);
     chat_end(j);
 }
 
@@ -2294,6 +2547,7 @@ int main(int argc, char **argv) {
     if (PAR > QW_PAR_MAX) PAR = QW_PAR_MAX;
     if (PAR > 1 && atoi(getenv("QW_SLOTS")) < PAR) { char v[8]; snprintf(v, sizeof v, "%d", PAR); setenv("QW_SLOTS", v, 1); } // 每個並發的對話一個 slot
     signal(SIGPIPE, SIG_IGN);
+    diag_install(60); // diag：遺言 handler + atexit + 每 60 秒的記憶體紀錄（要在 lt_start 之前：它接手 SIGTERM / SIGINT）
     { // 累計數字（跨重啟）：--stats-file，或 cache_dir/stats.json
         char sp[1100];
         if (!stats_file) { if (*cache_dir) snprintf(sp, sizeof sp, "%s/stats.json", cache_dir); else sp[0] = 0; }
@@ -2314,6 +2568,10 @@ int main(int argc, char **argv) {
     if (getenv("QW_PAR_SLICE_MAX")) SLICE_MAX_N = atoi(getenv("QW_PAR_SLICE_MAX"));
     if (getenv("QW_PAR_CHUNK_MS") && atof(getenv("QW_PAR_CHUNK_MS")) > 0) PF_SEG_MS = atof(getenv("QW_PAR_CHUNK_MS"));
     if (getenv("QW_PAR_DECODE_MS")) DEC_MIN_MS = atof(getenv("QW_PAR_DECODE_MS"));
+    if (getenv("QW_COAL_MIN")) COAL_MIN = atoi(getenv("QW_COAL_MIN")); // 合併前綴相同的 prefill 的門檻（token；0 = 關）
+    PAR_MIX = getenv("QW_PAR_MIX") && atoi(getenv("QW_PAR_MIX")) > 0;
+    if (getenv("QW_PAR_MIX_CHUNK_MS") && atof(getenv("QW_PAR_MIX_CHUNK_MS")) > 0) PF_MIX_MS = atof(getenv("QW_PAR_MIX_CHUNK_MS"));
+    if (PAR_MIX) fprintf(stderr, "mixed step（QW_PAR_MIX）：分段 prefill 時其他對話同時 decode，段長約 %.0f ms\n", PF_MIX_MS);
     if (getenv("QW_MAX_WAIT_S")) MAX_WAIT_S = atof(getenv("QW_MAX_WAIT_S"));
     if (getenv("QW_MEM_LEVEL_MIN")) MEM_LEVEL_MIN = atoi(getenv("QW_MEM_LEVEL_MIN"));
     const double t0 = qw_now();

@@ -375,6 +375,207 @@ static void test_status(void) {
     for (int i = 0; i < 5; i++) { free(all[i]->ids); free(all[i]); }
 }
 
+// ---- 合併前綴相同的 prefill（coal_plan / pf_pick / coal_after / qw_engine_par_clip）
+// 前 shared 個 token 相同（family 決定內容），之後各自不同（seed）
+static job *coal_job(int id, int np, int shared, int family, int seed) {
+    job *j = calloc(1, sizeof *j);
+    j->id = id;
+    j->np = np;
+    j->sid = -1; // 不碰 engine（qw_engine_par_snap 對無效的 sid 直接回 false）
+    j->ids = calloc((size_t)np, sizeof(int32_t));
+    for (int i = 0; i < np; i++) j->ids[i] = i < shared ? 1000003 * family + i : 7000000 + seed * 100003 + i;
+    j->pfing = true;
+    j->t0 = 100.0 + id; // id 小的先來
+    return j;
+}
+static void coal_free(job **a, int n) { for (int i = 0; i < n; i++) { free(a[i]->ids); free(a[i]); } }
+// 模擬 pf_chunk：engine 的段尾規則（剩 ≤ ch + 64 就算到底）+ 交接點截斷；複製時從交接點接續
+static void coal_sim_chunk(job *j, int ch) {
+    if (j->coal_copy) {
+        j->pfd = 0;
+        const int bl = j->lead_at; // 領頭的在交接點記了快照（測試裡假設還在）
+        coal_after(j, bl);
+        j->pfd = bl;
+    }
+    const int start = j->pfd;
+    int end = j->np - start > ch + 64 ? start + ch : j->np;
+    end = qw_engine_par_clip(0, start, end, j->coal_pts, j->ncoal_pts, 64);
+    j->pfd = end;
+    if (j->pfd >= j->np) j->pfing = false;
+}
+
+static void test_coal_clip(void) {
+    const int pts[3] = {13952, 9000, 20000};
+    CHECK(qw_engine_par_clip(0, 4096, 12288, pts, 3, 64) == 8960); // 9000 → 8960（64 的倍數），比 13952 近
+    CHECK(qw_engine_par_clip(0, 8960, 17152, pts, 3, 64) == 13952);
+    CHECK(qw_engine_par_clip(0, 13952, 19968, pts, 3, 64) == 19968); // 20000 對齊成 19968 = 段尾：不變
+    CHECK(qw_engine_par_clip(0, 13952, 20032, pts, 3, 64) == 19968);
+    CHECK(qw_engine_par_clip(0, 13952, 16000, pts, 0, 64) == 16000); // 沒有交接點
+    CHECK(qw_engine_par_clip(100, 100, 9000, pts + 1, 1, 64) == 100 + (9000 - 100) / 64 * 64); // 照第一段的起點對齊
+    CHECK(qw_engine_par_clip(9500, 9500, 12000, pts + 1, 1, 64) == 12000); // 交接點在起點之前：不管
+}
+
+static void test_coal_plan(void) {
+    COAL_MIN = 2048;
+    st_coal = st_coal_n = 0;
+    enum { SH = 14000, NP = 16000, AT = SH / 64 * 64 };
+    job *a[4];
+    for (int i = 0; i < 4; i++) a[i] = coal_job(i + 1, NP, SH, 1, i);
+    coal_plan(a, 4);
+    CHECK(a[0]->lead == 0);
+    for (int i = 1; i < 4; i++) CHECK(a[i]->lead == 1 && a[i]->lead_at == AT && !a[i]->coal_copy);
+    CHECK(a[0]->ncoal_pts == 1 && a[0]->coal_pts[0] == AT);
+    CHECK(pf_pick(a, 4, 200) == a[0]); // 只有領頭的可以算
+    // 領頭的算到一半：還在等
+    coal_sim_chunk(a[0], 8192);
+    CHECK(a[0]->pfd == 8192);
+    coal_plan(a, 4);
+    for (int i = 1; i < 4; i++) CHECK(a[i]->lead == 1 && !a[i]->coal_copy);
+    CHECK(pf_pick(a, 4, 200) == a[0]);
+    coal_sim_chunk(a[0], 8192); // 8192 + 8192 > AT：段尾停在交接點
+    CHECK(a[0]->pfd == AT);
+    coal_plan(a, 4);
+    for (int i = 1; i < 4; i++) CHECK(a[i]->coal_copy && a[i]->coal_done);
+    CHECK(a[0]->ncoal_pts == 0);
+    // 跟的先複製（最早來的先），領頭的暫停到它們都複製完
+    for (int k = 1; k < 4; k++) {
+        job *p = pf_pick(a, 4, 200);
+        CHECK(p == a[k]);
+        if (p != a[k]) break;
+        coal_sim_chunk(p, 1024);
+        CHECK(p->lead == 0 && !p->coal_copy && p->pfd == AT + 1024);
+        coal_plan(a, 4);
+    }
+    CHECK(st_coal == 3LL * AT && st_coal_n == 3);
+    CHECK(!coal_held(a[0], a, 4));
+    coal_plan(a, 4); // 跟過一次就不再跟
+    for (int i = 1; i < 4; i++) CHECK(a[i]->lead == 0);
+    coal_free(a, 4);
+
+    // 領頭的被取消：剩下的重新選（進度相同時 id 小的當領頭）
+    job *b[3];
+    for (int i = 0; i < 3; i++) b[i] = coal_job(10 + i, NP, SH, 2, i);
+    coal_plan(b, 3);
+    CHECK(b[1]->lead == 10 && b[2]->lead == 10);
+    job *rest[2] = {b[1], b[2]};
+    coal_plan(rest, 2);
+    CHECK(b[1]->lead == 0 && b[2]->lead == 11 && b[2]->lead_at == AT);
+    CHECK(pf_pick(rest, 2, 200) == b[1]);
+    // 領頭的已經算完 prompt（在生成）：跟的那個下一段直接複製
+    b[1]->pfd = NP;
+    b[1]->pfing = false;
+    coal_plan(rest, 2);
+    CHECK(b[2]->coal_copy && pf_pick(rest, 2, 200) == b[2]);
+    coal_free(b, 3);
+
+    // 不跟：共用太短、領頭的已經過了交接點、自己的進度差不多、COAL_MIN = 0
+    job *c[2] = {coal_job(20, NP, 1000, 3, 0), coal_job(21, NP, 1000, 3, 1)};
+    coal_plan(c, 2);
+    CHECK(c[1]->lead == 0);
+    coal_free(c, 2);
+    job *d[2] = {coal_job(30, NP, SH, 4, 0), coal_job(31, NP, SH, 4, 1)};
+    d[0]->pfd = 14500;
+    coal_plan(d, 2);
+    CHECK(d[1]->lead == 0);
+    d[0]->pfd = 8192;
+    d[1]->pfd = 12800; // 進度比較多的當領頭：d[1]（12800）領、d[0] 跟（交接點 13952 ≥ 8192 + 2048）
+    coal_plan(d, 2);
+    CHECK(d[0]->lead == 31 && d[1]->lead == 0);
+    coal_free(d, 2);
+    job *f[2] = {coal_job(40, NP, SH, 5, 0), coal_job(41, NP, SH, 5, 1)};
+    COAL_MIN = 0;
+    coal_plan(f, 2);
+    CHECK(f[1]->lead == 0 && pf_pick(f, 2, 200) == f[0]);
+    COAL_MIN = 2048;
+    // 自己是整個 prompt 都相同（重試）：交接點留最後一個 token 自己算
+    job *g[2] = {coal_job(50, NP, NP, 6, 0), coal_job(51, NP, NP, 6, 0)};
+    coal_plan(g, 2);
+    CHECK(g[1]->lead == 50 && g[1]->lead_at == (NP - 1) / 64 * 64);
+    coal_free(f, 2);
+    coal_free(g, 2);
+}
+
+// 隨機模擬：幾組前綴相同的 prompt 同時進來、隨機取消。有人在 prefill 時一定選得出一個（不會卡死），每個都算完，
+// 而且共用前綴只算一次左右
+static void test_coal_sim(void) {
+    COAL_MIN = 2048;
+    unsigned rs = 12345;
+    for (int round = 0; round < 200; round++) {
+        st_coal = st_coal_n = 0;
+        const int n = 2 + (int)((rs = rs * 1103515245u + 12345u) >> 16) % 14;
+        job *a[16];
+        int alive = n, id0 = 1000 * round;
+        long long naive = 0;
+        for (int i = 0; i < n; i++) {
+            rs = rs * 1103515245u + 12345u;
+            const int fam = (int)(rs >> 16) % 3, np = 6000 + (int)(rs >> 8) % 20000, sh = fam == 0 ? 0 : 3000 + fam * 5000;
+            a[i] = coal_job(id0 + i, np, sh < np ? sh : np, fam, round * 100 + i);
+            naive += np;
+        }
+        long long computed = 0;
+        int it = 0;
+        for (; alive && it < 10000; it++) {
+            coal_plan(a, alive);
+            job *p = pf_pick(a, alive, 200 + it);
+            int npf = 0;
+            for (int i = 0; i < alive; i++) npf += a[i]->pfing;
+            if (npf && !p) { CHECK(!"pf_pick: 有人在 prefill 卻選不出來（卡死）"); break; }
+            if (p) {
+                CHECK(!coal_waiting(p));
+                const int d0 = p->coal_copy ? p->lead_at : p->pfd;
+                coal_sim_chunk(p, 1024 + 64 * (it % 7));
+                computed += p->pfd - d0;
+            }
+            rs = rs * 1103515245u + 12345u;
+            int keep = 0;
+            for (int i = 0; i < alive; i++) { // 算完的離開；偶爾取消一個
+                const bool cancel = (rs >> 20) % 97 == 0 && i == (int)(rs >> 8) % alive;
+                if (!a[i]->pfing || cancel) { free(a[i]->ids); free(a[i]); }
+                else a[keep++] = a[i];
+            }
+            alive = keep;
+        }
+        CHECK(!alive);
+        CHECK(computed <= naive);
+        if (round < 3) fprintf(stderr, "[coal] %d 個請求：直接算 %lld 個 token，合併後算 %lld 個（複製 %lld 個，%lld 個跟過）\n", n, naive, computed, st_coal, st_coal_n);
+        coal_free(a, alive);
+    }
+}
+
+// /status：請求結束時 output_tokens 與 active[].generated 同時換手（Σ 不跳）
+static void test_status_handoff(void) {
+    PAR = 4;
+    job *a = fake_job(100, 100), *b = fake_job(100, 100);
+    a->id = 61; b->id = 62;
+    a->sid = b->sid = -1;
+    a->st.prompt = b->st.prompt = 100;
+    a->inb = b->inb = true;
+    a->g.model = b->g.model = "m";
+    conn c;
+    conn_init(&c, -1);
+    a->c = b->c = &c;
+    a->got = 300; // 含思考與收尾的 token：生成的每個 token 都在 got 裡
+    b->got = 20;
+    job *act[2] = {a, b};
+    st_publish(act, 2, "batch");
+    pthread_mutex_lock(&st_mu);
+    long long live0 = 0;
+    for (int i = 0; i < st_n; i++) live0 += st_job[i].got;
+    const long long sum0 = st_out + live0;
+    pthread_mutex_unlock(&st_mu);
+    par_done(a, QW_FIN_STOP); // 還沒有下一次 st_publish
+    pthread_mutex_lock(&st_mu);
+    long long live1 = 0;
+    for (int i = 0; i < st_n; i++) live1 += st_job[i].got;
+    CHECK(st_out + live1 == sum0);
+    CHECK(st_n == 1 && st_job[0].id == 62);
+    pthread_mutex_unlock(&st_mu);
+    CHECK(a->out_moved && a->st.gen == 300);
+    st_n = 0;
+    conn_free(&c);
+    free(a->ids); free(a); free(b->ids); free(b);
+}
+
 int main(int argc, char **argv) {
     test_reminder_end();
     test_toolset_diverge();
@@ -387,6 +588,10 @@ int main(int argc, char **argv) {
     test_retry_after_header();
     test_sched_params();
     test_status();
+    test_coal_clip();
+    test_coal_plan();
+    test_coal_sim();
+    test_status_handoff();
     fprintf(stderr, fails ? "%d FAILED\n" : "all ok\n", fails);
     return fails != 0;
 }

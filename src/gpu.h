@@ -55,6 +55,11 @@ double qw_batch_end(qw_batch *b);
 // 分開的版本：submit 只送出（不等）；wait 等完成、回傳 GPU 時間並釋放 batch
 void qw_batch_submit(qw_batch *b);
 double qw_batch_wait(qw_batch *b);
+// 已 submit 的 batch 是否已在 GPU 上跑完（不等待；之後仍要 qw_batch_wait 釋放）
+bool qw_batch_poll(qw_batch *b);
+// 之後 qw_batch_begin 用哪條串流：0（預設）或 1（另一個 command queue 與 event 鏈）。兩條串流的工作互不等待、GPU 可同時執行，
+// 所以同時在跑的兩邊不能寫同一個 buffer（也不能一邊寫、一邊讀）；同一條串流裡照送出順序執行
+void qw_gpu_set_stream(qw_gpu *g, int s);
 
 // Profiling：之後開始的 batch 每個 dispatch 用獨立 encoder，前後各取一次 GPU 時間戳。
 // qw_batch_end 後可用 qw_profile_count / qw_profile_get 取出每個 dispatch 的 kernel 名稱與 GPU 時間（µs）。

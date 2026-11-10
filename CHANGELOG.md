@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.7.0 — 2026-11-10
+
+Subagents launched together no longer prefill the same prefix again and again, and a server that dies leaves a reason in the log. Engine output unchanged: on the original IQ3_S GGUF, default, INT8 and speculative outputs are bit-identical to 1.6.1 (and so to 1.0.0); concurrent output is bit-identical to running alone.
+
+### Shared prefixes among concurrent prompts
+- When prompts in sliced prefill share at least 2,048 tokens (`QW_COAL_MIN`, 0 disables), the shared part is prefilled once: a leader stops at the shared boundary and saves a snapshot there, followers copy it and prefill only their own suffix. Outputs are bit-identical to prefilling each alone.
+- 8 prompts sent together sharing a 20.5K-token prefix: 104.2 s → 37.7 s; 7 × 20,544 tokens copied instead of recomputed.
+- Admission control subtracts the prefix shared with prompts in flight, so followers are not refused with 529.
+- `/status`: `coalesced_tokens`, `coalesced_requests`, `active[].follows`.
+
+### Diagnostics
+- On SIGSEGV / SIGBUS / SIGILL / SIGFPE / SIGABRT / SIGTRAP / SIGTERM / SIGINT / SIGHUP / SIGXCPU / SIGXFSZ and on exit, the server writes a last line to its log with the time, signal details, its memory footprint and the system memory level; fatal signals add a stack trace and still produce the OS crash report. The footprint and memory level are also logged when they change notably and at every memory action. A SIGKILL (e.g. from the OS under memory pressure) cannot be caught.
+
+### Dashboard
+- The output rate no longer spikes when a request finishes: finished output now moves from the active list to the totals atomically.
+
+### Experimental, off by default
+- `QW_PAR_MIX=1`: run a prefill segment and the batched decode of other conversations at the same time on two GPU queues (bit-identical results). On the M5 Max the GPU barely overlaps them (decode made 2.2 steps/s during a prefill, prefill slowed 15%), so the default alternation stays.
+
 ## 1.6.1 — 2026-11-10
 
 Dashboard wording and layout only.

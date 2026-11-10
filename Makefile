@@ -81,8 +81,12 @@ $(BUILD)/chatcheck: tools/chatcheck.c src/chat.c src/chat.h src/json.c src/json.
 $(BUILD)/chattest: tools/chattest.c src/chat.c src/chat.h src/json.c src/json.h src/tok.c src/tok.h src/unicode_tab.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/chattest.c src/chat.c src/json.c src/tok.c -o $@
 
-$(BUILD)/qwental-serve: tools/serve.c tools/dashboard.html src/chat.c src/chat.h $(ENGINE_DEP) $(BUILD)/gpu_metal.o | $(BUILD)
+$(BUILD)/qwental-serve: tools/serve.c tools/diag.h tools/dashboard.html src/chat.c src/chat.h $(ENGINE_DEP) $(BUILD)/gpu_metal.o | $(BUILD)
 	$(CC) $(CFLAGS) tools/serve.c src/chat.c $(ENGINE_SRC) $(BUILD)/gpu_metal.o -o $@ $(LDLIBS)
+
+# tools/diag.h 的測試（送 signal 給子程序，看遺言與結束狀態；不用 GPU / 模型）
+$(BUILD)/diagcheck: tools/diagcheck.c tools/diag.h | $(BUILD)
+	$(CC) $(CFLAGS) tools/diagcheck.c -o $@
 
 $(BUILD)/dispatch: bench/dispatch.c $(BUILD)/gpu_metal.o src/gpu.h | $(BUILD)
 	$(CC) $(CFLAGS) bench/dispatch.c $(BUILD)/gpu_metal.o -o $@ $(LDLIBS)

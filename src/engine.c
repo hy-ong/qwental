@@ -4486,7 +4486,12 @@ static void prof_dump(qw_engine *e, const char *title) {
     for (int i = 0; i < na; i++) fprintf(stderr, "  %-34s %5d  %8.3f ms  %5.1f%%\n", nm[i], cnt[i], us[i] / 1e3, us[i] / tot * 100);
 }
 
+static bool mix_on(const qw_engine *e);              // mixed step（qw_engine_par_mix）：這段 prefill 跑的同時讓其他對話 decode
+static bool mix_busy;                                // mixed step 的 decode 迴圈中（不能再開始 prefill：p* 暫存正在用）
+static int mix_sid = -1;                             // mixed step 中正在 prefill 的 slot（decode 不能碰）
+static double mix_wait(qw_engine *e, qw_batch *b); // 已 submit 的 b 跑完之前反覆 decode；回傳 b 的 GPU 秒數
 static double pf_segment(qw_engine *e, const int32_t *ids, uint32_t T, float *dump) {
+    if (mix_busy) { fprintf(stderr, "mixed step：decode 迴圈裡不能 prefill\n"); return -1; }
     const double tseg0 = qw_now();
     const uint32_t pos0 = (uint32_t)e->pos;
     const bool prof = getenv("QW_PF_PROF") && (int)pos0 + (int)T >= atoi(getenv("QW_PF_PROF"));
@@ -4563,13 +4568,18 @@ static double pf_segment(qw_engine *e, const int32_t *ids, uint32_t T, float *du
     const qw_ple *Pn = NULL;
     if (e->pf_nx_T > 0 && !prof && !skip("ple"))
         for (int l = 0; l < stop && !Pn; l++) if (e->m->layers[l].has_ple) Pn = &e->m->layers[l].ple;
+    const bool mix = !prof && mix_on(e);
     if (Pn) { // 下一段的 n-gram 列在 GPU 跑這段時抄（列在 32 GB 的 mmap 表裡，冷的時候一段要 1–2 秒）
         qw_batch_submit(b);
         int32_t *tkn = e->tok.ptr; // 下一段的 token 先放進 tok（這段的 kernel 只讀到 pos0 + T + 2 為止，該位置的值相同）
         for (int t2 = 0; t2 < e->pf_nx_T; t2++) tkn[pos0 + T + 2 + t2] = e->pf_nx_ids[t2];
         ng_prefetch(e, Pn, (int)(pos0 + T + 2), e->pf_nx_T);
-        t = qw_batch_wait(b);
+        if (mix) ng_prefetch_wait(e); // 背景抄列時才讀 e->tok / e->ngX：mixed step 換 slot、換暫存之前先等它抄完
+        t = mix ? mix_wait(e, b) : qw_batch_wait(b);
         ng_prefetch_wait(e);
+    } else if (mix) {
+        qw_batch_submit(b);
+        t = mix_wait(e, b);
     } else t = qw_batch_end(b);
     dn_tap_flush(e);
     if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[t] pf_segment T=%u：編碼 %.1f ms、等待 %.1f ms、GPU %.1f ms\n", T, (te0 - tseg0) * 1e3, (qw_now() - te0) * 1e3, t * 1e3);
@@ -8314,19 +8324,39 @@ static int xs_copy(qw_engine *e, int sid, const int32_t *prompt, int np, int hav
 }
 static int pf0[QW_PAR_MAX]; // 分段 prefill：這個 slot 第一段從哪裡開始（檢查點位置照整段算）
 static int par_pp[8], par_npp; // 持久化點（qw_engine_par_persist 設定，給下一個 prompt 用）
+static int par_sp[QW_PAR_SNAPAT_MAX], par_nsp; // 共用前綴的交接點（qw_engine_par_snapat；只存記憶體裡的快照，不寫 SSD）
+static int par_xs_n; // 上一次 par_prefill_to 從別的 slot 複製了幾個 token（qw_engine_par_copied）
 void qw_engine_par_persist(qw_engine *e, const int *pos, int n) {
     (void)e;
     par_npp = 0;
+    par_nsp = 0; // 交接點每次另外設（qw_engine_par_snapat 要在這之後呼叫）
     for (int i = 0; i < n && par_npp < 8; i++) par_pp[par_npp++] = pos[i];
+}
+void qw_engine_par_snapat(qw_engine *e, const int *pos, int n) {
+    (void)e;
+    par_nsp = 0;
+    for (int i = 0; i < n && par_nsp < QW_PAR_SNAPAT_MAX; i++) par_sp[par_nsp++] = pos[i];
+}
+int qw_engine_par_copied(qw_engine *e) { (void)e; return par_xs_n; }
+// 段尾停在第一個交接點：pts 裡的位置照 s0 起算對齊到 cc（GDN 分塊）的倍數 a，start < a < end 的最小的 a 當新的段尾
+// （a 是合法的分段點：與一次算完逐位元相同）。a − start < cc 不會發生（start 也是從 s0 起算的分段點）
+int qw_engine_par_clip(int s0, int start, int end, const int *pts, int n, int cc) {
+    int out = end;
+    for (int k = 0; k < n; k++) {
+        if (pts[k] <= s0) continue;
+        const int a = s0 + (pts[k] - s0) / cc * cc;
+        if (a > start && a < out) out = a;
+    }
+    return out;
 }
 static bool par_pf_plan(qw_engine *e, int sid, int np, int start, int end) { // 回傳 true：end 本身是檢查點（段尾另外存）
     const int s0 = pf0[sid];
-    int cks[12], nck = 0;
+    int cks[3 + 8 + QW_PAR_SNAPAT_MAX], nck = 0;
     const int back[3] = {2048, 512, 128}, minnew[3] = {4096, 4096, 512};
     for (int k = 0; k < 3; k++)
         if (np - s0 > minnew[k] && np - back[k] > s0 + 64 && (nck == 0 || np - back[k] > cks[nck - 1] + 32)) cks[nck++] = np - back[k];
-    for (int k = 0; k < par_npp; k++) { // 持久化點（例如 system 訊息結尾）：也存快照，算完寫到 SSD
-        const int pp = par_pp[k];
+    for (int k = 0; k < par_npp + par_nsp; k++) { // 持久化點（例如 system 訊息結尾）與交接點：也存快照（持久化點算完寫到 SSD）
+        const int pp = k < par_npp ? par_pp[k] : par_sp[k - par_npp];
         bool dup = pp <= s0 || pp >= np;
         for (int q = 0; q < nck; q++) dup |= cks[q] == pp;
         if (!dup) cks[nck++] = pp;
@@ -8339,7 +8369,8 @@ static bool par_pf_plan(qw_engine *e, int sid, int np, int start, int end) { // 
     e->npf_snap = 0;
     for (int k = 0; k < nck; k++) {
         const int a = s0 + (cks[k] - s0) / CC * CC;
-        if (a > start && a < end && (e->npf_snap == 0 || e->pf_snap[e->npf_snap - 1] != a)) e->pf_snap[e->npf_snap++] = a;
+        if (a > start && a < end && e->npf_snap < (int)(sizeof e->pf_snap / sizeof *e->pf_snap) && (e->npf_snap == 0 || e->pf_snap[e->npf_snap - 1] != a))
+            e->pf_snap[e->npf_snap++] = a;
         if (a == end && end < np) at_end = true;
     }
     return at_end;
@@ -8363,7 +8394,10 @@ const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prom
     char derr[256];
     const bool tapdf = par_dfslot(e) && df_init(e, derr, sizeof derr) && e->dfKr.ptr; // GGUF：prompt 最後一個視窗的特徵寫進這個對話的環狀 KV
     if (*done > 0 && *done < np && e->pos == *done && e->kvlen == *done && !memcmp(e->kvtok, prompt, sizeof(int32_t) * (size_t)*done)) {
-        const int start = *done, end = chunk > 0 && np - start > chunk + 64 ? start + chunk : np;
+        const int start = *done;
+        int end = chunk > 0 && np - start > chunk + 64 ? start + chunk : np;
+        end = qw_engine_par_clip(pf0[sid], start, end, par_sp, par_nsp, gdn_chunk()); // 交接點：段尾停在那裡（快照在段尾存）
+        par_xs_n = 0;
         memcpy(e->kvtok, prompt, sizeof(int32_t) * (size_t)end);
         e->kvlen = end;
         const bool ck = par_pf_plan(e, sid, np, start, end);
@@ -8388,7 +8422,8 @@ const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prom
         if (e->snap[i].len > common) e->snap[i].len = 0;
         if (e->snap[i].len > 0 && e->snap[i].len <= np - 1 && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
     }
-    if (!getenv("QW_NO_CACHE") && xs_copy(e, sid, prompt, np, best >= 0 ? e->snap[best].len : 0) > 0) { // 別的 slot 有更長的前綴
+    par_xs_n = 0;
+    if (!getenv("QW_NO_CACHE") && (par_xs_n = xs_copy(e, sid, prompt, np, best >= 0 ? e->snap[best].len : 0)) > 0) { // 別的 slot 有更長的前綴
         best = -1;
         for (int i = 0; i < CKMAX; i++)
             if (e->snap[i].len > 0 && e->snap[i].len <= np - 1 && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
@@ -8411,7 +8446,8 @@ const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prom
     if (cached) *cached = start;
     // 分段時 qw_engine_prefill 每次只預留這一段：第一段就照整個 prompt 預留，KV 一次到位（1.25 倍成長下逐段擴大會多搬好幾次整份 KV）
     kv_reserve(e, np + 2 * VBMAX + 8 < e->max_ctx ? np + 2 * VBMAX + 8 : e->max_ctx);
-    const int end = chunk > 0 && np - start > chunk + 64 ? start + chunk : np;
+    int end = chunk > 0 && np - start > chunk + 64 ? start + chunk : np;
+    if (end - start > 16) end = qw_engine_par_clip(start, start, end, par_sp, par_nsp, gdn_chunk()); // 交接點：段尾停在那裡
     memcpy(e->kvtok, prompt, sizeof(int32_t) * (size_t)end);
     e->kvlen = end;
     e->df_tapping = false;
@@ -8515,6 +8551,7 @@ static int par_split(int B, int *g) {
 }
 const float *qw_engine_par_step(qw_engine *e, const int *sids, const int32_t *toks, int B, double *gpu_ms) {
     if (B < 1 || B > QW_PAR_MAX) return NULL;
+    for (int i = 0; mix_busy && i < B; i++) if (sids[i] == mix_sid) return NULL; // mixed step：prefill 中的 slot 不能 decode
     int grp[QW_PAR_MAX];
     const int ng = par_split(B, grp);
     if (ng == 1) return par_step8(e, sids, toks, B, gpu_ms);
@@ -8762,6 +8799,83 @@ static const float *par_step8(qw_engine *e, const int *sids, const int32_t *toks
         if (!tapdf) e->slots[sids[i]].dfdone = 0; // 沒寫特徵：環狀 KV 接不上了
     }
     return e->blg.ptr;
+}
+
+// ---- mixed step（並發模式；serve 以 QW_PAR_MIX 開啟）：分段 prefill 的一段在 GPU 上跑的同時，其他對話照常一起 decode。
+// prefill 算力受限（矩陣單元）、一起 decode 頻寬受限（每步讀一次全部權重），兩者在 GPU 上重疊。
+// 不把 decode 的列併進 prefill 的矩陣（prefill 的 qmm 分塊 / 累加順序與 decode 的 qmv 不同 → 結果不再逐位元相同），
+// 而是兩邊各用原本的 kernel、原本的算式：prefill 這段照常編碼、送到串流 0，decode 每一步（qw_engine_par_step）送到串流 1
+// （另一個 command queue 與 event 鏈，兩條互不等待）。所以 prefill 與 decode 的結果都與分開跑逐位元相同，前提是同時在跑的兩邊
+// 不寫同一個 buffer：
+//   - 各 slot 的 KV、token 歷史、DeltaNet / conv / PLE 狀態本來就分開（par_use 換的是 slot 自己的 buffer；prefill 已綁定的不受影響）
+//   - prefill 的暫存（p*、gW…、分塊 GDN 等）與一起 decode 的暫存（b*、q3*/q4*/q5*、gg*、dncnt…）本來就不重疊
+//   - 兩邊共用的只有下面 mix_fields 這些單列暫存（prefill 段尾 hyper_in + lm_head 寫 h / x / logits…；decode 的 PLE 用 h、
+//     n-gram 列 ngW / ngS / ngB / ngX 由 CPU 在編碼時寫入；ssp 兩邊的 DeltaNet / attention 都寫）：decode 迴圈期間換成另一份
+//   - DFlash2 的暫存（dftap…）：decode 迴圈期間不寫特徵（par_keepdf 暫時關；只影響一起推測解碼的猜測上下文，不影響輸出）
+// 換 slot 的 CPU 狀態（e->pos、kvlen、snap…）由 par_use 存回 / 載入；迴圈結束後換回 prefill 的 slot，pf_segment 照常收尾。
+static qw_mix_fn mix_fn;
+static void *mix_ctx;
+void qw_engine_par_mix(qw_engine *e, qw_mix_fn fn, void *ctx) { (void)e; mix_fn = fn; mix_ctx = ctx; }
+enum { MIX_NF = 16 };
+static void mix_fields(qw_engine *e, qw_buf **f) {
+    qw_buf *a[MIX_NF] = {&e->h, &e->nh, &e->nf, &e->d, &e->d2, &e->u, &e->x, &e->inj, &e->inj2, &e->out, &e->logits, &e->ssp,
+                         &e->ngW, &e->ngS, &e->ngB, &e->ngX};
+    memcpy(f, a, sizeof a);
+}
+static qw_buf mix_sh[MIX_NF]; // 另一份（與 mix_fields 一一對應）
+static void mix_swap(qw_engine *e) {
+    qw_buf *f[MIX_NF];
+    mix_fields(e, f);
+    for (int i = 0; i < MIX_NF; i++)
+        if (f[i]->ptr && mix_sh[i].ptr) { const qw_buf t = *f[i]; *f[i] = mix_sh[i]; mix_sh[i] = t; }
+}
+static bool mix_alloc(qw_engine *e) { // 另一份單列暫存（至少與目前的一樣大；decode 迴圈期間 e 的欄位指向這一份）
+    qw_buf *f[MIX_NF];
+    mix_fields(e, f);
+    for (int i = 0; i < MIX_NF; i++) {
+        if (!f[i]->ptr || mix_sh[i].size >= f[i]->size) continue;
+        if (mix_sh[i].ptr) qw_buf_free(&mix_sh[i]);
+        if (!alloc(e, &mix_sh[i], f[i]->size)) { memset(&mix_sh[i], 0, sizeof mix_sh[i]); return false; }
+    }
+    return true;
+}
+static bool mix_on(const qw_engine *e) {
+    return mix_fn && !mix_busy && par_cur >= 0 && e->m->lin_tiled && e->m->embed_gq && !e->dn_pmask && !trace_on();
+}
+static double mix_wait(qw_engine *e, qw_batch *b) {
+    const int P = par_cur;
+    if (!mix_alloc(e)) return qw_batch_wait(b);
+    const double t0 = qw_now();
+    const bool kd = par_keepdf, dft = e->df_tapping;
+    const int dff = e->df_ctx_from;
+    double pc[VBMAX + 1];
+    int ps[VBMAX + 1];
+    memcpy(pc, par_cost, sizeof pc); // 量到的一步時間含重疊（變慢）：不算進分組用的估計
+    memcpy(ps, par_seen, sizeof ps);
+    mix_swap(e);
+    par_keepdf = false;
+    mix_sid = P;
+    mix_busy = true;
+    qw_gpu_set_stream(e->g, 1);
+    int n = 0;
+    while (!qw_batch_poll(b) && mix_fn(mix_ctx)) n++;
+    qw_gpu_set_stream(e->g, 0);
+    mix_busy = false;
+    mix_sid = -1;
+    const double t1 = qw_now();
+    const double t = qw_batch_wait(b);
+    mix_swap(e);
+    memcpy(par_cost, pc, sizeof pc);
+    memcpy(par_seen, ps, sizeof ps);
+    par_keepdf = kd;
+    if (par_cur != P && !par_use(e, P)) { fprintf(stderr, "mixed step：換回 prefill 的 slot %d 失敗\n", P); return -1; }
+    e->df_tapping = dft;
+    e->df_ctx_from = dff;
+    e->pending = false;
+    if (getenv("QW_PAR_PROF"))
+        fprintf(stderr, "[mix] prefill 一段 GPU %.1f ms；期間 decode %d 步（%.1f ms），之後再等 %.1f ms\n", t * 1e3, n, (t1 - t0) * 1e3,
+                (qw_now() - t1) * 1e3);
+    return t;
 }
 
 // ---- 並發推測解碼：B 個對話各驗證 n[i] 個 token（第一個是確定的、其餘是猜測），共 R = Σn[i] ≤ VBMAX 列，共用權重的部分一起讀

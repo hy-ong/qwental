@@ -20,6 +20,35 @@ static uint64_t par_hash(const float *l) { uint64_t h = 1469598103934665603ull; 
 typedef struct { int n; int32_t *o; } par_col;
 static bool par_cb(void *c, int32_t t) { par_col *q = c; q->o[q->n++] = t; return true; }
 
+// QW_PAR + QW_PAR_MIX=檔案：mixed step 的檢查。分段 prefill 這個長 prompt（每段 QW_PAR_MIX_CHUNK，預設 4096）的同時，
+// QW_PAR 的對話在 engine 的回呼（mix_cb）裡一起 decode；decode 每步的 logits、長 prompt 最後的 logits 都要與單獨跑逐位元相同
+enum { PM = 64 };
+static struct {
+    qw_engine *e;
+    int B, N, k, steps;
+    int *sid, *lgbad;
+    int32_t *last, (*ref)[4096], (*got)[4096];
+    uint64_t (*rh)[4096];
+    bool skip_ref;
+} mxs;
+static bool mix_cb(void *c) {
+    (void)c;
+    if (mxs.k >= mxs.N) return false;
+    const float *bl = qw_engine_par_step(mxs.e, mxs.sid, mxs.last, mxs.B, NULL);
+    if (!bl) { fprintf(stderr, "mixed step：par_step 失敗\n"); return false; }
+    const int k = mxs.k;
+    for (int i = 0; i < mxs.B; i++) {
+        const float *r = bl + (size_t)i * 248320;
+        if (!mxs.skip_ref && mxs.lgbad[i] < 0 && mxs.got[i][k - 1] == mxs.ref[i][k - 1] && par_hash(r) != mxs.rh[i][k]) mxs.lgbad[i] = k;
+        int bst = 0;
+        for (int v = 1; v < 248320; v++) if (r[v] > r[bst]) bst = v;
+        mxs.got[i][k] = mxs.last[i] = bst;
+    }
+    mxs.k++;
+    mxs.steps++;
+    return true;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "用法：%s token,token,...|@檔案 [生成數量] [dump 目錄]（QW_CTX=最大 context，預設 4096）\n", argv[0]);
@@ -185,7 +214,6 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (getenv("QW_PAR")) { // QW_PAR=檔案,檔案,…（各一個 prompt 的 token id）：先各自單獨 greedy（原本的路徑），再一起並發 greedy，逐 token 比較
-        enum { PM = 64 };
         int32_t *pid[PM]; int pn[PM], B = 0;
         char *lst = strdup(getenv("QW_PAR"));
         for (char *f = strtok(lst, ","); f && B < PM; f = strtok(NULL, ",")) {
@@ -212,6 +240,26 @@ int main(int argc, char **argv) {
                 ref[i][k] = bst;
                 if (k + 1 < N) l0 = qw_engine_step(e, bst, NULL);
             }
+        }
+        int32_t *mid = NULL; // QW_PAR_MIX：長 prompt（單獨 prefill 一次當基準：最後的 logits 雜湊、時間）
+        int mn = 0;
+        uint64_t mref = 0;
+        double mt_alone = 0;
+        if (getenv("QW_PAR_MIX")) {
+            FILE *fp = fopen(getenv("QW_PAR_MIX"), "rb");
+            if (!fp) { fprintf(stderr, "開不了 %s\n", getenv("QW_PAR_MIX")); return 1; }
+            mid = malloc(sizeof(int32_t) * 1000000);
+            long v; char c;
+            while (mn < 1000000 && fscanf(fp, "%ld", &v) == 1) { mid[mn++] = (int32_t)v; if (fscanf(fp, "%c", &c) != 1) break; }
+            fclose(fp);
+            qw_engine_reset(e);
+            double pm = 0;
+            const double t1 = qw_now();
+            const float *l0 = qw_engine_prefill(e, mid, mn, NULL, &pm);
+            mt_alone = qw_now() - t1;
+            if (!l0) { fprintf(stderr, "長 prompt 單獨 prefill 失敗\n"); return 1; }
+            mref = par_hash(l0);
+            printf("長 prompt %d 個 token：單獨 prefill %.0f ms（%.0f tok/s）\n", mn, mt_alone * 1e3, mn / mt_alone);
         }
         int lgbad[PM];
         for (int i = 0; i < PM; i++) lgbad[i] = -1;
@@ -319,9 +367,34 @@ int main(int argc, char **argv) {
             qw_engine_close(e);
             return 0;
         }
+        int k0 = 1;
+        if (mid) { // 分段 prefill 長 prompt；每段在 GPU 上跑的同時，engine 反覆呼叫 mix_cb（B 個對話一起 decode 一步）
+            if (N > 4096) { fprintf(stderr, "QW_PAR_MIX：生成數最多 4096\n"); return 1; }
+            const int msid = qw_engine_par_pick(e, mid, mn, busy);
+            if (msid < 0) { fprintf(stderr, "沒有空的 slot 給長 prompt（QW_SLOTS 至少 %d）\n", B + 1); return 1; }
+            const int ch = getenv("QW_PAR_MIX_CHUNK") ? atoi(getenv("QW_PAR_MIX_CHUNK")) / 64 * 64 : 4096;
+            mxs = (typeof(mxs)){.e = e, .B = B, .N = N, .k = 1, .sid = sid, .lgbad = lgbad, .last = last, .ref = ref, .got = got, .rh = rh,
+                                .skip_ref = skip_ref};
+            int done = 0, cached = 0, segs = 0;
+            const float *ml = NULL;
+            const double t1 = qw_now();
+            while (done < mn) {
+                const int d0 = done;
+                qw_engine_par_mix(e, getenv("QW_PAR_MIX_OFF") ? NULL : mix_cb, NULL); // QW_PAR_MIX_OFF：同樣的分段、不重疊（對照）
+                ml = qw_engine_par_prefill_to(e, msid, mid, mn, ch > 0 ? ch : 4096, &done, segs ? NULL : &cached);
+                qw_engine_par_mix(e, NULL, NULL);
+                if (!ml || done <= d0) { fprintf(stderr, "長 prompt 分段 prefill 失敗\n"); return 1; }
+                segs++;
+            }
+            const double tm = qw_now() - t1;
+            printf("長 prompt（slot %d，重用 %d）：分段 %d 段、%.0f ms（%.0f tok/s，單獨 %.0f tok/s）；最後的 logits %s；期間 decode %d 步（%.1f 步/秒）\n",
+                   msid, cached, segs, tm * 1e3, (mn - cached) / tm, mn / mt_alone,
+                   par_hash(ml) == mref ? "與單獨跑逐位元相同 ✓" : "不同 ✗", mxs.steps, mxs.steps / tm);
+            k0 = mxs.k;
+        }
         double gsum = 0, tw = qw_now();
-        for (int k = 1; k < N; k++) {
-            if (k == 2) { tw = qw_now(); gsum = 0; } // 第一步含 kernel 編譯，不算
+        for (int k = k0; k < N; k++) {
+            if (k == k0 + 1) { tw = qw_now(); gsum = 0; } // 第一步含 kernel 編譯，不算
             double gm = 0;
             const float *bl = qw_engine_par_step(e, sid, last, B, &gm);
             if (!bl) { fprintf(stderr, "par_step 失敗\n"); return 1; }
@@ -367,8 +440,9 @@ int main(int argc, char **argv) {
             else if (lgbad[i] >= 0) printf("對話 %d（slot %d，prompt %d）：前 %d / %d 個 token 相同，logits 從第 %d 步起不同 ✗\n", i, sid[i], pn[i], same, N, lgbad[i]);
             else printf("對話 %d（slot %d，prompt %d）：%d 個 token、每步 logits 都與單獨跑逐位元相同%s\n", i, sid[i], pn[i], N, same == N ? " ✓" : "（token 卻不同？）✗");
         }
-        printf("並發 %d：prefill 共 %.0f ms；decode %d 步，每步 GPU %.2f ms、牆鐘 %.2f ms → 總共 %.1f tok/s（每個對話 %.1f）\n", B, tp * 1e3, N - 1,
-               gsum / (N - 2), tw * 1e3 / (N - 2), B * (N - 2) / tw, (N - 2) / tw);
+        const int ns = N - k0 - 1 > 0 ? N - k0 - 1 : 1; // 計時的步數（第一步不算）
+        printf("並發 %d：prefill 共 %.0f ms；decode %d 步，每步 GPU %.2f ms、牆鐘 %.2f ms → 總共 %.1f tok/s（每個對話 %.1f）\n", B, tp * 1e3, N - k0,
+               gsum / ns, tw * 1e3 / ns, B * ns / tw, ns / tw);
         qw_engine_close(e);
         return 0;
     }

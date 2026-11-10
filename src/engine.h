@@ -1,7 +1,7 @@
 // Qwental 推論 engine（目前：decode 路徑，一次一個 token；prompt 也逐個 token 餵入）
 #pragma once
 
-#define QW_VERSION "1.6.1"
+#define QW_VERSION "1.7.0"
 #include <stdbool.h>
 #include <stdint.h>
 #include "gpu.h"
@@ -81,6 +81,13 @@ int qw_engine_par_pick(qw_engine *e, const int32_t *prompt, int np, unsigned lon
 const float *qw_engine_par_prefill(qw_engine *e, int sid, const int32_t *prompt, int np, int *cached); // 回傳最後位置的 logits
 const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prompt, int np, int chunk, int *done, int *cached); // 分段：一次最多 chunk 個，*done = 算到哪（> 0 從那裡接著算）
 void qw_engine_par_persist(qw_engine *e, const int *pos, int n); // 接下來的 par_prefill 處理到這些位置時把狀態存到 SSD（同 qw_gen.persist）
+// 共用前綴的交接點（serve 合併同時進來、前綴相同的 prompt）：接下來的 par_prefill_to 算到這些位置時段尾停在那裡、記快照（只在記憶體，不寫 SSD），
+// 別的 slot 的 par_prefill_to 再由 xs_copy 複製過去。位置照這組 slot 第一段的起點對齊到 GDN 分塊（合法的分段點：結果與一次算完逐位元相同）。
+// 每次 qw_engine_par_persist 都會清掉，要在它之後呼叫；最多 QW_PAR_SNAPAT_MAX 個
+enum { QW_PAR_SNAPAT_MAX = 4 };
+void qw_engine_par_snapat(qw_engine *e, const int *pos, int n);
+int qw_engine_par_copied(qw_engine *e); // 上一次 par_prefill_to 從別的 slot 複製了幾個 token 的前綴（0 = 沒有）
+int qw_engine_par_clip(int s0, int start, int end, const int *pts, int n, int cc); // 純函式（測試用）：pts 對齊後落在 (start, end) 的最小位置，沒有就是 end
 const float *qw_engine_par_step(qw_engine *e, const int *sids, const int32_t *toks, int B, double *gpu_ms); // [B][vocab] logits
 void qw_engine_par_finish(qw_engine *e, int sid, const int32_t *gen, int ngen); // 生成結束：存快照給下次接續
 int qw_engine_par_solo(qw_engine *e, int sid, const int32_t *prompt, int np, const qw_gen *g, qw_tok_cb cb, void *ctx,
@@ -103,6 +110,12 @@ int qw_engine_par_vaccept(qw_engine *e, const int *acc, const int32_t *nx); // �
 int qw_engine_par_vdraft(qw_engine *e, const int *sids, const int32_t *anchors, int B); // 各對話從目前位置、anchor 猜一塊
 void qw_engine_par_keepdf(qw_engine *e, bool on); // 一起 decode 時也維持各對話的 DFlash2 上下文（之後要換成一起推測解碼時用）
 int qw_engine_par_draft(qw_engine *e, int sid, int32_t *dr, float *pr); // 這個對話最近一次的猜測（回傳個數；pr = 各位置的信心）
+// mixed step（實驗）：設定之後，qw_engine_par_prefill_to 的每一段 prefill 送到 GPU 後、跑完之前，engine 反覆呼叫 fn(ctx)；
+// fn 只能做一次 qw_engine_par_step（不含正在 prefill 的 slot）、取樣與送出 token（含 qw_engine_par_finish），不能 prefill / 驗證 / 猜測；
+// 回傳 false = 沒有要 decode 的了。decode 走第二條 GPU 串流與 prefill 同時執行，兩邊結果都與分開跑逐位元相同（只支援 GGUF；
+// 其他情況照舊不重疊）。fn = NULL 關閉
+typedef bool (*qw_mix_fn)(void *ctx);
+void qw_engine_par_mix(qw_engine *e, qw_mix_fn fn, void *ctx);
 int32_t qw_engine_sample(const float *logits, const qw_gen *g, unsigned long long *rng);
 int qw_engine_spec_accept(const float *lg, const int32_t *dr, int nd, const qw_gen *g, unsigned long long *rng,
                           int32_t *nx); // 推測解碼的接受判定：回傳接受幾個猜測，*nx = 下一個 token // 同 qw_engine_generate_ex 的取樣（rng 會前進）

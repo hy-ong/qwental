@@ -32,6 +32,12 @@ struct qw_gpu {
     // （buffer 不追蹤依賴，沒有這個的話相鄰的 command buffer 可能在 GPU 上重疊）
     id<MTLEvent> event;
     uint64_t evv;
+    // 第二條串流（qw_gpu_set_stream(g, 1)）：自己的 queue 與 event 鏈，與串流 0 的工作互不等待，GPU 可以同時執行
+    // （並發模式的 mixed step：prefill 一段在串流 0 跑的同時，decode 在串流 1 跑；兩邊寫的 buffer 不重疊由呼叫端保證）
+    id<MTLCommandQueue> queue1;
+    id<MTLEvent> event1;
+    uint64_t evv1;
+    int stream; // 之後 qw_batch_begin 用哪條（0 / 1）
     // profiling
     bool prof;
     id<MTLCounterSampleBuffer> sbuf;
@@ -47,6 +53,7 @@ struct qw_batch {
     id<MTLCommandBuffer> done[QW_FLUSH_MAX]; // qw_batch_flush 先送出的 command buffer（依序；最後一個 cb 完成時它們都已完成）
     int ndone;
     bool conc;
+    int stream; // 這個 batch 在哪條串流（queue 與 event 鏈）
     // profiling：綁定先記下來，dispatch 時才開 encoder
     qw_gpu *g;
     bool prof;
@@ -84,6 +91,8 @@ void qw_gpu_close(qw_gpu *g) {
     for (int i = 0; i < g->nkernels; i++) g->kernels[i].pso = nil;
     for (int i = 0; i < g->nlibs; i++) g->libs[i] = nil;
     g->queue = nil;
+    g->queue1 = nil;
+    g->event1 = nil;
     g->dev = nil;
     free(g);
 }
@@ -207,11 +216,25 @@ const char *qw_profile_get(const qw_gpu *g, int i, double *us) {
     return g->prof_name[i];
 }
 
+static id<MTLCommandQueue> st_queue(qw_gpu *g, int s) { return s ? g->queue1 : g->queue; }
+static id<MTLEvent> st_event(qw_gpu *g, int s) { return s ? g->event1 : g->event; }
+static uint64_t *st_evv(qw_gpu *g, int s) { return s ? &g->evv1 : &g->evv; }
+
+void qw_gpu_set_stream(qw_gpu *g, int s) {
+    if (s && !g->queue1) {
+        g->queue1 = [g->dev newCommandQueue];
+        g->event1 = [g->dev newEvent];
+        g->evv1 = 0;
+    }
+    g->stream = s && g->queue1 ? 1 : 0;
+}
+
 qw_batch *qw_batch_begin(qw_gpu *g, bool concurrent) {
     qw_batch *b = calloc(1, sizeof *b);
     b->g = g;
-    b->cb = [g->queue commandBufferWithUnretainedReferences];
-    [b->cb encodeWaitForEvent:g->event value:g->evv];
+    b->stream = g->prof ? 0 : g->stream; // profiling 只用串流 0
+    b->cb = [st_queue(g, b->stream) commandBufferWithUnretainedReferences];
+    [b->cb encodeWaitForEvent:st_event(g, b->stream) value:*st_evv(g, b->stream)];
     if (g->prof) {
         b->prof = true;
         g->nprof = 0;
@@ -227,11 +250,11 @@ void qw_batch_flush(qw_batch *b) {
     @autoreleasepool {
         qw_gpu *g = b->g;
         [b->enc endEncoding];
-        [b->cb encodeSignalEvent:g->event value:++g->evv];
+        [b->cb encodeSignalEvent:st_event(g, b->stream) value:++*st_evv(g, b->stream)];
         [b->cb commit];
         b->done[b->ndone++] = b->cb;
-        b->cb = [g->queue commandBufferWithUnretainedReferences];
-        [b->cb encodeWaitForEvent:g->event value:g->evv];
+        b->cb = [st_queue(g, b->stream) commandBufferWithUnretainedReferences];
+        [b->cb encodeWaitForEvent:st_event(g, b->stream) value:*st_evv(g, b->stream)];
         b->enc = [b->cb computeCommandEncoderWithDispatchType:b->conc ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
     }
 }
@@ -317,7 +340,7 @@ double qw_batch_end(qw_batch *b) {
     double t = -1;
     @autoreleasepool {
         if (!b->prof) [b->enc endEncoding];
-        [b->cb encodeSignalEvent:b->g->event value:++b->g->evv];
+        [b->cb encodeSignalEvent:st_event(b->g, b->stream) value:++*st_evv(b->g, b->stream)];
         MTLTimestamp c0 = 0, g0 = 0, c1 = 0, g1 = 0;
         if (b->prof) [b->cb.device sampleTimestamps:&c0 gpuTimestamp:&g0];
         [b->cb commit];
@@ -350,9 +373,14 @@ void qw_batch_submit(qw_batch *b) {
     @autoreleasepool {
         [b->enc endEncoding];
         b->enc = nil;
-        [b->cb encodeSignalEvent:b->g->event value:++b->g->evv];
+        [b->cb encodeSignalEvent:st_event(b->g, b->stream) value:++*st_evv(b->g, b->stream)];
         [b->cb commit];
     }
+}
+
+bool qw_batch_poll(qw_batch *b) {
+    const MTLCommandBufferStatus st = b->cb.status; // 最後一個 command buffer 完成時，先送出的（flush）都已完成（event 鏈）
+    return st == MTLCommandBufferStatusCompleted || st == MTLCommandBufferStatusError;
 }
 
 double qw_batch_wait(qw_batch *b) {
