@@ -1,7 +1,10 @@
 // Qwental HTTP server：Anthropic Messages API（/v1/messages，含串流）與 OpenAI Chat Completions（/v1/chat/completions）
 // 預設最多 16 個請求同時進行（--parallel N 改上限，最多 64；--parallel 1 = 一次一個）。MLX 權重一起 decode 時捨入與單獨跑略有不同
 // （--exact-spec 時逐位元相同）。
-// 照當下的請求數與實測速度自動選推測解碼（輪流）或一起 decode（超過 8 個時分組），greedy 輸出與單獨跑逐位元相同。
+// 照當下的請求數與實測速度自動選推測解碼（輪流，≤ 3 個對話時才考慮；QW_PAR_SLICE_MAX）或一起 decode（超過 8 個時分組），
+// greedy 輸出與單獨跑逐位元相同。
+// 串流時每 10 秒沒有輸出就送 keepalive（ping）；用戶端斷線就取消請求（GPU 停下、slot 放出來）。思考太長時收尾、留空間給回答
+// （同 Strata 的 answer_room；QW_NO_ANSWER_ROOM=1 關掉）。
 // 用法：build/qwental-serve [--gguf models/iq3s-gguf] [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--exact-spec] [--port 8080] [--ctx 131072] [--host 127.0.0.1] [--slots 3] [--cache-dir cache] [--parallel [N]] [--version]
 // --gguf：整個模型改用該目錄的 GGUF（Strata 的 IQ3_S 等；等同 QW_GGUF=目錄 QW_GGUF_PARTS=all）。
 //   這時 MLX 目錄（--model）是選用的：沒有時 tokenizer 讀 GGUF 的 metadata，dflash2/ 改找 GGUF 目錄的同層
@@ -13,10 +16,12 @@
 //   兩者都隱含 --int8，各自會讓輸出再多一點差異（等同 QW_INT8=lin,attn,shared,moe[,qk][,hyper]）
 #include <arpa/inet.h>
 #include <dispatch/dispatch.h>
+#include <errno.h>
 #include <pthread.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 #include "chat.h"
@@ -31,6 +37,10 @@
 #include "gpu.h"
 #include "json.h"
 #include "tok.h"
+
+static const char dashboard_html[] = { // GET /dashboard（與 /）：即時狀態頁（讀 /status）
+#embed "dashboard.html"
+};
 
 static const char *MODEL_DIR = "models/Qwen3.8-Flash-Next-mixed-4-8bit";
 static pthread_mutex_t tok_mu = PTHREAD_MUTEX_INITIALIZER; // --parallel：連線執行緒 tokenize、engine 執行緒 decode 共用 tokenizer
@@ -42,70 +52,234 @@ static int32_t IM_END, EOT;
 static int CTX;
 
 // ---------------------------------------------------------------- HTTP
+// 輸出一律先排進連線自己的緩衝（engine 執行緒只做記憶體複製，不碰 socket）；寫 socket 的只有連線執行緒（pump_step）。
+// 用戶端不讀（Ctrl-Z、網路卡住）只會卡住它自己的連線：一次寫超過 SNDTIMEO_S 秒、或緩衝超過 OUT_MAX 就當成斷線（dead），
+// engine 在下一個 token / prefill 段之間看到 dead 就結束這個請求（GPU 停下、slot 放出來）。
+// 連線執行緒閒著時（排隊、prefill、tool call 還在緩衝）每 PING_S 秒送一個 keepalive，並檢查用戶端是否已經斷線
+enum { PING_S = 10, SNDTIMEO_S = 30, RCVTIMEO_S = 30, REQ_DEADLINE_S = 300 };
+#define BODY_MAX ((size_t)256 << 20) // request body 上限（百萬 token 的對話也還有餘裕）
+#define HDR_MAX ((size_t)1 << 20)
+#define OUT_MAX ((size_t)64 << 20)
 typedef struct {
     int fd;
-    bool dead;
+    atomic_bool dead;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    sbuf out;          // 還沒寫出去的（mu 保護）
+    double last_q;     // 最近一次排進輸出的時間（mu 保護；keepalive 用）
+    double last_probe; // 最近一次檢查斷線（只有寫 socket 的執行緒用）
+    int sse;           // 串流的回應標頭已送出：1 Anthropic（ping 事件）、2 OpenAI（SSE 註解）
 } conn;
 
+static void conn_init(conn *c, int fd) {
+    memset(c, 0, sizeof *c);
+    c->fd = fd;
+    atomic_init(&c->dead, false);
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->cv, NULL);
+    c->last_q = qw_now();
+}
+static void conn_free(conn *c) {
+    sb_free(&c->out);
+    pthread_cond_destroy(&c->cv);
+    pthread_mutex_destroy(&c->mu);
+}
+static bool conn_dead(conn *c) { return atomic_load_explicit(&c->dead, memory_order_relaxed); }
+static void conn_kill(conn *c) { atomic_store(&c->dead, true); }
+
 static bool wr(conn *c, const char *s, size_t n) {
-    while (n && !c->dead) {
+    if (conn_dead(c)) return false;
+    pthread_mutex_lock(&c->mu);
+    if (c->out.n + n > OUT_MAX) {
+        conn_kill(c);
+        fprintf(stderr, "[http] 用戶端一直沒讀取輸出（緩衝超過 %zu MiB）：當成斷線\n", OUT_MAX >> 20);
+    } else if (n) {
+        sb_put(&c->out, s, n);
+        c->last_q = qw_now();
+        pthread_cond_signal(&c->cv);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return !conn_dead(c);
+}
+// 直接寫 socket（只有連線執行緒）：SO_SNDTIMEO 內寫不出去就當成斷線
+static void send_all(conn *c, const char *s, size_t n) {
+    while (n && !conn_dead(c)) {
         const ssize_t k = write(c->fd, s, n);
-        if (k <= 0) { c->dead = true; break; }
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) { conn_kill(c); break; }
         s += k;
         n -= (size_t)k;
     }
-    return !c->dead;
+}
+// 用戶端關了連線（FIN 或 RST）？請求已經整個讀完，之後讀得到資料只會是下一個請求（不算斷線）
+static void conn_probe(conn *c) {
+    char b;
+    const ssize_t k = recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (k == 0 || (k < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) conn_kill(c);
+}
+// 連線執行緒的一步：等輸出（最多 0.5 秒；*stop 變 true 時也會被叫醒）→ 寫出去；閒著時檢查斷線、太久沒輸出就送 keepalive。
+// 緩衝裡永遠是完整的 SSE 事件（sse() 一次排一整個），ping 接在後面不會插進事件中間
+static void pump_step(conn *c, atomic_bool *stop) {
+    pthread_mutex_lock(&c->mu);
+    if (!c->out.n && !(stop && atomic_load(stop))) { // 斷線了也照樣等（等 engine 結束這個請求，不要空轉）
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 500 * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&c->cv, &c->mu, &ts);
+    }
+    sbuf o = c->out;
+    c->out = (sbuf){0};
+    const double lq = c->last_q;
+    pthread_mutex_unlock(&c->mu);
+    if (o.n) send_all(c, o.p, o.n);
+    sb_free(&o);
+    if (conn_dead(c)) return;
+    const double now = qw_now();
+    if (now - c->last_probe >= 0.5) { c->last_probe = now; conn_probe(c); }
+    if (c->sse && now - lq >= PING_S) {
+        const char *pg = c->sse == 1 ? "event: ping\ndata: {\"type\": \"ping\"}\n\n" : ": ping\n\n";
+        wr(c, pg, strlen(pg));
+    }
+}
+// 把剩下的輸出全部寫出去（回應結束、關連線之前）
+static void pump_drain(conn *c) {
+    for (;;) {
+        pthread_mutex_lock(&c->mu);
+        sbuf o = c->out;
+        c->out = (sbuf){0};
+        pthread_mutex_unlock(&c->mu);
+        const bool any = o.n > 0;
+        if (any) send_all(c, o.p, o.n);
+        sb_free(&o);
+        if (!any) break;
+    }
+}
+
+static const char *http_reason(int code) {
+    switch (code) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    case 408: return "Request Timeout";
+    case 411: return "Length Required";
+    case 413: return "Content Too Large";
+    case 431: return "Request Header Fields Too Large";
+    case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
+    case 529: return "Overloaded";
+    default: return code < 500 ? "Bad Request" : "Internal Server Error";
+    }
+}
+// Anthropic 的錯誤類型（Claude Code 對 529 / 500 會重試）
+static const char *err_type(int code) {
+    switch (code) {
+    case 404: return "not_found_error";
+    case 413: return "request_too_large";
+    case 408: return "timeout_error";
+    case 500: return "api_error";
+    case 503:
+    case 529: return "overloaded_error";
+    default: return "invalid_request_error";
+    }
 }
 
 static void respond(conn *c, int code, const char *ctype, const char *body, size_t n) {
     char h[256];
     const int hn = snprintf(h, sizeof h, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", code,
-                            code == 200 ? "OK" : code == 404 ? "Not Found" : "Bad Request", ctype, n);
+                            http_reason(code), ctype, n);
     wr(c, h, (size_t)hn);
     wr(c, body, n);
 }
 
 static void respond_err(conn *c, int code, const char *msg) {
     sbuf b = {0};
-    sb_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
+    sb_printf(&b, "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":", err_type(code));
     sb_json_str(&b, msg, strlen(msg), false);
     sb_puts(&b, "}}");
     respond(c, code, "application/json", b.p, b.n);
     sb_free(&b);
 }
 
-// 讀一個請求：回傳 body（呼叫端 free），method / path 寫進參數
-static char *read_req(int fd, char *method, char *path, size_t *blen) {
+// 標頭行 l（到 \r 為止）的值裡有沒有 word（不分大小寫）
+static bool hdr_has(const char *l, const char *word) {
+    const char *e = strchr(l, '\r');
+    const size_t n = e ? (size_t)(e - l) : strlen(l), m = strlen(word);
+    for (size_t i = 0; i + m <= n; i++)
+        if (!strncasecmp(l + i, word, m)) return true;
+    return false;
+}
+
+// 讀一個請求：回傳 body（呼叫端 free），method / path 寫進參數。失敗回傳 NULL：*status = 要回的錯誤（emsg 為訊息），0 = 連線斷了
+// 每次 read 最多等 RCVTIMEO_S 秒（SO_RCVTIMEO），整個請求最多 REQ_DEADLINE_S 秒；標頭最多 HDR_MAX、body 最多 BODY_MAX（超過回 413）
+static char *read_req(conn *c, char *method, char *path, size_t *blen, int *status, char *emsg, size_t emlen) {
+    const double t0 = qw_now();
+    *status = 0;
     size_t cap = 65536, n = 0;
-    char *buf = malloc(cap + 1);
-    char *he = NULL;
+    char *buf = malloc(cap + 1), *he = NULL, *body = NULL;
+    if (!buf) { *status = 500; snprintf(emsg, emlen, "out of memory"); return NULL; }
     while (!he) {
-        if (n == cap) { cap *= 2; buf = realloc(buf, cap + 1); }
-        const ssize_t k = read(fd, buf + n, cap - n);
-        if (k <= 0) { free(buf); return NULL; }
+        if (n == cap) {
+            if (cap >= HDR_MAX) { *status = 431; snprintf(emsg, emlen, "request headers too large"); goto fail; }
+            char *nb = realloc(buf, cap * 2 + 1);
+            if (!nb) { *status = 500; snprintf(emsg, emlen, "out of memory"); goto fail; }
+            buf = nb;
+            cap *= 2;
+        }
+        if (qw_now() - t0 > REQ_DEADLINE_S) { *status = 408; snprintf(emsg, emlen, "request timeout"); goto fail; }
+        const ssize_t k = read(c->fd, buf + n, cap - n);
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && n) { *status = 408; snprintf(emsg, emlen, "request timeout"); goto fail; }
+        if (k <= 0) goto fail; // 什麼都沒送就關了（或閒置太久）：不回應
+        const size_t from = n > 3 ? n - 3 : 0;
         n += (size_t)k;
         buf[n] = 0;
-        he = strstr(buf, "\r\n\r\n");
-    }
-    if (sscanf(buf, "%15s %1023s", method, path) != 2) { free(buf); return NULL; }
-    size_t clen = 0;
-    for (char *l = buf; l < he; l = strstr(l, "\r\n") + 2) {
-        if (!strncasecmp(l, "Content-Length:", 15)) clen = strtoul(l + 15, NULL, 10);
-        if (!strstr(l, "\r\n")) break;
+        he = memmem(buf + from, n - from, "\r\n\r\n", 4);
     }
     const size_t hl = (size_t)(he + 4 - buf);
-    if (hl + clen > cap) { cap = hl + clen; buf = realloc(buf, cap + 1); }
-    while (n < hl + clen) {
-        const ssize_t k = read(fd, buf + n, hl + clen - n);
-        if (k <= 0) { free(buf); return NULL; }
-        n += (size_t)k;
+    he[2] = 0; // 標頭（每行都以 \r\n 結尾）變成一個字串
+    if (sscanf(buf, "%15s %1023s", method, path) != 2) { *status = 400; snprintf(emsg, emlen, "malformed request line"); goto fail; }
+    size_t clen = 0;
+    bool chunked = false, expect = false;
+    for (char *l = strstr(buf, "\r\n"); l && l[2]; l = strstr(l, "\r\n")) {
+        l += 2;
+        if (!strncasecmp(l, "Content-Length:", 15)) {
+            char *e;
+            const unsigned long long v = strtoull(l + 15, &e, 10);
+            while (*e == ' ' || *e == '\t') e++;
+            if (e == l + 15 || *e != '\r') { *status = 400; snprintf(emsg, emlen, "invalid Content-Length"); goto fail; }
+            if (v > BODY_MAX) {
+                *status = 413;
+                snprintf(emsg, emlen, "request body too large: %llu bytes > %zu maximum", v, BODY_MAX);
+                goto fail;
+            }
+            clen = (size_t)v;
+        } else if (!strncasecmp(l, "Transfer-Encoding:", 18) && hdr_has(l + 18, "chunked")) chunked = true;
+        else if (!strncasecmp(l, "Expect:", 7) && hdr_has(l + 7, "100-continue")) expect = true;
     }
-    char *body = malloc(clen + 1);
-    memcpy(body, buf + hl, clen);
+    if (chunked) { *status = 411; snprintf(emsg, emlen, "chunked request bodies are not supported: send Content-Length"); goto fail; }
+    body = malloc(clen + 1);
+    if (!body) { *status = 500; snprintf(emsg, emlen, "out of memory"); goto fail; }
+    size_t got = n - hl > clen ? clen : n - hl;
+    memcpy(body, buf + hl, got);
+    free(buf);
+    buf = NULL;
+    if (expect && got < clen) send_all(c, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    while (got < clen) {
+        if (qw_now() - t0 > REQ_DEADLINE_S) { *status = 408; snprintf(emsg, emlen, "request timeout"); goto fail; }
+        const ssize_t k = read(c->fd, body + got, clen - got);
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { *status = 408; snprintf(emsg, emlen, "request timeout"); goto fail; }
+        if (k <= 0) goto fail;
+        got += (size_t)k;
+    }
     body[clen] = 0;
     *blen = clen;
-    free(buf);
     return body;
+fail:
+    free(buf);
+    free(body);
+    return NULL;
 }
 
 // ---------------------------------------------------------------- 生成的共用部分
@@ -124,10 +298,15 @@ typedef struct {
     sbuf think, text, calls; // calls：Anthropic tool_use 區塊（逗號分隔）或 OpenAI tool_calls
     int ncalls;
     int out_tokens;
-    const char *stops[4]; // 停止字串
+    const char *stops[4]; // 停止字串（只比對回答的文字，不含思考與 tool call）
     int nstops;
-    sbuf tail;            // 最近輸出的文字（比對停止字串用）
+    size_t maxstop;       // 最長的停止字串
+    sbuf hold;            // 還沒送出的文字尾巴（最長停止字串 − 1 個位元組：跨事件的停止字串也不會先送出一半）
     const char *hit;      // 命中的停止字串
+    // 思考上限（Strata 的 answer_room）：思考到 think_cap 個 token 就收尾，留空間給回答
+    int think_cap, think_n;
+    int wrap;             // 要插入的收尾：1 = 到上限（WRAP_IDS）、2 = 還在思考就停了（CLOSE_IDS）
+    bool wrapped, closed; // 各只做一次
 } gen_ctx;
 
 static void sse(gen_ctx *g, const char *event, sbuf *data) {
@@ -154,8 +333,7 @@ static void anth_close_block(gen_ctx *g) {
     g->open_type = 0;
 }
 
-static void on_event(void *ctx, chat_ev_type t, const char *s, size_t n, const chat_call *call) {
-    gen_ctx *g = ctx;
+static void emit_event(gen_ctx *g, chat_ev_type t, const char *s, size_t n, const chat_call *call) {
     if (!g->stream) {
         if (t == CEV_THINK) sb_put(&g->think, s, n);
         else if (t == CEV_TEXT) sb_put(&g->text, s, n);
@@ -249,10 +427,59 @@ static void on_event(void *ctx, chat_ev_type t, const char *s, size_t n, const c
     sb_free(&d);
 }
 
-// 每個 token：解碼成 bytes，湊滿完整的 UTF-8 字元才送進解析器
+// 停止字串：只在回答的文字（CEV_TEXT）裡比對。文字留最長停止字串 − 1 個位元組不送（不切開 UTF-8 字元），
+// 命中時只送出它之前的部分；之後的事件（含 chat_parser_end 吐出來的）都不送
+static void stop_flush(gen_ctx *g) {
+    if (g->hold.n && !g->hit) emit_event(g, CEV_TEXT, g->hold.p, g->hold.n, NULL);
+    g->hold.n = 0;
+}
+static void stop_text(gen_ctx *g, const char *s, size_t n) {
+    sb_put(&g->hold, s, n);
+    const char *best = NULL;
+    int bi = -1;
+    for (int i = 0; i < g->nstops; i++) {
+        const char *h = memmem(g->hold.p, g->hold.n, g->stops[i], strlen(g->stops[i]));
+        if (h && (!best || h < best)) { best = h; bi = i; }
+    }
+    if (best) {
+        const size_t upto = (size_t)(best - g->hold.p);
+        if (upto) emit_event(g, CEV_TEXT, g->hold.p, upto, NULL);
+        g->hit = g->stops[bi];
+        g->hold.n = 0;
+        return;
+    }
+    if (g->hold.n < g->maxstop) return;
+    size_t cut = g->hold.n - (g->maxstop - 1);
+    while (cut > 0 && cut < g->hold.n && ((unsigned char)g->hold.p[cut] & 0xC0) == 0x80) cut--;
+    if (!cut) return;
+    emit_event(g, CEV_TEXT, g->hold.p, cut, NULL);
+    memmove(g->hold.p, g->hold.p + cut, g->hold.n - cut);
+    g->hold.n -= cut;
+}
+static void on_event(void *ctx, chat_ev_type t, const char *s, size_t n, const chat_call *call) {
+    gen_ctx *g = ctx;
+    if (g->hit) return;
+    if (g->nstops) {
+        if (t == CEV_TEXT) { stop_text(g, s, n); return; }
+        stop_flush(g);
+    }
+    emit_event(g, t, s, n, call);
+}
+
+// 解析器在 <think> 的一般文字裡、可以插入收尾（chat.h：chat_parser.state 0 = 思考；3 = 思考裡的 tool call 不算：
+// 收尾會插進 call 中間；pend 留著完整的 </think> 時已經算結束）
+static bool parser_thinking(const chat_parser *p) {
+    return p->state == 0 && !(p->pend.n && memmem(p->pend.p, p->pend.n, "</think>", 8));
+}
+
+// 每個 token：解碼成 bytes，湊滿完整的 UTF-8 字元才送進解析器。回傳 false = 停（用戶端斷線、命中停止字串）
 static bool on_token(void *ctx, int32_t t) {
     gen_ctx *g = ctx;
     g->out_tokens++;
+    if (g->think_cap && !g->wrapped) { // 思考 token 數（含思考裡的 tool call）；到上限且在可以插入的地方才收尾
+        if (g->parser.state == 0 || g->parser.state == 3) g->think_n++;
+        if (g->think_n >= g->think_cap && parser_thinking(&g->parser)) { g->wrap = 1; g->wrapped = true; }
+    }
     char buf[300];
     memcpy(buf, g->u8, (size_t)g->u8n);
     tok_lock();
@@ -269,25 +496,8 @@ static bool on_token(void *ctx, int32_t t) {
     g->u8n = n - cut;
     memcpy(g->u8, buf + cut, (size_t)g->u8n);
     if (cut && getenv("QW_LOG_RAW")) fwrite(buf, 1, (size_t)cut, stderr);
-    if (cut && g->nstops) { // 停止字串：命中就只送出它之前的部分
-        const size_t old = g->tail.n;
-        sb_put(&g->tail, buf, (size_t)cut);
-        for (int i = 0; i < g->nstops; i++) {
-            const char *h = strstr(g->tail.p, g->stops[i]);
-            if (!h) continue;
-            const size_t upto = (size_t)(h - g->tail.p);
-            if (upto > old) chat_parser_feed(&g->parser, g->tail.p + old, upto - old, on_event, g);
-            g->hit = g->stops[i];
-            return false;
-        }
-        if (g->tail.n > 4096) { // 只留最後一段
-            memmove(g->tail.p, g->tail.p + g->tail.n - 256, 256);
-            g->tail.n = 256;
-            g->tail.p[256] = 0;
-        }
-    }
     if (cut) chat_parser_feed(&g->parser, buf, (size_t)cut, on_event, g);
-    return !g->c->dead;
+    return !g->hit && !conn_dead(g->c);
 }
 
 static void gen_id(char *id, const char *prefix) {
@@ -301,13 +511,15 @@ typedef struct job {
     js *b;
     chat_req r;
     sbuf prompt;
-    int32_t *ids;
+    int32_t *ids; // prompt，生成的 token 接在後面（容量 np + max_tokens + 2）
     int np;
     gen_ctx g;
     qw_gen gp;
     int32_t stops[2];
     int persist[2];
     int fin;
+    int ecode;        // fin = QW_FIN_ERROR 時：529（暫時沒辦法，重試）或 500（engine 失敗）
+    const char *emsg; // 同上：錯誤訊息
     qw_gen_stats st;
     // --parallel：engine 執行緒的狀態
     int sid, got, base;
@@ -322,18 +534,60 @@ typedef struct job {
     int32_t *gen;
     unsigned long long rng;
     double t0, tg0;
-    bool done;
+    int id;    // 流水號（/status）
+    double tc; // 收到請求的時間（/status 的 age_s）
+    atomic_bool done; // engine 做完了（在 c->mu 裡設，之後 engine 不再碰這個 job）
     struct job *next;
 } job;
+
+// 思考收尾的 token（main 裡 tokenize 好）：到上限時同 Strata 的 REASONING_WRAP_UP，還在思考就停了時同 REASONING_CLOSE
+static const char *WRAP_TEXT = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n";
+static const char *CLOSE_TEXT = "\n</think>\n\n";
+static int32_t WRAP_IDS[64], CLOSE_IDS[16];
+static int NWRAP, NCLOSE;
+
+// 除錯（QW_LOG_PROMPT=目錄）：每個請求的完整 prompt 存成檔案。存的是人讀的版本（chat_unmark 拿掉 QW_TOK_PLAIN 標記）；
+// encode 一定用帶標記的原版
+static void log_prompt(const sbuf *prompt) {
+    const char *dir = getenv("QW_LOG_PROMPT");
+    if (!dir) return;
+    static atomic_int seq;
+    char pth[1024];
+    snprintf(pth, sizeof pth, "%s/req%03d.txt", dir, atomic_fetch_add(&seq, 1));
+    sbuf u = {0};
+    sb_put(&u, prompt->p ? prompt->p : "", prompt->n);
+    chat_unmark(&u);
+    FILE *f = fopen(pth, "wb");
+    if (f) { fwrite(u.p, 1, u.n, f); fclose(f); }
+    sb_free(&u);
+}
+
+static void job_free(job *j) {
+    gen_ctx *gg = &j->g;
+    sb_free(&gg->think);
+    sb_free(&gg->text);
+    sb_free(&gg->calls);
+    sb_free(&gg->hold);
+    chat_parser_free(&gg->parser);
+    free(j->ids);
+    sb_free(&j->prompt);
+    chat_free(&j->r);
+    js_free(j->b);
+    free(j);
+}
 
 static job *chat_begin(conn *c, const char *body, size_t blen, bool openai) {
     char err[256];
     js *b = js_parse(body, blen, err, sizeof err);
     if (!b) { respond_err(c, 400, err); return NULL; }
     job *j = calloc(1, sizeof *j);
+    if (!j) { respond_err(c, 500, "out of memory"); js_free(b); return NULL; }
     j->c = c;
     j->openai = openai;
     j->b = b;
+    static atomic_int job_seq;
+    j->id = atomic_fetch_add(&job_seq, 1) + 1;
+    j->tc = qw_now();
     chat_req r;
     if (!(openai ? chat_from_openai(b, &r, err, sizeof err) : chat_from_anthropic(b, &r, err, sizeof err))) {
         respond_err(c, 400, err);
@@ -355,22 +609,17 @@ static job *chat_begin(conn *c, const char *body, size_t blen, bool openai) {
     }
     sbuf prompt = {0};
     chat_render(&r, &prompt);
-    if (getenv("QW_LOG_PROMPT")) { // 除錯：每個請求的完整 prompt 存成檔案
-        static int seq = 0;
-        char pth[256];
-        snprintf(pth, sizeof pth, "%s/req%03d.txt", getenv("QW_LOG_PROMPT"), seq++);
-        FILE *f = fopen(pth, "wb");
-        if (f) { fwrite(prompt.p, 1, prompt.n, f); fclose(f); }
-    }
+    log_prompt(&prompt);
     tok_lock();
     const int np = qw_tok_encode(TK, prompt.p, prompt.n, NULL, 0);
-    int32_t *ids = malloc(sizeof(int32_t) * (size_t)np);
-    qw_tok_encode(TK, prompt.p, prompt.n, ids, np);
+    int32_t *ids = np > 0 ? malloc(sizeof(int32_t) * (size_t)np) : NULL;
+    if (ids) qw_tok_encode(TK, prompt.p, prompt.n, ids, np);
     tok_unlock();
-    if (np + 64 > CTX) { // 超過 context：回 Anthropic 標準錯誤，Claude Code 會自動壓縮對話
+    if (!ids || np + 64 > CTX) { // 超過 context：回 Anthropic 標準錯誤，Claude Code 會自動壓縮對話
         char m[160];
-        snprintf(m, sizeof m, "prompt is too long: %d tokens > %d maximum", np, CTX - 64);
-        respond_err(c, 400, m);
+        if (ids) snprintf(m, sizeof m, "prompt is too long: %d tokens > %d maximum", np, CTX - 64);
+        else snprintf(m, sizeof m, np > 0 ? "out of memory" : "empty prompt");
+        respond_err(c, ids ? 400 : np > 0 ? 500 : 400, m);
         free(ids);
         sb_free(&prompt);
         chat_free(&r);
@@ -378,26 +627,59 @@ static job *chat_begin(conn *c, const char *body, size_t blen, bool openai) {
         free(j);
         return NULL;
     }
-    const char *model = js_str(b, "model");
-    j->g = (gen_ctx){.c = c, .stream = js_bool(b, "stream", false), .openai = openai, .model = model ? model : "qwental"};
+    const char *model = js_str(b, "model"); // 回應裡照抄請求的模型名稱（claude-haiku-… 等都接受）
+    j->g = (gen_ctx){.c = c, .stream = js_bool(b, "stream", false), .openai = openai, .model = model && *model ? model : "qwental"};
     gen_id(j->g.id, openai ? "chatcmpl-" : "msg_");
     chat_parser_init(&j->g.parser, r.thinking, r.tools);
     int max_tokens = (int)js_num(b, "max_tokens", openai ? js_num(b, "max_completion_tokens", 32768) : 4096);
     if (max_tokens > CTX - np - 16) max_tokens = CTX - np - 16;
-    // stop_sequences（Anthropic）/ stop（OpenAI）：在輸出的文字裡比對
+    // 生成的 token 接在 prompt 後面（切換單獨 / 一起、思考收尾後接續時整段就是新的 prompt）
+    int32_t *ni = realloc(ids, sizeof(int32_t) * (size_t)(np + (max_tokens > 0 ? max_tokens : 0) + 2));
+    if (!ni) {
+        respond_err(c, 500, "out of memory");
+        chat_parser_free(&j->g.parser);
+        free(ids);
+        sb_free(&prompt);
+        chat_free(&r);
+        js_free(b);
+        free(j);
+        return NULL;
+    }
+    ids = ni;
+    // 思考上限（Strata 的 answer_room / reasoning budget）：max_tokens 也算思考，思考太長會沒有回答。
+    // 留 max(512, max_tokens / 4)（最多一半）給回答：有 thinking.budget_tokens 時取兩者小的；沒有時 max_tokens ≥ 1024 才限制
+    // （QW_NO_ANSWER_ROOM=1 關掉自動的部分）
+    if (r.thinking && max_tokens > 1) {
+        const js *th = openai ? NULL : js_get(b, "thinking");
+        const int budget = th && th->t == JS_OBJ ? (int)js_num(th, "budget_tokens", 0) : 0;
+        int reserve = max_tokens / 4 > 512 ? max_tokens / 4 : 512;
+        if (reserve > max_tokens / 2) reserve = max_tokens / 2;
+        int cap = 0;
+        if (budget > 0) cap = budget < max_tokens - reserve ? budget : max_tokens - reserve;
+        else if (max_tokens >= 1024 && !getenv("QW_NO_ANSWER_ROOM")) cap = max_tokens - reserve;
+        j->g.think_cap = cap > 0 ? cap : 0;
+    }
+    // stop_sequences（Anthropic）/ stop（OpenAI）：在回答的文字裡比對
     const js *ss = js_get(b, openai ? "stop" : "stop_sequences");
-    if (ss && ss->t == JS_STR) { j->g.stops[0] = ss->s; j->g.nstops = 1; }
+    if (ss && ss->t == JS_STR && ss->len) { j->g.stops[0] = ss->s; j->g.nstops = 1; }
     for (const js *x = ss && ss->t == JS_ARR ? ss->kid : NULL; x && j->g.nstops < 4; x = x->next)
         if (x->t == JS_STR && x->len) j->g.stops[j->g.nstops++] = x->s;
+    for (int i = 0; i < j->g.nstops; i++)
+        if (strlen(j->g.stops[i]) > j->g.maxstop) j->g.maxstop = strlen(j->g.stops[i]);
     j->stops[0] = IM_END;
     j->stops[1] = EOT;
     const char *ev = getenv("QW_TEMP");
     // 持久化點：工具定義結束前的 token 邊界、system 訊息結尾（第一個 <|im_end|> 之後）
     int *persist = j->persist, npersist = 0;
     {
-        const char *te = strstr(prompt.p, "</tools>");
-        if (te) {
-            const size_t off = (size_t)(te - prompt.p);
+        sbuf u = {0}; // 位元組位置要對得上 decode 出來的文字：拿掉 QW_TOK_PLAIN 標記再找
+        sb_put(&u, prompt.p, prompt.n);
+        chat_unmark(&u);
+        const char *te = u.p ? memmem(u.p, u.n, "</tools>", 8) : NULL;
+        const bool has_te = te != NULL;
+        const size_t off = has_te ? (size_t)(te - u.p) : 0;
+        sb_free(&u);
+        if (has_te) {
             size_t acc = 0;
             char tb[300];
             for (int i = 0; i < np; i++) {
@@ -421,62 +703,131 @@ static job *chat_begin(conn *c, const char *body, size_t blen, bool openai) {
                  .spec = !getenv("QW_NO_SPEC"),
                  .persist = persist,
                  .npersist = npersist};
-    if (j->g.stream) {
-        const char *h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-        wr(c, h, strlen(h));
-        if (!openai) {
-            sbuf d = {0};
-            sb_printf(&d, "{\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", j->g.id);
-            sb_json_str(&d, j->g.model, strlen(j->g.model), false);
-            sb_printf(&d, ",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":%d,\"output_tokens\":1}}}", np);
-            sse(&j->g, "message_start", &d);
-            sb_free(&d);
-        }
-    }
     j->r = r;
     j->prompt = prompt;
     j->ids = ids;
+    j->gen = ids + np;
     j->np = np;
     return j;
 }
 
+// 串流：送出回應標頭（與 Anthropic 的 message_start）。之後連線執行緒閒著時就會送 keepalive
+static void stream_start(job *j) {
+    if (!j->g.stream) return;
+    conn *c = j->c;
+    const char *h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    wr(c, h, strlen(h));
+    if (!j->openai) { // usage 在這裡只能說整個 prompt；最後的數字在 message_delta（同 Strata）
+        sbuf d = {0};
+        sb_printf(&d, "{\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", j->g.id);
+        sb_json_str(&d, j->g.model, strlen(j->g.model), false);
+        sb_printf(&d, ",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}", j->np);
+        sse(&j->g, "message_start", &d);
+        sb_free(&d);
+    }
+    c->sse = j->openai ? 2 : 1;
+}
+
+// ---- 思考收尾（answer_room）：思考到上限、或還在 <think> 裡就停了（只做一次）時，把收尾的 token 當成輸出接在後面（照樣串流），
+// 之後從 prompt + 已生成接著生成（slot 的快照 / 前綴快取：只多算這幾個 token）
+static bool close_ok(job *j) { // 模型還在思考就停了：收尾一次、讓它回答（同 Strata 的 reasoning_close_retry）
+    return NCLOSE && !j->g.closed && !j->g.hit && !conn_dead(j->c) && parser_thinking(&j->g.parser) && !getenv("QW_NO_ANSWER_ROOM") &&
+           j->got + NCLOSE + 1 <= j->gp.max_tokens;
+}
+static bool wrap_fits(const job *j) {
+    const int k = j->g.wrap == 2 ? NCLOSE : NWRAP;
+    return k && j->got + k + 1 <= j->gp.max_tokens;
+}
+// 插入 j->g.wrap 要的收尾（並清掉 wrap）。回傳 false = 沒插（已經不在思考裡、或沒空間了：照常生成到 max_tokens）
+static bool wrap_inject(job *j) {
+    const int kind = j->g.wrap;
+    j->g.wrap = 0;
+    if (!kind || !parser_thinking(&j->g.parser) || conn_dead(j->c) || j->g.hit) return false;
+    j->g.wrap = kind;
+    const bool fits = wrap_fits(j);
+    j->g.wrap = 0;
+    if (!fits) return false;
+    const int32_t *t = kind == 2 ? CLOSE_IDS : WRAP_IDS;
+    const int k = kind == 2 ? NCLOSE : NWRAP;
+    if (kind == 2) j->g.closed = true;
+    j->g.wrapped = true; // 收尾的 token 不再算思考上限
+    fprintf(stderr, kind == 2 ? "[think] 還在思考就停了（%d 個 token）：收尾一次、接著回答\n"
+                              : "[think] 思考到上限（%d 個 token，max_tokens %d）：收尾、留空間給回答\n",
+            j->g.think_n, j->gp.max_tokens);
+    for (int i = 0; i < k; i++) {
+        j->gen[j->got++] = t[i];
+        on_token(&j->g, t[i]);
+    }
+    return true;
+}
+
 // ---- /status：累計數字（兩種模式都有）
 static double T_START;
-static long long st_done, st_in, st_cached, st_out; // 完成的請求、prompt token、重用的 token、生成的 token
+static long long st_done, st_in, st_cached, st_out, st_cancel, st_err; // 完成的請求、prompt token、重用的 token、生成的 token、用戶端斷線、錯誤
 static void chat_end(job *j) {
-    __atomic_fetch_add(&st_done, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&st_in, j->np, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&st_cached, j->st.cached, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&st_out, j->st.gen, __ATOMIC_RELAXED);
     conn *c = j->c;
-    const bool openai = j->openai;
+    const bool openai = j->openai, dead = conn_dead(c);
     gen_ctx *gg = &j->g;
     const int np = j->np, fin = j->fin;
     const qw_gen_stats st = j->st;
-    chat_req r = j->r;
-    sbuf prompt = j->prompt;
-    int32_t *ids = j->ids;
-    js *b = j->b;
-    chat_parser_end(&gg->parser, on_event, gg);
-    fprintf(stderr, "[%s] prompt %d（重用 %d）%.0f ms；生成 %d 個 token %.0f ms（%.1f tok/s）；%d 輪、接受 %d 個猜測（n-gram %d 輪）；結束 %d\n",
-            openai ? "openai" : "anthropic", np, st.cached, st.prefill_ms, st.gen, st.gen_ms, st.gen ? st.gen / st.gen_ms * 1e3 : 0.0,
-            st.rounds, st.accepted, st.ngram_rounds, fin);
+    __atomic_fetch_add(&st_done, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&st_in, np, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&st_cached, st.cached, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&st_out, st.gen, __ATOMIC_RELAXED);
+    if (dead) __atomic_fetch_add(&st_cancel, 1, __ATOMIC_RELAXED);
+    if (fin == QW_FIN_ERROR) __atomic_fetch_add(&st_err, 1, __ATOMIC_RELAXED);
+    // 被截斷（max_tokens、context 滿、取消）：沒寫完的 tool call 當成文字輸出、不變成 tool_use（parser.cut_call），stop_reason 是 max_tokens
+    chat_parser_finish(&gg->parser, fin == QW_FIN_LENGTH || fin == QW_FIN_CTX || dead, on_event, gg);
+    if (gg->nstops) stop_flush(gg);
+    fprintf(stderr, "[%s] prompt %d（重用 %d）%.0f ms；生成 %d 個 token %.0f ms（%.1f tok/s）；%d 輪、接受 %d 個猜測（n-gram %d 輪）；結束 %d%s%s%s\n",
+            openai ? "openai" : "anthropic", np, st.cached, st.prefill_ms, st.gen, st.gen_ms, st.gen && st.gen_ms > 0 ? st.gen / st.gen_ms * 1e3 : 0.0,
+            st.rounds, st.accepted, st.ngram_rounds, fin, dead ? "；用戶端已斷線（取消）" : "", fin == QW_FIN_ERROR ? "；錯誤" : "",
+            gg->parser.cut_call ? "；tool call 沒寫完（max_tokens）" : "");
+    if (gg->parser.rescued || gg->parser.unread)
+        fprintf(stderr, "[%s] 從思考裡救出 %d 個 tool call；%d 個沒宣告的工具當成文字\n", openai ? "openai" : "anthropic", gg->parser.rescued, gg->parser.unread);
     const bool tool = gg->ncalls > 0;
-    const char *sr = gg->hit ? (openai ? "stop" : "stop_sequence") : fin == QW_FIN_LENGTH ? (openai ? "length" : "max_tokens")
+    const bool cut = fin == QW_FIN_LENGTH || fin == QW_FIN_CTX;
+    const char *sr = gg->hit ? (openai ? "stop" : "stop_sequence") : cut ? (openai ? "length" : "max_tokens")
                    : tool ? (openai ? "tool_calls" : "tool_use") : (openai ? "stop" : "end_turn");
-    if (gg->stream) {
+    // usage（同 Strata）：這次新讀的 prompt 算 cache 寫入、重用的算 cache 讀取；input_tokens 留 1（0 會讓 Claude Code 把 prompt 算兩次）
+    const int reused = st.cached < 0 ? 0 : st.cached > np - 1 ? np - 1 : st.cached, fresh = np - reused;
+    char usage[192];
+    snprintf(usage, sizeof usage, "{\"input_tokens\":1,\"cache_creation_input_tokens\":%d,\"cache_read_input_tokens\":%d,\"output_tokens\":%d}",
+             fresh - 1, reused, st.gen);
+    char ousage[192];
+    snprintf(ousage, sizeof ousage, "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,\"prompt_tokens_details\":{\"cached_tokens\":%d}}", np,
+             st.gen, np + st.gen, reused);
+    if (fin == QW_FIN_ERROR) { // 已經開始串流：SSE error 事件（Claude Code 對 overloaded_error 會重試）；還沒：HTTP 529 / 500
+        const char *m = j->emsg ? j->emsg : "inference engine error";
+        if (gg->stream) {
+            sbuf d = {0};
+            if (openai) {
+                sb_puts(&d, "{\"error\":{\"message\":");
+                sb_json_str(&d, m, strlen(m), false);
+                sb_puts(&d, ",\"type\":\"server_error\"}}");
+                sse(gg, NULL, &d);
+            } else {
+                sb_puts(&d, "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":");
+                sb_json_str(&d, m, strlen(m), false);
+                sb_puts(&d, "}}");
+                sse(gg, "error", &d);
+            }
+            sb_free(&d);
+        } else respond_err(c, j->ecode ? j->ecode : 500, m);
+    } else if (gg->stream) {
         sbuf d = {0};
         if (openai) {
             sb_printf(&d, "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", gg->id, (long)time(NULL));
             sb_json_str(&d, gg->model, strlen(gg->model), false);
-            sb_printf(&d, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
-                      sr, np, st.gen, np + st.gen);
+            sb_printf(&d, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}],\"usage\":%s}", sr, ousage);
             sse(gg, NULL, &d);
             wr(c, "data: [DONE]\n\n", 14);
         } else {
             anth_close_block(gg);
-            sb_printf(&d, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":%s%s%s},\"usage\":{\"output_tokens\":%d}}", sr,
-                      gg->hit ? "\"" : "", gg->hit ? gg->hit : "null", gg->hit ? "\"" : "", st.gen);
+            sb_printf(&d, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":", sr);
+            if (gg->hit) sb_json_str(&d, gg->hit, strlen(gg->hit), false);
+            else sb_puts(&d, "null");
+            sb_printf(&d, "},\"usage\":%s}", usage);
             sse(gg, "message_delta", &d);
             d.n = 0;
             sb_puts(&d, "{\"type\":\"message_stop\"}");
@@ -492,8 +843,7 @@ static void chat_end(job *j) {
             sb_json_str(&o, gg->text.p ? gg->text.p : "", gg->text.n, false);
             if (gg->think.n) { sb_puts(&o, ",\"reasoning_content\":"); sb_json_str(&o, gg->think.p, gg->think.n, false); }
             if (tool) { sb_puts(&o, ",\"tool_calls\":["); sb_put(&o, gg->calls.p, gg->calls.n); sb_puts(&o, "]"); }
-            sb_printf(&o, "},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}", sr, np,
-                      st.gen, np + st.gen);
+            sb_printf(&o, "},\"finish_reason\":\"%s\"}],\"usage\":%s}", sr, ousage);
         } else {
             sb_printf(&o, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", gg->id);
             sb_json_str(&o, gg->model, strlen(gg->model), false);
@@ -515,27 +865,73 @@ static void chat_end(job *j) {
             sb_printf(&o, "],\"stop_reason\":\"%s\",\"stop_sequence\":", sr);
             if (gg->hit) sb_json_str(&o, gg->hit, strlen(gg->hit), false);
             else sb_puts(&o, "null");
-            sb_printf(&o, ",\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d}}", np, st.gen);
+            sb_printf(&o, ",\"usage\":%s}", usage);
         }
         respond(c, 200, "application/json", o.p, o.n);
         sb_free(&o);
     }
-    sb_free(&gg->think);
-    sb_free(&gg->text);
-    sb_free(&gg->calls);
-    sb_free(&gg->tail);
-    chat_parser_free(&gg->parser);
-    free(ids);
-    sb_free(&prompt);
-    chat_free(&r);
-    js_free(b);
-    free(j);
+    job_free(j);
 }
+
+// ---- 單一請求（--parallel 1）：生成在這個執行緒，另一個執行緒負責寫 socket（keepalive、斷線偵測）
+typedef struct {
+    conn *c;
+    atomic_bool stop;
+} pump_arg;
+static void *pump_main(void *a) {
+    pump_arg *p = a;
+    while (!atomic_load(&p->stop)) pump_step(p->c, &p->stop);
+    return NULL;
+}
+static bool serial_cb(void *ctx, int32_t t) {
+    job *j = ctx;
+    j->gen[j->got++] = t;
+    return on_token(&j->g, t) && !j->g.wrap; // 思考到上限：停下來插入收尾再接著生成
+}
+static bool serial_pfy(void *ctx) { return conn_dead(((job *)ctx)->c); } // 長 prompt 的 prefill 段之間：用戶端斷線就停（快照留著，重試時接續）
 
 static void handle_chat(conn *c, const char *body, size_t blen, bool openai) {
     job *j = chat_begin(c, body, blen, openai);
     if (!j) return;
-    j->fin = qw_engine_generate_ex(E, j->ids, j->np, &j->gp, on_token, &j->g, &j->st);
+    stream_start(j);
+    pump_arg pa = {.c = c};
+    atomic_init(&pa.stop, false);
+    pthread_t pt;
+    const bool pumping = !pthread_create(&pt, NULL, pump_main, &pa);
+    j->rng = j->gp.seed;
+    int fin = QW_FIN_LENGTH;
+    for (bool first = true;; first = false) {
+        if (j->got >= j->gp.max_tokens) { fin = QW_FIN_LENGTH; break; }
+        qw_gen g2 = j->gp;
+        g2.max_tokens = j->gp.max_tokens - j->got;
+        g2.seed = j->rng; // 第一段 = 請求的 seed（與以前相同）
+        g2.pf_yield = serial_pfy;
+        qw_gen_stats s2 = {0};
+        fin = qw_engine_generate_ex(E, j->ids, j->np + j->got, &g2, serial_cb, j, &s2);
+        if (first) j->st = s2;
+        else {
+            j->st.rounds += s2.rounds;
+            j->st.accepted += s2.accepted;
+            j->st.ngram_rounds += s2.ngram_rounds;
+            j->st.gen_ms += s2.gen_ms + s2.prefill_ms;
+        }
+        j->rng = j->rng * 6364136223846793005ull + 1442695040888963407ull;
+        if (fin == QW_FIN_YIELD) { fin = QW_FIN_CALLBACK; break; } // 只有 serial_pfy 會讓出：用戶端斷線
+        if (conn_dead(c) || j->g.hit) break;
+        if (fin == QW_FIN_CALLBACK && j->g.wrap) { wrap_inject(j); continue; } // 插不進去也接著生成（思考到 max_tokens）
+        if (fin == QW_FIN_STOP && close_ok(j)) { j->g.wrap = 2; if (wrap_inject(j)) continue; }
+        break;
+    }
+    j->fin = fin;
+    j->st.gen = j->got;
+    if (fin == QW_FIN_ERROR) { j->ecode = 500; j->emsg = "inference engine error"; }
+    if (pumping) {
+        pthread_mutex_lock(&c->mu);
+        atomic_store(&pa.stop, true);
+        pthread_cond_signal(&c->cv);
+        pthread_mutex_unlock(&c->mu);
+        pthread_join(pt, NULL);
+    }
     chat_end(j);
 }
 
@@ -544,59 +940,108 @@ static void handle_chat(conn *c, const char *body, size_t blen, bool openai) {
 // engine 執行緒：新請求逐一 prefill（期間其他對話暫停），之後每步一起 decode（qw_engine_par_step），token 經 on_token 串流給各自的連線
 static int PAR = -1; // 同時最多幾個請求；-1 = 自動（16；只有一部分是 GGUF 時 1）
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER, done_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
 static job *q_head, *q_tail;
+static int q_len;                 // 佇列裡幾個（q_mu）
+enum { QUEUE_MAX = 64 };          // 排隊超過這麼多就回 529（Claude Code 會退避重試）
+static volatile int par_na;       // engine 執行緒：目前進行中的對話數（讓出前看新請求進不進得來）
 
-static bool q_pending(void) {
+// 有排隊、而且進得來（還沒到 PAR 個）：16 個都在跑時讓出沒有用，只會白白切換
+static bool q_admit(void) {
+    if (par_na >= PAR) return false;
     pthread_mutex_lock(&q_mu);
     const bool p = q_head != NULL;
     pthread_mutex_unlock(&q_mu);
     return p;
 }
 // 生成的 token 接在 prompt 後面（j->ids[np + k]，j->gen = j->ids + np），切換單獨 / 一起時整段就是新的 prompt。
-// j->base：slot 的 KV 內容目前記到哪（上一次 prefill 的長度），結束時從這裡之後記快照
+// j->base：slot 的 KV 內容目前記到哪（上一次 prefill 的長度），結束時從這裡之後記快照。
+// 取消（用戶端斷線，fin = QW_FIN_CALLBACK）也走這裡：分段 prefill 中途停下時 slot 停在段界（kvlen = pos = 算到的位置），
+// 狀態一致；單獨跑的 prefill 從 pf_yield 讓出時 engine 已在那裡記了快照，重試的請求直接接續
 static void par_done(job *j, int fin) {
     j->fin = fin;
     j->st.gen = j->got;
     j->st.gen_ms = (qw_now() - j->tg0) * 1e3;
     if (j->sid >= 0) qw_engine_par_finish(E, j->sid, j->ids + j->base, j->np + j->got - j->base);
-    pthread_mutex_lock(&q_mu);
-    j->done = true;
-    pthread_cond_broadcast(&done_cv);
-    pthread_mutex_unlock(&q_mu);
+    conn *c = j->c;
+    pthread_mutex_lock(&c->mu); // 在 c->mu 裡設 done：連線執行緒只會在這之後釋放 job / conn
+    atomic_store(&j->done, true);
+    pthread_cond_signal(&c->cv);
+    pthread_mutex_unlock(&c->mu);
 }
-// 送出一個 token（同 qw_engine_generate_ex 的 EMIT）：回傳 false = 這個請求結束了
+static void par_fail(job *j, int code, const char *msg) {
+    j->ecode = code;
+    j->emsg = msg;
+    fprintf(stderr, "[par] 請求失敗（%d）：%s\n", code, msg);
+    par_done(j, QW_FIN_ERROR);
+}
+// 思考收尾之後要重新加入的對話（離開了一起 decode，下一輪從 prompt + 已生成接續）
+static job *rejoin[QW_PAR_MAX];
+static int nrejoin;
+static void leave_batch(job *j);
+// 一起 decode 中要插入思考收尾：離開 batch（記快照）→ 插入 → 下一輪重新加入。回傳 true = 不用插（照常留在 batch）
+static bool par_wrap(job *j) {
+    if (!parser_thinking(&j->g.parser) || !wrap_fits(j)) { j->g.wrap = 0; return true; }
+    if (j->inb) leave_batch(j);
+    wrap_inject(j);
+    // 快照停在插入之前（leave_batch 記的）：之後取消時 par_finish 不能把插入的 token 當成已經進模型的（ngen = 0 → 不記）
+    j->base = j->np + j->got;
+    if (j->g.hit || conn_dead(j->c)) { par_done(j, QW_FIN_CALLBACK); return false; }
+    if (j->got >= j->gp.max_tokens) { par_done(j, QW_FIN_LENGTH); return false; }
+    rejoin[nrejoin++] = j;
+    return false;
+}
+// 送出一個 token（同 qw_engine_generate_ex 的 EMIT）：回傳 false = 這個請求不在這一輪了（結束、或等著重新加入）
 static bool par_emit(job *j, int32_t t) {
     for (int q = 0; q < j->gp.nstop; q++)
-        if (j->gp.stop[q] == t) { par_done(j, QW_FIN_STOP); return false; }
+        if (j->gp.stop[q] == t) {
+            if (close_ok(j)) { j->g.wrap = 2; return par_wrap(j); } // 還在思考就停了：收尾、接著回答（停止 token 不留）
+            par_done(j, QW_FIN_STOP);
+            return false;
+        }
     j->gen[j->got++] = t;
     if (!on_token(&j->g, t)) { par_done(j, QW_FIN_CALLBACK); return false; }
     if (j->got >= j->gp.max_tokens) { par_done(j, QW_FIN_LENGTH); return false; }
     j->last = t;
+    if (j->g.wrap) return par_wrap(j);
     return true;
 }
-// ---- 排程：每次都從實測速度選比較快的做法（不必指定幾路）
-//   推測解碼輪流跑（一次一個對話、時間片 SLICE_MS）：總速度 ≈ 各對話推測解碼速度的平均（含切換成本，實測）
+// ---- 排程：從實測速度選比較快的做法（不必指定幾路）
+//   推測解碼輪流跑（一次一個對話、時間片 SLICE_MS）：總速度用牆鐘實測（rr_rate：一段時間內輪流生成的 token ÷ 經過的時間，
+//     含 slot 切換、快照存取、排程本身；分段 prefill 的時間扣掉）。還沒量過時用各對話推測解碼速度的平均估（偏樂觀）
 //   一起 decode：總速度 = B / 一步的時間（實測；還沒量過的 B 用 engine 的各組時間估）
+// 輪流只在 ≤ SLICE_MAX_N 個對話時考慮（QW_PAR_SLICE_MAX；更多時切換成本一定吃掉推測解碼的好處：實測 15 個輪流總共只有約 4 tok/s，
+// 一起 decode 約 160 tok/s）；換做法之後至少維持 MODE_HOLD_S 秒（免得來回切）；輪流時每個對話至少跑 MIN_SLICE_MS 才讓出。
 // 兩種做法都和單獨 greedy 逐位元相同，只差快慢；只有一個請求時一定是推測解碼
-enum { SLICE_MS = 300 };
+enum { SLICE_MS = 300, MIN_SLICE_MS = 250, MODE_HOLD_S = 5, PF_AGE_S = 30 };
+static int SLICE_MAX_N = 3;
 static volatile int par_others; // 單獨跑的時候，另外還有幾個進行中的對話在等（> 0 才切時間片）
 static volatile bool par_pfwait; // 有對話在分段 prefill：時間片縮短（prefill 多分一點時間）
 static double seg_t0;
-static double spec_rate;                 // 推測解碼的實測速度（tok/s，EMA，含切換）
+static double spec_rate;                 // 推測解碼的實測速度（tok/s，EMA；一段之內，不含切換）
+static double rr_rate[QW_PAR_MAX + 1];   // n 個對話輪流推測解碼的實測總速度（tok/s，EMA，牆鐘、含切換）
 static double bat_rate[QW_PAR_MAX + 1];  // 一起 decode B 個的實測總速度（tok/s，EMA；兩種一起的做法取快的）
 static double pl_rate[QW_PAR_MAX + 1], vs_rate[QW_PAR_MAX + 1]; // 一起 decode / 一起推測解碼 各自的實測（tok/s，EMA）
 static bool solo_cb(void *ctx, int32_t t) { // 要讓出時只設 yield：這一輪的 token 送完才停（模型狀態停在最後一個 token 之前）
     job *j = ctx;
     j->gen[j->got++] = t;
     if (!on_token(&j->g, t)) { j->cbstop = true; return false; }
-    if (!j->yflag && (q_pending() || (par_others && (qw_now() - seg_t0) * 1e3 > (par_pfwait ? SLICE_MS * 2 / 3 : SLICE_MS)))) j->yflag = true;
+    if (j->g.wrap) j->yflag = true; // 思考到上限：這一輪送完就停、插入收尾
+    const double ms = (qw_now() - seg_t0) * 1e3;
+    if (!j->yflag && ms >= MIN_SLICE_MS && ((par_others && ms > (par_pfwait ? SLICE_MS * 2 / 3 : SLICE_MS)) || q_admit())) j->yflag = true;
     return true;
 }
 static double ema(double o, double x, double w) { return o > 0 ? (1 - w) * o + w * x : x; }
-static bool solo_pfy(void *ctx) { (void)ctx; return q_pending(); } // 單獨跑的長 prompt：每段 prefill 之間有新請求就讓出
+// 單獨跑的長 prompt：每段 prefill 之間，用戶端斷線就停；有進得來的新請求（且這段至少跑了 MIN_SLICE_MS）就讓出。
+// 讓出時 engine 在段界記快照（st->pf_done），之後接著算；取消的請求重試時也從這裡接續
+static bool solo_pfy(void *ctx) {
+    job *j = ctx;
+    if (conn_dead(j->c)) return true;
+    return (qw_now() - seg_t0) * 1e3 >= MIN_SLICE_MS && q_admit();
+}
 // 推測解碼跑一段（到結束、有新請求、或時間片用完）。回傳 true = 還沒結束（狀態留在 slot，下次從 prompt + 已生成接續）
-static bool run_solo(job *j) {
+// *ng = 這一段生成了幾個 token、*pf = 其中花在 prefill 的 ms（呼叫端量輪流速度用；j 結束後就不能再碰，所以從這裡帶出來）
+static bool run_solo(job *j, int *ng_out, double *pf_out) {
     qw_gen g2 = j->gp;
     g2.max_tokens = j->gp.max_tokens - j->got;
     g2.seed = j->rng;
@@ -609,19 +1054,35 @@ static bool run_solo(job *j) {
     seg_t0 = qw_now();
     const int fin = qw_engine_par_solo(E, j->sid, j->ids, j->np + j->got, &g2, solo_cb, j, &s2);
     double ms = (qw_now() - seg_t0) * 1e3;
+    *ng_out = 0;
+    *pf_out = 0;
     if (fin == QW_FIN_YIELD && s2.pf_done > 0) { // prompt 還沒算完就讓出：之後分段 prefill 接著算（快照在 pf_done）
         j->pfy = true;
         j->st.cached = s2.cached;
+        *pf_out = ms;
         return true;
     }
-    if (first) { j->st.prompt = j->np; j->st.cached = s2.cached; j->st.prefill_ms = s2.prefill_ms; ms -= s2.prefill_ms; } // 第一段扣掉 prompt
+    if (first) { j->st.prompt = j->np; j->st.cached = s2.cached; j->st.prefill_ms = s2.prefill_ms; ms -= s2.prefill_ms; *pf_out = s2.prefill_ms; } // 第一段扣掉 prompt
+    // 之後每段開頭從快照接續的部分是切換成本：不扣（輪流的實測速度要含它）
     const int ng = j->got - got0;
+    *ng_out = ng;
     if (ng >= 8 && ms > 1) { j->srate = ema(j->srate, ng * 1e3 / ms, 0.5); spec_rate = ema(spec_rate, ng * 1e3 / ms, 0.3); }
     j->st.rounds += s2.rounds;
     j->st.accepted += s2.accepted;
     j->st.ngram_rounds += s2.ngram_rounds;
     j->base = j->np + j->got; // generate_ex 結束時記了快照（不一定到最後一個 token，par_prefill / par_solo 會找能用的）
     j->rng = j->rng * 6364136223846793005ull + 1442695040888963407ull;
+    if (fin == QW_FIN_STOP && close_ok(j)) j->g.wrap = 2; // 還在思考就停了：收尾、接著回答（停止 token 不在 gen 裡）
+    if (j->g.wrap && (fin == QW_FIN_YIELD || fin == QW_FIN_STOP)) { // 下一段從 prompt + 已生成 + 收尾接續（快照在 generate_ex 結束時記了）
+        const bool injected = wrap_inject(j);
+        j->base = j->np + j->got; // 同 par_wrap：插入的 token 還沒進模型，取消時不能記進快照
+        if (fin == QW_FIN_YIELD || injected) {
+            if (j->g.hit || conn_dead(j->c)) { par_done(j, QW_FIN_CALLBACK); return false; }
+            if (j->got >= j->gp.max_tokens) { par_done(j, QW_FIN_LENGTH); return false; }
+            return true;
+        }
+    }
+    if (fin == QW_FIN_ERROR) { par_fail(j, 500, "inference engine error (solo decode)"); return false; }
     if (fin != QW_FIN_YIELD) { par_done(j, fin); return false; }
     if (j->got >= j->gp.max_tokens) { par_done(j, QW_FIN_LENGTH); return false; }
     return true;
@@ -632,7 +1093,7 @@ static bool join_batch(job *j) {
     qw_engine_par_persist(E, j->gp.persist, j->gp.npersist);
     const float *lg = qw_engine_par_prefill(E, j->sid, j->ids, j->np + j->got, &cached);
     j->base = j->np + j->got;
-    if (!lg) { par_done(j, QW_FIN_ERROR); return false; }
+    if (!lg) { par_fail(j, 500, "inference engine error (prefill)"); return false; }
     if (!j->st.prompt) { j->st.prompt = j->np; j->st.cached = cached; j->st.prefill_ms = (qw_now() - j->t0) * 1e3; j->tg0 = qw_now(); }
     j->inb = true;
     j->hasd = false;
@@ -652,7 +1113,7 @@ static bool pf_chunk(job *j) {
     qw_engine_par_persist(E, j->gp.persist, j->gp.npersist);
     const float *lg = qw_engine_par_prefill_to(E, j->sid, j->ids, j->np, ch, &j->pfd, &cached);
     if (lg && j->pfd - (first ? cached : d0) >= 256) rate = (j->pfd - (first ? cached : d0)) / ((qw_now() - t) * 1e3);
-    if (!lg) { par_done(j, QW_FIN_ERROR); return false; }
+    if (!lg) { par_fail(j, 500, "inference engine error (chunked prefill)"); return false; }
     if (first && !j->pfy) j->st.cached = cached;
     if (j->pfd < j->np) return true;
     j->pfing = false;
@@ -792,9 +1253,12 @@ static void mem_guard(job **act, int na) {
 }
 static bool want_slice(job **act, int n, bool cur) {
     if (n <= 1) return true;
-    double rs = 0;
-    for (int i = 0; i < n; i++) rs += act[i]->srate > 0 ? act[i]->srate : spec_rate;
-    rs /= n;
+    if (n > SLICE_MAX_N) return false;
+    double rs = rr_rate[n]; // 實測（含切換）；還沒量過：各對話一段之內的速度平均
+    if (rs <= 0) {
+        for (int i = 0; i < n; i++) rs += act[i]->srate > 0 ? act[i]->srate : spec_rate;
+        rs /= n;
+    }
     double rb = bat_rate[n];
     if (rb <= 0) { const double c = qw_engine_par_cost(E, n); rb = c > 0 ? n * 1e3 / c : 0; }
     if (rs <= 0 || rb <= 0) return false; // 沒數字：一起（2 個以上通常比較快）
@@ -802,18 +1266,31 @@ static bool want_slice(job **act, int n, bool cur) {
 }
 // /status 的即時狀態（par_loop 每輪更新）
 static pthread_mutex_t st_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct { int np, cached, got; char state; } st_job[QW_PAR_MAX];
+static struct {
+    int id, np, cached, got, prefilled;
+    char state;
+    double tps, t0;
+    char model[64]; // 複製（job 結束後就被釋放）
+} st_job[QW_PAR_MAX];
 static int st_n;
 static const char *st_mode = "idle";
 static void st_publish(job **act, int na, const char *mode) {
+    int ninb = 0;
+    for (int i = 0; i < na; i++) ninb += act[i]->inb;
     pthread_mutex_lock(&st_mu);
     st_n = na;
     for (int i = 0; i < na; i++) {
         job *j = act[i];
+        st_job[i].id = j->id;
         st_job[i].np = j->np;
         st_job[i].cached = j->st.cached;
         st_job[i].got = j->got;
+        st_job[i].prefilled = j->pfing ? j->pfd : j->st.prompt ? j->np : 0;
         st_job[i].state = j->pfing ? 'p' : j->inb ? 'b' : 's';
+        // 每個對話的速度：一起 decode 時 = 實測總速度 ÷ 人數；輪流時 = 它自己推測解碼的實測（一段之內）
+        st_job[i].tps = j->inb ? (ninb > 0 && bat_rate[ninb] > 0 ? bat_rate[ninb] / ninb : 0) : j->srate;
+        st_job[i].t0 = j->tc;
+        snprintf(st_job[i].model, sizeof st_job[i].model, "%s", j->g.model);
     }
     if (mode) st_mode = mode;
     pthread_mutex_unlock(&st_mu);
@@ -825,18 +1302,24 @@ static void handle_status(conn *c) {
     for (job *q = q_head; q; q = q->next) queued++;
     pthread_mutex_unlock(&q_mu);
     sb_printf(&o, "{\"version\":\"%s\",\"profile\":\"%s\",\"uptime_s\":%.0f,\"parallel\":%d,\"done\":%lld,\"prompt_tokens\":%lld,"
-                  "\"cached_tokens\":%lld,\"output_tokens\":%lld,\"queued\":%d",
-              QW_VERSION, getenv("QW_GGUF") ? "gguf" : "mlx", qw_now() - T_START, PAR, st_done, st_in, st_cached, st_out, queued);
+                  "\"cached_tokens\":%lld,\"output_tokens\":%lld,\"queued\":%d,\"cancelled\":%lld,\"errors\":%lld",
+              QW_VERSION, getenv("QW_GGUF") ? "gguf" : "mlx", qw_now() - T_START, PAR, st_done, st_in, st_cached, st_out, queued, st_cancel, st_err);
     if (PAR > 1) {
         pthread_mutex_lock(&st_mu);
         sb_printf(&o, ",\"mode\":\"%s\",\"slot_mem_gb\":%.2f,\"slot_budget_gb\":%.1f,\"active\":[", st_n ? st_mode : "idle", st_mem / 1e9,
                   SLOT_BUDGET / 1e9);
-        for (int i = 0; i < st_n; i++)
-            sb_printf(&o, "%s{\"prompt\":%d,\"cached\":%d,\"generated\":%d,\"state\":\"%s\"}", i ? "," : "", st_job[i].np, st_job[i].cached,
-                      st_job[i].got, st_job[i].state == 'p' ? "prefill" : st_job[i].state == 'b' ? "batch" : "solo");
+        const double now = qw_now();
+        for (int i = 0; i < st_n; i++) {
+            sb_printf(&o, "%s{\"id\":%d,\"prompt\":%d,\"cached\":%d,\"prefilled\":%d,\"generated\":%d,\"state\":\"%s\",\"tps\":%.1f,\"age_s\":%.1f,\"model\":",
+                      i ? "," : "", st_job[i].id, st_job[i].np, st_job[i].cached, st_job[i].prefilled, st_job[i].got,
+                      st_job[i].state == 'p' ? "prefill" : st_job[i].state == 'b' ? "batch" : "solo", st_job[i].tps, now - st_job[i].t0);
+            sb_json_str(&o, st_job[i].model, strlen(st_job[i].model), false);
+            sb_puts(&o, "}");
+        }
         pthread_mutex_unlock(&st_mu);
         sb_printf(&o, "],\"rate\":{\"spec\":%.1f", spec_rate);
         for (int n = 2; n <= QW_PAR_MAX; n++) if (bat_rate[n] > 0) sb_printf(&o, ",\"batch%d\":%.1f", n, bat_rate[n]);
+        for (int n = 2; n <= QW_PAR_MAX; n++) if (rr_rate[n] > 0) sb_printf(&o, ",\"slice%d\":%.1f", n, rr_rate[n]);
         sb_printf(&o, "}");
     }
     sb_printf(&o, "}");
@@ -852,7 +1335,24 @@ static void *par_loop(void *arg) {
     int32_t toks[QW_PAR_MAX];
     static int prof = -1;
     if (prof < 0) prof = getenv("QW_PAR_PROF") != NULL;
+    double mode_t = 0;              // 上一次換做法的時間（MODE_HOLD_S）
+    int rr_n = 0, rr_tok = 0;       // 輪流推測解碼的牆鐘實測：目前在量幾個對話、累計 token 與時間
+    double rr_ms = 0;
     for (;;) {
+        for (int i = 0; i < nrejoin; i++) act[na++] = rejoin[i]; // 思考收尾後重新加入
+        nrejoin = 0;
+        { // 用戶端斷線（連線執行緒偵測到）：結束這個請求，GPU 不再為它算、slot 放出來
+            int keep = 0;
+            for (int i = 0; i < na; i++) {
+                job *j = act[i];
+                if (!conn_dead(j->c)) { act[keep++] = j; continue; }
+                fprintf(stderr, "[par] 用戶端斷線：取消請求（prompt %d，%s，已生成 %d 個 token）\n", j->np,
+                        j->pfing ? "分段 prefill 中" : j->pfy ? "prefill 讓出中" : j->inb ? "一起 decode 中" : "輪流中", j->got);
+                par_done(j, QW_FIN_CALLBACK);
+            }
+            na = keep;
+        }
+        par_na = na;
         if (!na) st_publish(act, 0, "idle");
         pthread_mutex_lock(&q_mu);
         while (!na && !q_head) pthread_cond_wait(&q_cv, &q_mu);
@@ -861,20 +1361,25 @@ static void *par_loop(void *arg) {
         while (q_head && na + nadm < PAR) {
             adm[nadm++] = q_head;
             q_head = q_head->next;
+            q_len--;
             if (!q_head) q_tail = NULL;
         }
         pthread_mutex_unlock(&q_mu);
+        const double t_it = qw_now();
+        double pf_ms = 0; // 這一輪花在 prefill 的時間（輪流速度的實測扣掉）
         for (int k = 0; k < nadm; k++) { // 新請求：選 slot
             job *j = adm[k];
             unsigned long long busy = 0;
             for (int i = 0; i < na; i++) busy |= 1ull << act[i]->sid;
             j->t0 = j->tg0 = qw_now();
             j->rng = j->gp.seed ? j->gp.seed : 0x1234567ull;
+            if (conn_dead(j->c)) { par_done(j, QW_FIN_CALLBACK); continue; } // 排隊時就斷線了
             j->sid = qw_engine_par_pick(E, j->ids, j->np, busy);
-            if (j->sid < 0) { par_done(j, QW_FIN_ERROR); continue; }
+            if (j->sid < 0) { par_fail(j, 529, "overloaded: no free KV slot"); continue; }
             if (j->gp.max_tokens <= 0) { par_done(j, QW_FIN_LENGTH); continue; }
             act[na++] = j;
         }
+        par_na = na;
         if (!na) continue;
         mem_guard(act, na);
         // 新請求：有別人在跑時分段 prefill（每輪一段，其他對話照常前進）
@@ -887,11 +1392,17 @@ static void *par_loop(void *arg) {
             int nready = 0;
             for (int i = 0; i < na; i++) nready += !act[i]->pfing;
             const bool go = nready == 0 || (qw_now() - pf_last) * 1e3 >= SLICE_MS * 2 / 3;
-            job *pj = NULL; // 剩最少的先算（短的新請求不必等長的算完）
-            for (int i = 0; go && i < na; i++)
-                if (act[i]->pfing && (!pj || act[i]->np - act[i]->pfd < pj->np - pj->pfd)) pj = act[i];
+            job *pj = NULL, *old = NULL; // 剩最少的先算（短的新請求不必等長的算完）；等超過 PF_AGE_S 秒的最舊的每隔一段輪到一次（不會一直被插隊）
+            const double now = qw_now();
+            for (int i = 0; go && i < na; i++) {
+                if (!act[i]->pfing) continue;
+                if (!pj || act[i]->np - act[i]->pfd < pj->np - pj->pfd) pj = act[i];
+                if (now - act[i]->t0 > PF_AGE_S && (!old || act[i]->t0 < old->t0)) old = act[i];
+            }
+            static bool age_turn;
+            if (old && old != pj && (age_turn = !age_turn)) pj = old;
             const bool ok = !pj || pf_chunk(pj);
-            if (pj) pf_last = qw_now();
+            if (pj) { pf_last = qw_now(); pf_ms += (pf_last - now) * 1e3; }
             int keep = 0;
             for (int i = 0; i < na; i++)
                 if (ok || act[i] != pj) act[keep++] = act[i];
@@ -901,19 +1412,37 @@ static void *par_loop(void *arg) {
         int nr = 0;
         for (int i = 0; i < na; i++) if (!act[i]->pfing) rd[nr++] = act[i];
         if (!nr) continue;
-        const bool s2 = want_slice(rd, nr, slice);
+        bool s2 = want_slice(rd, nr, slice);
+        // 換做法之後至少維持 MODE_HOLD_S 秒（只有一個對話、或超過 SLICE_MAX_N 個時照規則直接換）
+        if (s2 != slice && nr > 1 && nr <= SLICE_MAX_N && qw_now() - mode_t < MODE_HOLD_S) s2 = slice;
         st_publish(act, na, s2 ? "spec" : "batch");
-        if (s2 != slice && nr > 1) fprintf(stderr, "[par] %d 個對話：改成%s\n", nr, s2 ? "輪流推測解碼" : "一起 decode");
+        if (s2 != slice) {
+            mode_t = qw_now();
+            if (nr > 1) fprintf(stderr, "[par] %d 個對話：改成%s\n", nr, s2 ? "輪流推測解碼" : "一起 decode");
+        }
         slice = s2;
+        if (!slice || nr != rr_n) { rr_n = slice ? nr : 0; rr_tok = 0; rr_ms = 0; }
         if (slice) { // 推測解碼：輪流，一次一個（有人在分段 prefill 時也切時間片）
             for (int i = 0; i < nr; i++) if (rd[i]->inb) leave_batch(rd[i]);
             job *j = rd[rr % nr];
             rr = rr % nr + 1;
             par_others = na - 1;
             par_pfwait = na > nr;
-            const bool alive = run_solo(j);
+            int ng = 0;
+            double spf = 0;
+            const bool alive = run_solo(j, &ng, &spf);
             par_others = 0;
             par_pfwait = false;
+            if (nr > 1) { // 輪流的總速度：牆鐘（含切換、快照、排程），扣掉 prefill；每量滿 1 秒更新一次
+                rr_tok += ng;
+                rr_ms += (qw_now() - t_it) * 1e3 - pf_ms - spf;
+                if (rr_ms >= 1000) {
+                    rr_rate[nr] = ema(rr_rate[nr], rr_tok * 1e3 / rr_ms, 0.3);
+                    if (prof) fprintf(stderr, "[par] 輪流 %d 個：實測 %.1f tok/s（%d 個 token / %.0f ms）\n", nr, rr_tok * 1e3 / rr_ms, rr_tok, rr_ms);
+                    rr_tok = 0;
+                    rr_ms = 0;
+                }
+            }
             if (!alive) {
                 int keep = 0;
                 for (int i = 0; i < na; i++) if (act[i] != j) act[keep++] = act[i];
@@ -978,26 +1507,59 @@ static void *par_loop(void *arg) {
         if (prof) { static int c = 0; if (++c % 50 == 0) fprintf(stderr, "[par] B=%d：par_step %.2f ms（GPU %.2f）、取樣 %.2f ms；一起 %.0f tok/s、推測 %.0f tok/s\n", nb, (ts1 - ts0) * 1e3, gms, dt - (ts1 - ts0) * 1e3, bat_rate[nb], spec_rate); }
         for (int i = 0; i < nb; i++) {
             job *j = bj[i];
-            if (!lg) { par_done(j, QW_FIN_ERROR); continue; }
+            if (!lg) { par_fail(j, 500, "inference engine error (batch decode)"); continue; }
             if (j->np + j->got + 2 >= CTX) { par_done(j, QW_FIN_CTX); continue; }
             if (par_emit(j, nx[i])) act[na++] = j;
         }
     }
     return NULL;
 }
+// 排隊中就斷線了：直接從佇列拿掉（engine 不必碰它）。回傳 true = 拿掉了
+static bool q_cancel(job *j) {
+    bool got = false;
+    pthread_mutex_lock(&q_mu);
+    for (job **p = &q_head, *prev = NULL; *p; prev = *p, p = &(*p)->next)
+        if (*p == j) {
+            *p = j->next;
+            if (q_tail == j) q_tail = prev;
+            q_len--;
+            got = true;
+            break;
+        }
+    pthread_mutex_unlock(&q_mu);
+    if (got) {
+        j->fin = QW_FIN_CALLBACK;
+        atomic_store(&j->done, true);
+        fprintf(stderr, "[par] 用戶端斷線：取消排隊中的請求（prompt %d）\n", j->np);
+    }
+    return got;
+}
 static void par_chat(conn *c, const char *body, size_t blen, bool openai) {
     job *j = chat_begin(c, body, blen, openai);
     if (!j) return;
     j->sid = -1;
-    j->ids = realloc(j->ids, sizeof(int32_t) * (size_t)(j->np + j->gp.max_tokens + 2)); // 生成的 token 接在 prompt 後面
-    j->gen = j->ids + j->np;
+    pthread_mutex_lock(&q_mu);
+    const bool full = q_len >= QUEUE_MAX;
+    pthread_mutex_unlock(&q_mu);
+    if (full) { // 還沒送任何東西：回 HTTP 529，Claude Code 會退避重試
+        respond_err(c, 529, "overloaded: too many queued requests");
+        fprintf(stderr, "[par] 排隊已滿（%d 個）：回 529\n", QUEUE_MAX);
+        job_free(j);
+        return;
+    }
+    stream_start(j);
     pthread_mutex_lock(&q_mu);
     if (q_tail) q_tail->next = j;
     else q_head = j;
     q_tail = j;
+    q_len++;
     pthread_cond_signal(&q_cv);
-    while (!j->done) pthread_cond_wait(&done_cv, &q_mu);
     pthread_mutex_unlock(&q_mu);
+    // 等 engine 做完：這段時間輸出在這裡寫出去（keepalive、斷線偵測也在這裡）
+    while (!atomic_load(&j->done)) {
+        pump_step(c, &j->done);
+        if (conn_dead(c) && !atomic_load(&j->done) && q_cancel(j)) break;
+    }
     chat_end(j);
 }
 
@@ -1009,14 +1571,10 @@ static void handle_count(conn *c, const char *body, size_t blen) {
     if (!chat_from_anthropic(b, &r, err, sizeof err)) { respond_err(c, 400, err); js_free(b); return; }
     sbuf prompt = {0};
     chat_render(&r, &prompt);
-    if (getenv("QW_LOG_PROMPT")) { // 除錯：每個請求的完整 prompt 存成檔案
-        static int seq = 0;
-        char pth[256];
-        snprintf(pth, sizeof pth, "%s/req%03d.txt", getenv("QW_LOG_PROMPT"), seq++);
-        FILE *f = fopen(pth, "wb");
-        if (f) { fwrite(prompt.p, 1, prompt.n, f); fclose(f); }
-    }
+    log_prompt(&prompt);
+    tok_lock(); // engine 執行緒同時在 decode（tokenizer 有共用的快取）
     const int np = qw_tok_encode(TK, prompt.p, prompt.n, NULL, 0);
+    tok_unlock();
     char o[64];
     const int n = snprintf(o, sizeof o, "{\"input_tokens\":%d}", np);
     respond(c, 200, "application/json", o, (size_t)n);
@@ -1025,29 +1583,55 @@ static void handle_count(conn *c, const char *body, size_t blen) {
     js_free(b);
 }
 
+// 一個連線：讀請求 → 處理 → 把輸出寫完 → 關掉。par：--parallel（生成交給 engine 執行緒），否則在這個執行緒生成
+static void serve_conn(int fd, bool par) {
+    const int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    const struct timeval rt = {.tv_sec = RCVTIMEO_S}, st = {.tv_sec = SNDTIMEO_S};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof rt);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &st, sizeof st);
+    conn c;
+    conn_init(&c, fd);
+    char method[16], path[1024], emsg[160];
+    size_t blen = 0;
+    int status = 0;
+    char *body = read_req(&c, method, path, &blen, &status, emsg, sizeof emsg);
+    if (body) {
+        char *q = strchr(path, '?');
+        if (q) *q = 0;
+        const char *p = path;
+        if (!strncmp(p, "/v1/v1/", 7)) p += 3; // base URL 多寫了一次 /v1（同 Strata）
+        const bool post = !strcmp(method, "POST"), get = !strcmp(method, "GET");
+        if (post && !strcmp(p, "/v1/messages")) (par ? par_chat : handle_chat)(&c, body, blen, false);
+        else if (post && !strcmp(p, "/v1/chat/completions")) (par ? par_chat : handle_chat)(&c, body, blen, true);
+        else if (post && !strcmp(p, "/v1/messages/count_tokens")) handle_count(&c, body, blen);
+        else if (get && (!strcmp(p, "/v1/models") || !strcmp(p, "/models"))) {
+            const char *m = "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.8-flash-next\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"Qwen3.8 Flash Next (Qwental)\"}]}";
+            respond(&c, 200, "application/json", m, strlen(m));
+        } else if (!strcmp(p, "/health")) respond(&c, 200, "application/json", "{\"ok\":true}", 11);
+        else if (get && (!strcmp(p, "/dashboard") || !strcmp(p, "/"))) respond(&c, 200, "text/html; charset=utf-8", dashboard_html, sizeof dashboard_html);
+        else if (get && !strcmp(p, "/status")) handle_status(&c);
+        else {
+            char m[1100];
+            snprintf(m, sizeof m, "not found: %s %s", method, path);
+            respond_err(&c, 404, m);
+        }
+        free(body);
+    } else if (status) {
+        fprintf(stderr, "[http] 請求有問題（%d）：%s\n", status, emsg);
+        respond_err(&c, status, emsg);
+    }
+    pump_drain(&c);
+    close(fd);
+    conn_free(&c);
+}
+
 // --parallel：一個連線（執行緒）
 static void *conn_main(void *arg) {
     const int fd = *(int *)arg;
     free(arg);
-    conn c = {fd, false};
-    char method[16], path[1024];
-    size_t blen = 0;
-    char *body = read_req(fd, method, path, &blen);
-    if (body) {
-        char *q = strchr(path, '?');
-        if (q) *q = 0;
-        if (!strcmp(method, "POST") && !strcmp(path, "/v1/messages")) par_chat(&c, body, blen, false);
-        else if (!strcmp(method, "POST") && !strcmp(path, "/v1/chat/completions")) par_chat(&c, body, blen, true);
-        else if (!strcmp(method, "POST") && !strcmp(path, "/v1/messages/count_tokens")) handle_count(&c, body, blen);
-        else if (!strcmp(method, "GET") && (!strcmp(path, "/v1/models") || !strcmp(path, "/models"))) {
-            const char *m = "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.8-flash-next\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"Qwen3.8 Flash Next (Qwental)\"}]}";
-            respond(&c, 200, "application/json", m, strlen(m));
-        } else if (!strcmp(path, "/health")) respond(&c, 200, "application/json", "{\"ok\":true}", 11);
-        else if (!strcmp(method, "GET") && !strcmp(path, "/status")) handle_status(&c);
-        else respond_err(&c, 404, "not found");
-        free(body);
-    }
-    close(fd);
+    serve_conn(fd, true);
     return NULL;
 }
 
@@ -1061,14 +1645,15 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("qwental %s: Anthropic / OpenAI compatible server for Qwen3.8-Flash-Next on Apple M5 Max\n\n"
                    "usage: qwental-serve [--gguf DIR] [--model DIR] [--port 8080] [--host 127.0.0.1] [--ctx 131072]\n"
-                   "                     [--cache-dir cache] [--parallel [N]] [--slots 3]\n"
+                   "                     [--cache-dir cache] [--parallel [N]] [--slots 3] [--anthropic-thinking on_request|always]\n"
                    "                     [--int8] [--int8-qk] [--int8-hyper] [--fast-head] [--exact-spec] [--version]\n\n"
                    "  --gguf DIR      run the IQ3_S GGUF in DIR (DFlash2 pack in dflash2/ next to it)\n"
                    "  --model DIR     MLX weights (default models/Qwen3.8-Flash-Next-mixed-4-8bit)\n"
                    "  --cache-dir D   SSD prefix cache (\"\" = off)\n"
                    "  --parallel N    concurrent requests (default 16, 1 = one at a time)\n"
+                   "  --anthropic-thinking M  Anthropic requests that do not ask for thinking: on_request (default, no thinking) or always\n"
                    "  --int8          INT8 prefill (faster long prompts; outputs differ slightly)\n\n"
-                   "endpoints: POST /v1/messages, /v1/messages/count_tokens, /v1/chat/completions; GET /v1/models, /health, /status\n",
+                   "endpoints: POST /v1/messages, /v1/messages/count_tokens, /v1/chat/completions; GET /v1/models, /health, /status, /dashboard\n",
                    QW_VERSION);
             return 0;
         }
@@ -1089,6 +1674,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--slots")) setenv("QW_SLOTS", argv[i + 1], 1);
         else if (!strcmp(argv[i], "--cache-dir")) cache_dir = argv[i + 1];
         else if (!strcmp(argv[i], "--parallel")) PAR = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "--anthropic-thinking")) { // Anthropic 請求沒提思考時：on_request（預設，不思考）/ always（思考）
+            if (strcmp(argv[i + 1], "always") && strcmp(argv[i + 1], "on_request")) { fprintf(stderr, "❌ --anthropic-thinking 要是 on_request 或 always\n"); return 1; }
+            chat_think_unasked = !strcmp(argv[i + 1], "always");
+        }
         i++;
     }
     if (i8qk || i8hy) { // 類別清單：QW_INT8=1 的預設集合再加上 qk / hyper
@@ -1109,6 +1698,12 @@ int main(int argc, char **argv) {
     if (!TK) { fprintf(stderr, "❌ %s\n", err); return 1; }
     IM_END = qw_tok_special(TK, "<|im_end|>");
     EOT = qw_tok_special(TK, "<|endoftext|>");
+    { // 思考收尾的 token（</think> 是特殊 token，encode 會認出來）
+        const int nw = qw_tok_encode(TK, WRAP_TEXT, strlen(WRAP_TEXT), NULL, 0), nc = qw_tok_encode(TK, CLOSE_TEXT, strlen(CLOSE_TEXT), NULL, 0);
+        if (nw > 0 && nw <= (int)(sizeof WRAP_IDS / sizeof *WRAP_IDS)) NWRAP = qw_tok_encode(TK, WRAP_TEXT, strlen(WRAP_TEXT), WRAP_IDS, nw);
+        if (nc > 0 && nc <= (int)(sizeof CLOSE_IDS / sizeof *CLOSE_IDS)) NCLOSE = qw_tok_encode(TK, CLOSE_TEXT, strlen(CLOSE_TEXT), CLOSE_IDS, nc);
+    }
+    if (getenv("QW_PAR_SLICE_MAX")) SLICE_MAX_N = atoi(getenv("QW_PAR_SLICE_MAX"));
     const double t0 = qw_now();
     CTX = ctx;
     E = qw_engine_open(MODEL_DIR, ctx, err, sizeof err);
@@ -1181,8 +1776,8 @@ int main(int argc, char **argv) {
         for (;;) { // 每個連線一個執行緒
             const int fd = accept(ls, NULL, NULL);
             if (fd < 0) continue;
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
             int *a2 = malloc(sizeof(int));
+            if (!a2) { close(fd); continue; }
             *a2 = fd;
             pthread_t ct;
             pthread_attr_t at;
@@ -1196,25 +1791,6 @@ int main(int argc, char **argv) {
     for (;;) {
         const int fd = accept(ls, NULL, NULL);
         if (fd < 0) continue;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        conn c = {fd, false};
-        char method[16], path[1024];
-        size_t blen = 0;
-        char *body = read_req(fd, method, path, &blen);
-        if (body) {
-            char *q = strchr(path, '?');
-            if (q) *q = 0;
-            if (!strcmp(method, "POST") && !strcmp(path, "/v1/messages")) handle_chat(&c, body, blen, false);
-            else if (!strcmp(method, "POST") && !strcmp(path, "/v1/chat/completions")) handle_chat(&c, body, blen, true);
-            else if (!strcmp(method, "POST") && !strcmp(path, "/v1/messages/count_tokens")) handle_count(&c, body, blen);
-            else if (!strcmp(method, "GET") && (!strcmp(path, "/v1/models") || !strcmp(path, "/models"))) {
-                const char *m = "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.8-flash-next\",\"object\":\"model\",\"type\":\"model\",\"display_name\":\"Qwen3.8 Flash Next (Qwental)\"}]}";
-                respond(&c, 200, "application/json", m, strlen(m));
-            } else if (!strcmp(path, "/health")) respond(&c, 200, "application/json", "{\"ok\":true}", 11);
-            else if (!strcmp(method, "GET") && !strcmp(path, "/status")) handle_status(&c);
-            else respond_err(&c, 404, "not found");
-            free(body);
-        }
-        close(fd);
+        serve_conn(fd, false);
     }
 }

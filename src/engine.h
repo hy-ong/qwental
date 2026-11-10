@@ -1,7 +1,7 @@
 // Qwental 推論 engine（目前：decode 路徑，一次一個 token；prompt 也逐個 token 餵入）
 #pragma once
 
-#define QW_VERSION "1.5.0"
+#define QW_VERSION "1.5.1"
 #include <stdbool.h>
 #include <stdint.h>
 #include "gpu.h"
@@ -77,7 +77,7 @@ const void *qw_engine_trace_buf(qw_engine *e, int tok);
 // ---- 並發（--parallel N）：每個對話一個 slot（QW_SLOTS ≥ 並發數）。GGUF 與單獨跑逐位元相同；MLX 只在 QW_EXACT_SPEC 時相同（否則捨入略有不同）
 int qw_engine_par_slots(qw_engine *e);
 enum { QW_PAR_MAX = 64 }; // 最多幾個對話同時進行（每步超過 8 個時分組算）
-int qw_engine_par_pick(qw_engine *e, const int32_t *prompt, int np, unsigned long long busy); // 選沒在用的 slot（busy 位元 = 正在用），-1 = 沒有
+int qw_engine_par_pick(qw_engine *e, const int32_t *prompt, int np, unsigned long long busy); // 選沒在用的 slot（busy 位元 = 正在用；不為了共用前綴蓋掉長對話），-1 = 沒有
 const float *qw_engine_par_prefill(qw_engine *e, int sid, const int32_t *prompt, int np, int *cached); // 回傳最後位置的 logits
 const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prompt, int np, int chunk, int *done, int *cached); // 分段：一次最多 chunk 個，*done = 算到哪（> 0 從那裡接著算）
 void qw_engine_par_persist(qw_engine *e, const int *pos, int n); // 接下來的 par_prefill 處理到這些位置時把狀態存到 SSD（同 qw_gen.persist）
@@ -87,7 +87,7 @@ int qw_engine_par_solo(qw_engine *e, int sid, const int32_t *prompt, int np, con
                        qw_gen_stats *st); // 只有一個請求：在 slot sid 走一般生成（推測解碼）；cb 回傳 false 中途停下
 double qw_engine_par_cost(qw_engine *e, int B); // B 個對話一起 decode 一步的預估牆鐘 ms（最佳分組；0 = 還沒量過）
 size_t qw_engine_par_mem(qw_engine *e); // 各 slot 佔的記憶體合計（位元組）
-int qw_engine_par_trim(qw_engine *e, unsigned long long busy, size_t budget, bool one); // 超過 budget 就釋放最久沒用的閒置 slot（one：只放一組）；回傳放了幾組
+int qw_engine_par_trim(qw_engine *e, unsigned long long busy, size_t budget, bool one); // 超過 budget 就釋放閒置 slot（重算成本 × 近期度最小的先放；one：只放一組）；回傳放了幾組
 const float *qw_engine_par_vstep(qw_engine *e, const int *sids, const int *n, const int32_t *toks, int B,
                                  double *gpu_ms); // 並發推測解碼：對話 i 驗證 n[i] 個 token（toks 依序排，Σn ≤ 8；GGUF）；回傳 [Σn][vocab] logits
 int qw_engine_par_vaccept(qw_engine *e, const int *acc, const int32_t *nx); // 上一次 vstep 之後：對話 i 接受了 acc[i] 個猜測（狀態寫回、位置前進）；

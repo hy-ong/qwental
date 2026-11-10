@@ -675,13 +675,27 @@ int qw_tok_encode(const qw_tok *t, const char *text, size_t len, int32_t *out, i
             text = norm;
             break;
         }
+    // QW_TOK_PLAIN 標記：拿掉標記本身，並記下它後面那個位置不比對特殊 token（訊息內容裡的 "<|im_end|>" 等照一般文字編碼）
+    char *plain = NULL;
+    uint8_t *nosp = NULL;
+    if (len >= 4 && memmem(text, len, QW_TOK_PLAIN, 4)) {
+        plain = malloc(len);
+        nosp = calloc(len + 1, 1);
+        size_t o = 0;
+        for (size_t k = 0; k < len;) {
+            if (k + 4 <= len && !memcmp(text + k, QW_TOK_PLAIN, 4)) { nosp[o] = 1; k += 4; continue; }
+            plain[o++] = text[k++];
+        }
+        len = o;
+        text = plain;
+    }
     const uint8_t *s = (const uint8_t *)text;
     int pos = 0;
     size_t i = 0, seg = 0;
     while (i <= len) {
         // 特殊 token
         int hit = -1;
-        if (i < len && s[i] == '<')
+        if (i < len && s[i] == '<' && !(nosp && nosp[i]))
             for (int k = 0; k < t->nsp; k++)
                 if ((size_t)t->sp[k].len <= len - i && !memcmp(s + i, t->sp[k].s, (size_t)t->sp[k].len)) {
                     if (hit < 0 || t->sp[k].len > t->sp[hit].len) hit = k;
@@ -702,6 +716,8 @@ int qw_tok_encode(const qw_tok *t, const char *text, size_t len, int32_t *out, i
         }
         i++;
     }
+    free(plain);
+    free(nosp);
     free(norm);
     return pos;
 }

@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.5.1 — 2026-11-10
+
+Claude Code works fully, also with subagents. Engine output is unchanged: on the original IQ3_S GGUF, default, INT8 and speculative outputs are bit-identical to 1.5.0 (and so to 1.0.0); concurrent output is still bit-identical to running each request alone.
+
+### Requests as Claude Code sends them
+Checked against 62 captured Claude Code 2.1.322 requests: the rendered prompt matches the official chat template byte for byte.
+- `role: "system"` messages inside `messages` (Claude Code's environment, language setting, date and deferred-tool list) were dropped; leading ones now join the system prompt and later ones become user turns, as in Strata.
+- Thinking effort follows the template: `high` / `xhigh` / `max` → xhigh (was medium), `budget_tokens` maps to an effort level, `none` / `off` disable thinking. Requests that do not ask for thinking skip it (`--anthropic-thinking on_request`, the default; `always` keeps the old behavior).
+- The volatile `x-anthropic-billing-header` stamp is pinned, so the system prefix stays cacheable.
+- Special-token literals in content (`<|im_end|>`, `</think>`, `<tool_call>` … in files or tool output) are tokenized as plain text instead of control tokens.
+- Output parser rewritten after Strata's: `</parameter>` inside a value no longer truncates it, several calls in one `<tool_call>`, calls written inside thinking or without `<tool_call>` are recovered, mangled tool names are mapped to declared tools, no call is dropped silently, and a call cut off by `max_tokens` is returned as text instead of a partial `tool_use`.
+- Completed empty assistant turns are skipped; `defer_loading` tools are left out of the tool list and `tool_reference` expands them; tool order is kept stable; images and binary documents get a clear note.
+
+### Server
+- Writes never block the engine: each connection has its own output buffer and a 30 s send timeout, so a stopped client (Ctrl-Z) no longer freezes every conversation.
+- Keepalive `ping` every 10 s while a request is queued, prefilling or emitting a tool call.
+- Cancellation: a closed connection is detected within 0.5 s, its request stops and its slot is released.
+- Engine failures are reported (SSE `error` / HTTP 500 / 529) instead of an empty `end_turn`; more than 64 queued requests get 529.
+- `usage` reports `cache_read_input_tokens` / `cache_creation_input_tokens` as Strata does.
+- Thinking leaves room for the answer: with `max_tokens` ≥ 1024 thinking is wrapped up before the last quarter; a turn that stops inside thinking is closed and continued.
+- `stop_sequences` match only answer text and are escaped in `message_delta`; `count_tokens` takes the tokenizer lock; request size limits (413 / 431 / 408); correct status texts and error types; `/v1/v1/…` alias; the requested model name is echoed.
+- Scheduler: with 15 subagents active, 1.5.0 kept time-slicing speculative decoding and every request got 0.2–0.3 tok/s. More than 3 conversations now always decode together, a time slice lasts at least 250 ms, the time-sliced rate is measured on the wall clock including switches, and a mode is kept at least 5 s.
+- Slots: a subagent sharing the system and tools prefix no longer overwrites the main conversation's slot, and memory pressure evicts by tokens held and idle time instead of pure LRU (long conversations are written to the SSD cache first). Main conversation of 60K tokens with 3 subagents: next turn 33.4 s → 0.6 s.
+- `GET /dashboard` (and `/`): a live web page on `/status`; `/status` lists each active conversation with id, prefill progress, tok/s, age and model name, plus cancelled and error counts.
+
+### Tests
+- `build/chattest` (parser, effort mapping, special-token escaping), `tools/chat_template_diff.py` (rendering against the official template), `tests/serve_e2e.sh` (18 server checks), `bench/slot_keep.py` (main conversation kept while subagents run).
+
 ## 1.5.0 — 2026-11-09
 
 Runs the abliterated SC117 IQ3_S GGUF ([`SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF`](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)) at full speed, concurrency included. On the original IQ3_S GGUF nothing changes: default, INT8 and speculative outputs are bit-identical to 1.4.0 (and so to 1.0.0).

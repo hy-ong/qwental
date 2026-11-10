@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwental 儀表板</title>
+<style>
+:root {
+  --bg: #0e1116; --panel: #161b22; --panel2: #1c222b; --line: #2a313c;
+  --fg: #e6edf3; --dim: #8b949e; --faint: #5c6570;
+  --accent: #58a6ff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --violet: #bc8cff;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f8fa; --panel: #ffffff; --panel2: #f0f3f6; --line: #d8dee4;
+    --fg: #1f2328; --dim: #59636e; --faint: #8c959f;
+    --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --violet: #8250df;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); }
+.wrap { max-width: 1400px; margin: 0 auto; padding: 16px 20px 32px; min-width: 760px; }
+.num, td, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding-bottom: 14px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+header .meta { display: flex; gap: 14px; color: var(--dim); font-size: 13px; flex-wrap: wrap; }
+header .meta b { color: var(--fg); font-weight: 500; font-family: var(--mono); }
+.conn { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 4px 10px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
+.conn.ok .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.conn.bad { border-color: var(--bad); color: var(--bad); }
+.conn.bad .dot { background: var(--bad); }
+.banner { display: none; margin-bottom: 16px; padding: 12px 16px; border-radius: 8px; border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 12%, var(--panel)); color: var(--fg); }
+.banner.show { display: block; }
+.banner b { color: var(--bad); }
+.stale { opacity: .45; transition: opacity .3s; }
+.grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.card .lbl { color: var(--dim); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card .lbl i { font-style: normal; color: var(--faint); }
+.card .big { font-family: var(--mono); font-size: 30px; font-weight: 600; line-height: 1.15; margin-top: 4px; white-space: nowrap; }
+.card .big small { font-size: 15px; color: var(--dim); font-weight: 400; }
+.card .sub { color: var(--dim); font-size: 12px; margin-top: 4px; font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card .hint { color: var(--dim); font-size: 12px; margin-top: 4px; }
+.bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 8px; position: relative; }
+.bar > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
+.bar.over > span { background: var(--bad); }
+.over-txt { color: var(--bad) !important; }
+#k-mem-sub { white-space: normal; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-family: var(--sans); border: 1px solid currentColor; line-height: 1.5; }
+.m-spec { color: var(--violet); } .m-batch { color: var(--accent); } .m-idle { color: var(--faint); }
+.s-prefill { color: var(--warn); } .s-solo { color: var(--violet); } .s-batch { color: var(--accent); } .s-other { color: var(--dim); }
+.row2 { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.panel h2 { font-size: 13.5px; margin: 0 0 8px; font-weight: 600; display: flex; align-items: baseline; gap: 10px; }
+.panel h2 .note { color: var(--dim); font-weight: 400; font-size: 12px; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--dim); margin-left: auto; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; background: var(--c); }
+.chartp { display: flex; flex-direction: column; }
+.cbox { position: relative; flex: 1; min-height: 170px; }
+.cbox canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: right; color: var(--dim); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; font-family: var(--sans); }
+td { text-align: right; padding: 5px 8px; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); white-space: nowrap; }
+th:first-child, td:first-child, th.l, td.l { text-align: left; }
+tbody tr:hover { background: var(--panel2); }
+td.cache { width: 26%; }
+.cbar { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.cbar .bar { flex: 1; margin: 0; max-width: 220px; }
+.cbar .bar > span { background: var(--ok); }
+.cbar .pct { width: 4.2em; text-align: right; }
+.empty { color: var(--dim); text-align: center; padding: 18px; font-family: var(--sans); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+.kv dt { color: var(--dim); }
+.kv dd { margin: 0; text-align: right; font-family: var(--mono); }
+.rates { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.rates .r { display: grid; grid-template-columns: 5.5em 1fr 5em; align-items: center; gap: 8px; font-size: 12px; margin: 3px 0; }
+.rates .r .bar { margin: 0; }
+.rates .r .v { text-align: right; font-family: var(--mono); }
+.rates .r.cur .k { color: var(--fg); font-weight: 600; }
+.rates .r .k { color: var(--dim); font-family: var(--mono); }
+footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; gap: 16px; flex-wrap: wrap; }
+@media (max-width: 1180px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 980px) { .row2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Qwental</h1>
+    <div class="meta">
+      <span>版本 <b id="h-ver">—</b></span>
+      <span>格式 profile <b id="h-prof">—</b></span>
+      <span>已執行 uptime <b id="h-up">—</b></span>
+    </div>
+    <div class="conn" id="conn"><span class="dot"></span><span id="conn-txt">連線中…</span></div>
+  </header>
+
+  <div class="banner" id="banner"><b>連不到伺服器 server unreachable</b> — <span id="banner-txt"></span>。每秒自動重試<span id="banner-stale">；下方是最後一次成功取得的資料</span>。</div>
+
+  <div id="main">
+  <section class="grid">
+    <div class="card">
+      <div class="lbl">進行中對話 <i>active / parallel</i></div>
+      <div class="big"><span id="k-act">—</span><small> / <span id="k-par">—</span></small></div>
+      <div class="bar"><span id="k-act-bar" style="width:0"></span></div>
+    </div>
+    <div class="card">
+      <div class="lbl">排隊中 <i>queued</i></div>
+      <div class="big" id="k-q">—</div>
+      <div class="hint" id="k-q-hint">等待空出的 slot</div>
+    </div>
+    <div class="card">
+      <div class="lbl">解碼模式 <i>mode</i></div>
+      <div class="big" style="font-size:22px;margin-top:8px"><span class="pill m-idle" id="k-mode">—</span></div>
+      <div class="hint" id="k-mode-hint">—</div>
+    </div>
+    <div class="card">
+      <div class="lbl">輸出速度 <i>output tok/s</i></div>
+      <div class="big" id="k-tps">—</div>
+      <div class="sub" id="k-tps-sub">近 5 秒平均</div>
+    </div>
+    <div class="card">
+      <div class="lbl">快取命中 <i>cache hit</i></div>
+      <div class="big" id="k-hit">—</div>
+      <div class="sub" id="k-hit-sub">近期 —</div>
+    </div>
+    <div class="card" id="c-mem">
+      <div class="lbl">Slot 記憶體 <i>used / budget</i></div>
+      <div class="big"><span id="k-mem">—</span><small> GB</small></div>
+      <div class="bar" id="k-mem-barw"><span id="k-mem-bar" style="width:0"></span></div>
+      <div class="sub" id="k-mem-sub">預算 —</div>
+    </div>
+  </section>
+
+  <section class="row2">
+    <div class="panel chartp">
+      <h2>近 5 分鐘 <span class="note">每秒取樣，只存在這個分頁</span>
+        <span class="legend"><span style="--c:var(--accent)">輸出 tok/s</span><span style="--c:var(--violet)">進行中對話</span></span></h2>
+      <div class="cbox"><canvas id="chart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>累計 totals <span class="note">伺服器啟動以來</span></h2>
+      <dl class="kv">
+        <dt>完成請求 requests</dt><dd id="t-done">—</dd>
+        <dt>Prompt tokens</dt><dd id="t-in">—</dd>
+        <dt>快取重用 cached</dt><dd id="t-cached">—</dd>
+        <dt>實際 prefill</dt><dd id="t-pf">—</dd>
+        <dt>輸出 output</dt><dd id="t-out">—</dd>
+        <dt>平均輸出 / 請求</dt><dd id="t-avg">—</dd>
+      </dl>
+      <div class="rates" id="rates" hidden>
+        <div class="lbl" style="color:var(--dim);font-size:12px;margin-bottom:4px">實測速度 measured（EMA，用來選模式）</div>
+        <div id="rates-list"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>進行中對話 active conversations <span class="note" id="tbl-note"></span></h2>
+    <table>
+      <thead><tr>
+        <th class="l">#</th><th class="l">狀態 state</th><th>Prompt</th><th>快取 cached</th><th class="cache">命中 hit</th><th>需 prefill</th><th>已生成 generated</th><th>tok/s</th>
+      </tr></thead>
+      <tbody id="tbody"><tr><td colspan="8" class="empty">等待資料…</td></tr></tbody>
+    </table>
+  </section>
+  </div>
+
+  <footer>
+    <span>資料來源 <span class="mono">GET /status</span>，每秒輪詢</span>
+    <span id="f-last">—</span>
+    <span>spec = 每個對話各自推測解碼 speculative；batch = 多個對話一起 decode</span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const POLL_MS = 1000, HIST_S = 300, TPS_WIN = 5, HIT_WIN = 60;
+  const num = (v) => (typeof v === "number" && isFinite(v) ? v : null);
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+  function human(n, d) {
+    n = num(n); if (n === null) return "—";
+    const a = Math.abs(n);
+    if (a >= 1e9) return (n / 1e9).toFixed(d ?? 2) + "B";
+    if (a >= 1e6) return (n / 1e6).toFixed(d ?? 2) + "M";
+    if (a >= 1e4) return (n / 1e3).toFixed(d ?? 1) + "K";
+    return Math.round(n).toLocaleString("en-US");
+  }
+  const pct = (x) => (x === null || !isFinite(x) ? "—" : (x * 100).toFixed(1) + "%");
+  function dur(s) {
+    s = num(s); if (s === null) return "—";
+    s = Math.floor(s);
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    if (d) return `${d}d ${h}h ${m}m`;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${x}s`;
+    return `${x}s`;
+  }
+  const fmtTps = (v) => (v === null ? "—" : v >= 100 ? v.toFixed(0) : v.toFixed(1));
+
+  const STATES = {
+    prefill: ["prefill 讀入中", "s-prefill"], p: ["prefill 讀入中", "s-prefill"],
+    solo: ["solo 單獨推測", "s-solo"], s: ["solo 單獨推測", "s-solo"],
+    batch: ["batch 一起解碼", "s-batch"], b: ["batch 一起解碼", "s-batch"],
+  };
+  const MODES = {
+    spec: ["spec", "m-spec", "推測解碼 speculative：每個對話各自跑"],
+    batch: ["batch", "m-batch", "多個對話一起 decode，總吞吐較高"],
+    idle: ["idle", "m-idle", "沒有進行中的對話"],
+  };
+
+  // ---- state ----
+  let samples = [];     // {t, out, in, cached, act}
+  let prevRows = [];    // [{prompt, cached, gen, t, tps}]
+  let last = null, lastOk = 0, failing = false, inflight = false;
+
+  // 沒有穩定的 job id：用 (prompt, cached) 當簽章配對前後兩次的列，並要求 generated 不倒退
+  function matchRows(rows, t) {
+    const pool = prevRows.slice();
+    return rows.map((r) => {
+      let best = -1;
+      for (let i = 0; i < pool.length; i++) {
+        const p = pool[i];
+        if (p && p.prompt === r.prompt && p.cached === r.cached && r.gen >= p.gen) {
+          if (best < 0 || Math.abs(p.gen - r.gen) < Math.abs(pool[best].gen - r.gen)) best = i;
+        }
+      }
+      let tps = null, since = t, gen0 = r.gen;
+      if (best >= 0) {
+        const p = pool[best]; pool[best] = null;
+        since = p.since; gen0 = p.gen0;
+        const dt = (t - p.t) / 1000;
+        if (dt > 0) {
+          const inst = (r.gen - p.gen) / dt;
+          tps = p.tps === null ? inst : p.tps * 0.5 + inst * 0.5;
+        }
+      }
+      return { ...r, t, tps, since, gen0 };
+    });
+  }
+
+  function windowed(key, win) {
+    const n = samples.length; if (n < 2) return null;
+    const lastS = samples[n - 1];
+    let i = n - 1;
+    while (i > 0 && lastS.t - samples[i - 1].t <= win * 1000 + 300) i--;
+    const a = samples[i]; if (a === lastS) return null;
+    return { a, b: lastS, dt: (lastS.t - a.t) / 1000 };
+  }
+
+  function render(d, t) {
+    const out = num(d.output_tokens), pin = num(d.prompt_tokens), cch = num(d.cached_tokens);
+    const active = Array.isArray(d.active) ? d.active : null;
+    const par = num(d.parallel);
+    const nAct = active ? active.length : null;
+
+    // 計數歸零（伺服器重啟）就清掉歷史
+    const prevS = samples[samples.length - 1];
+    if (prevS && out !== null && prevS.out !== null && out < prevS.out) { samples = []; prevRows = []; }
+    samples.push({ t, out, in: pin, cached: cch, act: nAct, tps: null });
+    while (samples.length && t - samples[0].t > HIST_S * 1000 + 2000) samples.shift();
+
+    // tok/s
+    let tps = null;
+    const w = windowed("out", TPS_WIN);
+    if (w && w.a.out !== null && w.b.out !== null && w.dt > 0) tps = Math.max(0, (w.b.out - w.a.out) / w.dt);
+
+    // header
+    $("h-ver").textContent = d.version ?? "—";
+    $("h-prof").textContent = d.profile ?? "—";
+    $("h-up").textContent = dur(d.uptime_s);
+
+    // rows
+    const rows = (active || []).map((a) => ({
+      prompt: num(a?.prompt) ?? 0, cached: num(a?.cached) ?? 0, gen: num(a?.generated) ?? 0,
+      state: typeof a?.state === "string" ? a.state : "?", id: a?.id,
+      stps: num(a?.tps),
+    }));
+    const hasId = rows.some((r) => r.id !== undefined && r.id !== null);
+    let matched;
+    if (hasId) {
+      const byId = new Map(prevRows.map((p) => [String(p.id), p]));
+      matched = rows.map((r) => {
+        const p = byId.get(String(r.id));
+        let tpsR = null;
+        if (p) { const dt = (t - p.t) / 1000; if (dt > 0) { const inst = (r.gen - p.gen) / dt; tpsR = p.tps === null ? inst : p.tps * 0.5 + inst * 0.5; } }
+        return { ...r, t, tps: tpsR };
+      });
+    } else matched = matchRows(rows, t);
+    prevRows = matched;
+
+    // 若伺服器沒給 per-job 速度，就用 per-row 推導值總和當備案（只在 out 計數缺時）
+    if (tps === null && matched.length && samples.length > 1) {
+      const s = matched.reduce((acc, r) => acc + (r.stps ?? r.tps ?? 0), 0);
+      if (s > 0) tps = s;
+    }
+    samples[samples.length - 1].tps = tps;
+
+    // cards
+    $("k-act").textContent = nAct === null ? (par === 1 ? "—" : "—") : nAct;
+    $("k-par").textContent = par ?? "—";
+    $("k-act-bar").style.width = nAct !== null && par ? Math.min(100, (nAct / par) * 100) + "%" : "0";
+    const q = num(d.queued);
+    $("k-q").textContent = q ?? "—";
+    $("k-q").style.color = q ? "var(--warn)" : "";
+    $("k-q-hint").textContent = q ? "對話數已達上限，等待空出的 slot" : "沒有等待中的請求";
+
+    const mode = typeof d.mode === "string" ? d.mode : (par === 1 ? "single" : null);
+    const mi = MODES[mode] || [mode ?? "—", "m-idle", mode === "single" ? "單一對話模式（parallel=1）" : "—"];
+    const mEl = $("k-mode"); mEl.textContent = mi[0]; mEl.className = "pill " + mi[1];
+    $("k-mode-hint").textContent = mi[2];
+
+    $("k-tps").textContent = fmtTps(tps);
+    const perConv = tps !== null && nAct ? tps / nAct : null;
+    $("k-tps-sub").textContent = `近 ${TPS_WIN} 秒` + (perConv !== null ? ` · 每對話 ≈ ${fmtTps(perConv)}` : "");
+
+    const hit = pin ? (cch ?? 0) / pin : null;
+    $("k-hit").textContent = pct(hit);
+    const hw = windowed("in", HIT_WIN);
+    let rhit = null, rin = 0;
+    if (hw && hw.a.in !== null && hw.b.in !== null) {
+      rin = hw.b.in - hw.a.in;
+      if (rin > 0) rhit = ((hw.b.cached ?? 0) - (hw.a.cached ?? 0)) / rin;
+    }
+    $("k-hit-sub").textContent = rhit !== null ? `近 ${Math.round(hw.dt)} 秒 ${pct(rhit)}` : "近期尚無完成請求";
+
+    const mem = num(d.slot_mem_gb), bud = num(d.slot_budget_gb);
+    $("k-mem").textContent = mem === null ? "—" : mem.toFixed(1);
+    const over = mem !== null && bud !== null && mem > bud;
+    $("k-mem-barw").classList.toggle("over", over);
+    $("k-mem").classList.toggle("over-txt", over);
+    $("k-mem-bar").style.width = mem !== null && bud ? Math.min(100, (mem / bud) * 100) + "%" : "0";
+    $("k-mem-sub").textContent = bud === null ? "預算 —" :
+      `預算 ${bud.toFixed(1)} GB · ${pct(mem / bud)}` + (over ? " · 超過預算，會釋放閒置 slot" : "");
+    $("k-mem-sub").classList.toggle("over-txt", over);
+
+    // totals
+    $("t-done").textContent = human(d.done);
+    $("t-in").textContent = human(pin);
+    $("t-cached").textContent = human(cch) + (hit !== null ? `  (${pct(hit)})` : "");
+    $("t-pf").textContent = pin !== null && cch !== null ? human(pin - cch) : "—";
+    $("t-out").textContent = human(out);
+    const dn = num(d.done);
+    $("t-avg").textContent = dn && out !== null ? human(out / dn) + " tok" : "—";
+
+    // measured rates: server 送的是 "rate"，也接受 "rates"
+    const rt = d.rate && typeof d.rate === "object" ? d.rate : d.rates && typeof d.rates === "object" ? d.rates : null;
+    if (rt) {
+      const ents = Object.entries(rt).filter(([, v]) => num(v) !== null && v > 0);
+      ents.sort((a, b) => (a[0] === "spec" ? -1 : b[0] === "spec" ? 1 : (parseInt(a[0].slice(5)) || 0) - (parseInt(b[0].slice(5)) || 0)));
+      const mx = Math.max(1, ...ents.map(([, v]) => v));
+      const curKey = mode === "spec" ? "spec" : mode === "batch" ? "batch" + (rows.filter((r) => r.state === "batch").length || nAct) : "";
+      $("rates").hidden = !ents.length;
+      $("rates-list").innerHTML = ents.map(([k, v]) =>
+        `<div class="r${k === curKey ? " cur" : ""}"><span class="k">${esc(k === "spec" ? "spec ×1" : k.replace("batch", "batch ×"))}</span>` +
+        `<div class="bar"><span style="width:${(v / mx) * 100}%;background:${k === "spec" ? "var(--violet)" : "var(--accent)"}"></span></div>` +
+        `<span class="v">${fmtTps(v)}</span></div>`).join("");
+    } else $("rates").hidden = true;
+
+    // table
+    const tb = $("tbody");
+    if (!active) {
+      tb.innerHTML = `<tr><td colspan="8" class="empty">${par === 1 ? "parallel = 1：伺服器不回報個別對話" : "伺服器沒有回報 active 欄位"}</td></tr>`;
+    } else if (!matched.length) {
+      tb.innerHTML = `<tr><td colspan="8" class="empty">目前沒有進行中的對話</td></tr>`;
+    } else {
+      tb.innerHTML = matched.map((r, i) => {
+        const st = STATES[r.state] || [r.state, "s-other"];
+        const h = r.prompt ? r.cached / r.prompt : 0;
+        const rt2 = r.stps ?? r.tps;
+        return `<tr><td class="l" style="color:var(--faint)">${hasId ? esc(r.id) : i + 1}</td>` +
+          `<td class="l"><span class="pill ${st[1]}">${esc(st[0])}</span></td>` +
+          `<td>${human(r.prompt)}</td><td>${human(r.cached)}</td>` +
+          `<td class="cache"><div class="cbar"><div class="bar"><span style="width:${(h * 100).toFixed(1)}%"></span></div><span class="pct">${pct(h)}</span></div></td>` +
+          `<td>${human(Math.max(0, r.prompt - r.cached))}</td>` +
+          `<td>${human(r.gen)}</td>` +
+          `<td>${r.state === "prefill" || r.state === "p" ? '<span style="color:var(--faint)">—</span>' : fmtTps(rt2 === null || rt2 === undefined ? null : Math.max(0, rt2))}</td></tr>`;
+      }).join("");
+    }
+    $("tbl-note").textContent = active && matched.length
+      ? (hasId ? `${matched.length} 個` : `${matched.length} 個 · 無穩定 id，tok/s 以 prompt+cached 配對推算`) : "";
+
+    drawChart();
+  }
+
+  // ---- chart ----
+  function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function drawChart() {
+    const cv = $("chart"), dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = cv.clientHeight;
+    if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+    const padL = 40, padR = 30, padT = 8, padB = 18, pw = W - padL - padR, ph = H - padT - padB;
+    const now = samples.length ? samples[samples.length - 1].t : Date.now();
+    const x = (t) => padL + pw * (1 - (now - t) / (HIST_S * 1000));
+    const tv = samples.map((s) => s.tps).filter((v) => v !== null);
+    const av = samples.map((s) => s.act).filter((v) => v !== null);
+    const tmax = niceMax(Math.max(10, ...tv));
+    const amax = Math.max(1, num(last?.parallel) ?? 1, ...av);
+    const line = cssVar("--line"), dim = cssVar("--faint");
+    g.font = `11px ${cssVar("--mono")}`; g.fillStyle = dim; g.strokeStyle = line; g.lineWidth = 1;
+    for (let k = 0; k <= 5; k++) {
+      const y = padT + ph * (1 - k / 5);
+      g.beginPath(); g.moveTo(padL, y + .5); g.lineTo(padL + pw, y + .5); g.stroke();
+      g.textAlign = "right"; g.fillText(String(+((tmax * k) / 5).toPrecision(3)), padL - 6, y + 4);
+    }
+    g.textAlign = "left";
+    for (const f of [0, 0.5, 1]) {
+      const v = amax * f;
+      if (f === 0.5 && v % 1) continue;
+      g.fillText(String(v), padL + pw + 6, padT + ph * (1 - f) + 4);
+    }
+    g.textAlign = "center";
+    for (const m of [5, 4, 3, 2, 1, 0]) g.fillText(m ? `-${m}m` : "now", padL + pw * (1 - m / 5), H - 4);
+
+    const series = (key, mx, color, fill) => {
+      // 斷線期間的 null 樣本把線切成好幾段
+      const segs = [[]];
+      for (const s of samples) {
+        if (s[key] === null) { if (segs[segs.length - 1].length) segs.push([]); continue; }
+        segs[segs.length - 1].push([x(s.t), padT + ph * (1 - Math.min(1, s[key] / mx))]);
+      }
+      for (const pts of segs) {
+        if (pts.length < 2) continue;
+        g.beginPath(); pts.forEach(([px, py], i) => (i ? g.lineTo(px, py) : g.moveTo(px, py)));
+        g.strokeStyle = color; g.lineWidth = 1.8; g.lineJoin = "round"; g.stroke();
+        if (fill) {
+          g.lineTo(pts[pts.length - 1][0], padT + ph); g.lineTo(pts[0][0], padT + ph); g.closePath();
+          g.globalAlpha = .14; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
+        }
+      }
+    };
+    series("act", amax, cssVar("--violet"), false);
+    series("tps", tmax, cssVar("--accent"), true);
+  }
+  function niceMax(v) {
+    const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p;
+    return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p;
+  }
+
+  // ---- connection ----
+  function setConn(ok, msg) {
+    const c = $("conn");
+    c.classList.toggle("ok", ok); c.classList.toggle("bad", !ok);
+    $("conn-txt").textContent = msg;
+    $("banner").classList.toggle("show", !ok);
+    $("main").classList.toggle("stale", !ok && !!last);
+  }
+
+  async function poll() {
+    if (inflight) return;
+    inflight = true;
+    const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 3000);
+    try {
+      const r = await fetch("/status", { cache: "no-store", signal: ctl.signal });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const d = await r.json();
+      if (!d || typeof d !== "object") throw new Error("回應不是 JSON 物件");
+      const t = Date.now();
+      last = d; lastOk = t; failing = false;
+      setConn(true, "已連線 live");
+      render(d, t);
+      $("f-last").textContent = "最後更新 " + new Date(t).toLocaleTimeString("zh-TW", { hour12: false });
+    } catch (e) {
+      failing = true;
+      const why = e.name === "AbortError" ? "逾時 timeout" : (e.message || String(e));
+      const ago = lastOk ? `，上次成功 ${dur((Date.now() - lastOk) / 1000)} 前` : "";
+      setConn(false, "離線 offline");
+      $("banner-txt").textContent = why + ago;
+      $("banner-stale").hidden = !last;
+      // 圖表上留空白：推一個 null 樣本
+      samples.push({ t: Date.now(), out: null, in: null, cached: null, act: null, tps: null });
+      while (samples.length && Date.now() - samples[0].t > HIST_S * 1000 + 2000) samples.shift();
+      prevRows = [];
+      drawChart();
+    } finally {
+      clearTimeout(to); inflight = false;
+    }
+  }
+
+  window.addEventListener("resize", drawChart);
+  matchMedia("(prefers-color-scheme: light)").addEventListener?.("change", drawChart);
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

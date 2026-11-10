@@ -1,0 +1,10 @@
+{
+  "model": "qwen",
+  "reasoning_effort": "none",
+  "messages": [
+    {"role": "user", "content": "hi"},
+    {"role": "system", "content": "mid system"},
+    {"role": "assistant", "content": "hello"},
+    {"role": "user", "content": "bye"}
+  ]
+}

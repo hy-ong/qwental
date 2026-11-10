@@ -77,7 +77,11 @@ $(BUILD)/tokcheck: tools/tokcheck.c src/tok.c src/tok.h src/unicode_tab.h $(BUIL
 $(BUILD)/chatcheck: tools/chatcheck.c src/chat.c src/chat.h src/json.c src/json.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/chatcheck.c src/chat.c src/json.c -o $@
 
-$(BUILD)/qwental-serve: tools/serve.c src/chat.c src/chat.h $(ENGINE_DEP) $(BUILD)/gpu_metal.o | $(BUILD)
+# chat.c 的單元測試（不用 GPU；給 GGUF 路徑時另外測 tokenizer，只讀 metadata）
+$(BUILD)/chattest: tools/chattest.c src/chat.c src/chat.h src/json.c src/json.h src/tok.c src/tok.h src/unicode_tab.h | $(BUILD)
+	$(CC) $(CFLAGS) tools/chattest.c src/chat.c src/json.c src/tok.c -o $@
+
+$(BUILD)/qwental-serve: tools/serve.c tools/dashboard.html src/chat.c src/chat.h $(ENGINE_DEP) $(BUILD)/gpu_metal.o | $(BUILD)
 	$(CC) $(CFLAGS) tools/serve.c src/chat.c $(ENGINE_SRC) $(BUILD)/gpu_metal.o -o $@ $(LDLIBS)
 
 $(BUILD)/dispatch: bench/dispatch.c $(BUILD)/gpu_metal.o src/gpu.h | $(BUILD)

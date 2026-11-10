@@ -1,0 +1,6 @@
+{
+  "model": "claude-haiku",
+  "max_tokens": 50,
+  "system": "Generate a short title.",
+  "messages": [{"role": "user", "content": "please fix my build"}]
+}

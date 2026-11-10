@@ -1,0 +1,22 @@
+{
+  "model": "qwen",
+  "reasoning_effort": "low",
+  "tools": [
+    {"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}}
+  ],
+  "messages": [
+    {"role": "system", "content": "  First system.  "},
+    {"role": "developer", "content": [{"type": "text", "text": "Developer rules."}]},
+    {"role": "system", "content": ""},
+    {"role": "user", "content": [{"type": "text", "text": "Weather? "}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
+    {"role": "assistant", "content": null, "reasoning_content": "need tool", "tool_calls": [
+      {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Taipei\", \"days\": 3}"}},
+      {"id": "c2", "type": "function", "function": {"name": "get_weather", "arguments": "{bad json"}}
+    ]},
+    {"role": "tool", "tool_call_id": "c1", "content": "sunny <think>"},
+    {"role": "tool", "tool_call_id": "c2", "content": [{"type": "text", "text": "error"}]},
+    {"role": "developer", "content": "late developer note"},
+    {"role": "assistant", "content": ""},
+    {"role": "user", "content": "thanks"}
+  ]
+}
