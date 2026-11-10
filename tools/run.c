@@ -120,6 +120,58 @@ int main(int argc, char **argv) {
         qw_engine_close(e);
         return 0;
     }
+    if (getenv("QW_PF_SPLIT")) { // 從中間接續的 prefill 與一次 prefill 的最後 logits 差多少：QW_PF_SPLIT=k1,k2,…（先 prefill [0,k)，再 [k,n)）；
+                                 // k 後面加 +s：先 prefill [0,k)、decode 一步一步餵到 k+s（像生成結束的快照），再 prefill 其餘
+        double pm = 0;
+        qw_engine_reset(e);
+        const float *a = qw_engine_prefill(e, ids, n, NULL, &pm);
+        if (!a) return 1;
+        float *ac = malloc(248320 * 4);
+        memcpy(ac, a, 248320 * 4);
+        if (getenv("QW_PF_SPLIT_REF")) { // 基準改成逐 token decode（慢；短 prompt 用），並先印一次 prefill 與它的差
+            float *full = malloc(248320 * 4);
+            memcpy(full, ac, 248320 * 4);
+            qw_engine_reset(e);
+            const float *r = NULL;
+            for (int i = 0; i < n; i++) if (!(r = qw_engine_step(e, ids[i], NULL))) return 1;
+            memcpy(ac, r, 248320 * 4);
+            int ar = 0, an = 0;
+            for (int i = 1; i < 248320; i++) { if (ac[i] > ac[ar]) ar = i; if (full[i] > full[an]) an = i; }
+            double zr = 0, zn = 0, kl = 0, num = 0, den = 0;
+            for (int i = 0; i < 248320; i++) { zr += exp((double)ac[i] - ac[ar]); zn += exp((double)full[i] - full[an]); }
+            for (int i = 0; i < 248320; i++) {
+                const double d = (double)ac[i] - full[i], lr = (double)ac[i] - ac[ar] - log(zr), ln = (double)full[i] - full[an] - log(zn);
+                kl += exp(lr) * (lr - ln); num += d * d; den += (double)ac[i] * ac[i];
+            }
+            printf("一次 prefill vs 逐 token decode：argmax %d/%d、KL %.2e、rel %.2e\n", ar, an, kl, sqrt(num / den));
+            free(full);
+        }
+        for (const char *q = getenv("QW_PF_SPLIT"); *q;) {
+            char *end;
+            const int k = (int)strtol(q, &end, 10);
+            int sd = 0;
+            if (*end == '+') sd = (int)strtol(end + 1, &end, 10);
+            q = *end ? end + 1 : end;
+            if (k <= 0 || k + sd >= n) continue;
+            qw_engine_reset(e);
+            const float *b = qw_engine_prefill(e, ids, k, NULL, &pm);
+            for (int i = k; b && i < k + sd; i++) b = qw_engine_step(e, ids[i], NULL);
+            if (b) b = qw_engine_prefill(e, ids + k + sd, n - k - sd, NULL, &pm);
+            if (!b) return 1;
+            int ar = 0, an = 0;
+            for (int i = 1; i < 248320; i++) { if (ac[i] > ac[ar]) ar = i; if (b[i] > b[an]) an = i; }
+            double zr = 0, zn = 0, kl = 0, num = 0, den = 0, mx = 0;
+            for (int i = 0; i < 248320; i++) { zr += exp((double)ac[i] - ac[ar]); zn += exp((double)b[i] - b[an]); }
+            for (int i = 0; i < 248320; i++) {
+                const double d = (double)ac[i] - b[i], lr = (double)ac[i] - ac[ar] - log(zr), ln = (double)b[i] - b[an] - log(zn);
+                kl += exp(lr) * (lr - ln); num += d * d; den += (double)ac[i] * ac[i]; if (fabs(d) > mx) mx = fabs(d);
+            }
+            printf("split %d+%d（k %% 64 = %d）：argmax %d/%d、KL %.2e、max|Δ| %.3f、rel %.2e%s\n", k, sd, k % 64, ar, an, kl, mx, sqrt(num / den),
+                   memcmp(ac, b, 248320 * 4) ? "" : "（逐位元相同）");
+        }
+        qw_engine_close(e);
+        return 0;
+    }
     if (getenv("QW_PF_CHUNK")) { // 分段 prefill（每段 QW_PF_CHUNK 個 token，接著上一段）與一次 prefill 的最後 logits 比
         const int C = atoi(getenv("QW_PF_CHUNK"));
         double pm = 0;

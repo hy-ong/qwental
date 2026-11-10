@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.7.2 — 2026-11-11
+
+Fixes answers that went off track in long Claude Code sessions, and a simpler dashboard. On the original IQ3_S GGUF, default, INT8 and speculative outputs are bit-identical to 1.7.1 (and so to 1.0.0); concurrent output is bit-identical to running alone.
+
+### Reused state is now bit-identical to computing from scratch
+- A request that resumed from cached state at a position that was not a multiple of 64 (the DeltaNet chunk size) — a prompt end, the previous turn's finish, a snapshot left after idle pruning — or from state produced by decoding, got last-position logits that differ from one-shot prefill by KL 0.01–0.43. Greedy then picked a different first token at near-ties, and long sessions drifted into "answering a different question".
+- Each snapshot now records whether it is exact (reachable by aligned prefill from 0). Other requests resume only from exact snapshots at multiples of 64; the same request continuing its own generation still resumes where it stopped. Prefill also saves a checkpoint at the prompt end rounded down to 64, so a follow-up turn recomputes at most 63 tokens plus the previous answer (stress test: 313,876 → 312,178 tokens prefilled, 864 → 854 s).
+- The SSD cache format is now QWC2, keyed by model and INT8 fingerprint; older files are ignored.
+- A request running alone with speculative decoding now stops thinking exactly at the thinking cap (it emitted the rest of the accepted round, so the wrap-up came later than in batched decoding).
+- `bench/cache_fuzz.py` drives a Claude-Code-like load (growing main conversation, subagents sharing prefixes, cancellations, memory pressure) and compares every answer with running it alone without reuse: before 8/40 and 11/23 (SC117 + `--int8`) answers differed, after 0/40 and 0/23. `QW_VERIFY_REUSE=N` makes the server recompute 1 in N reused prompts when idle and log `[verify] OK / MISMATCH`.
+
+### Dashboard
+- The main view is four numbers (output tok/s, conversations generating / reading, prompt tokens left to read with an ETA, memory as OK / Tight / Low), one 5-minute chart, a one-line list per conversation and one cost line. Totals, measured rates, cost details and usage by period are under "Details".
+
 ## 1.7.1 — 2026-11-10
 
 Fixes the memory leak that made the server die every 15–20 minutes under Claude Code with many subagents. Engine output unchanged.

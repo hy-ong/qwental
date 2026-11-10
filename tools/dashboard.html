@@ -6,247 +6,231 @@
 <title>Qwental</title>
 <style>
 :root {
-  --bg: #0e1116; --panel: #161b22; --panel2: #1c222b; --line: #2a313c;
-  --fg: #e6edf3; --dim: #8b949e; --faint: #5c6570;
-  --accent: #58a6ff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --violet: #bc8cff;
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+  --bg: #0f1115; --panel: #161a20; --panel2: #1e232b; --line: #262c35;
+  --fg: #e7eaee; --dim: #8a929c; --faint: #5b636d;
+  --accent: #5aa2ff; --ok: #3fb950; --warn: #d6a12a; --bad: #f0605a;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
 }
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f6f8fa; --panel: #ffffff; --panel2: #f0f3f6; --line: #d8dee4;
-    --fg: #1f2328; --dim: #59636e; --faint: #8c959f;
-    --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --violet: #8250df;
+    --bg: #f7f8fa; --panel: #ffffff; --panel2: #eef1f4; --line: #e1e5ea;
+    --fg: #1d2127; --dim: #5f6873; --faint: #9aa2ac;
+    --accent: #0a6bd6; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
   }
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); }
-.wrap { max-width: 1400px; margin: 0 auto; padding: 16px 20px 32px; min-width: 760px; }
-.num, td, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding-bottom: 14px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
-header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: .2px; }
-header .meta { display: flex; gap: 14px; color: var(--dim); font-size: 13px; flex-wrap: wrap; }
-header .meta b { color: var(--fg); font-weight: 500; font-family: var(--mono); }
-.conn { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 4px 10px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
-.conn.ok .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
-.conn.bad { border-color: var(--bad); color: var(--bad); }
+html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); font-variant-numeric: tabular-nums; }
+.wrap { max-width: 1320px; margin: 0 auto; padding: 18px 32px 40px; min-width: 360px; }
+header { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-bottom: 28px; font-size: 13px; color: var(--dim); }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; color: var(--fg); }
+.conn { display: flex; align-items: center; gap: 7px; color: var(--fg); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.conn.ok .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+.conn.bad { color: var(--bad); }
 .conn.bad .dot { background: var(--bad); }
-.lang { display: flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; font-size: 12px; }
-.lang button { font: inherit; color: var(--dim); background: var(--panel); border: 0; padding: 4px 10px; cursor: pointer; }
-.lang button + button { border-left: 1px solid var(--line); }
-.lang button.on { color: var(--fg); background: var(--panel2); font-weight: 600; }
-.banner { display: none; margin-bottom: 16px; padding: 12px 16px; border-radius: 8px; border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 12%, var(--panel)); color: var(--fg); }
+.lang { margin-left: auto; display: flex; border-radius: 999px; background: var(--panel); padding: 2px; }
+.lang button, .seg button { font: inherit; font-size: 12px; color: var(--dim); background: none; border: 0; padding: 3px 11px; border-radius: 999px; cursor: pointer; white-space: nowrap; }
+.lang button.on, .seg button.on { color: var(--fg); background: var(--panel2); font-weight: 600; }
+.banner { display: none; margin: -12px 0 24px; padding: 10px 14px; border-radius: 10px; background: color-mix(in srgb, var(--bad) 12%, var(--panel)); font-size: 13px; }
 .banner.show { display: block; }
-.banner b { color: var(--bad); }
-.stale { opacity: .45; transition: opacity .3s; }
-.grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
-.card .lbl { color: var(--dim); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card .big { font-family: var(--mono); font-size: 30px; font-weight: 600; line-height: 1.15; margin-top: 4px; white-space: nowrap; }
-.card .big small { font-size: 15px; color: var(--dim); font-weight: 400; }
-.card .sub { color: var(--dim); font-size: 12px; margin-top: 4px; font-family: var(--mono); text-wrap: balance; overflow-wrap: anywhere; word-break: keep-all; }
-.card .hint { color: var(--dim); font-size: 12px; margin-top: 4px; text-wrap: balance; }
-.bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 8px; position: relative; }
-.bar > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
-.bar.over > span { background: var(--bad); }
-.over-txt { color: var(--bad) !important; }
-#k-mem-sub { white-space: normal; }
-#k-sys { font-family: var(--mono); white-space: normal; text-wrap: balance; }
-.pf { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; vertical-align: middle; font-size: 12px; color: var(--dim); }
-.pf .bar { width: 64px; height: 3px; margin: 0; }
-.pf .bar > span { background: var(--warn); }
-.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-family: var(--sans); border: 1px solid currentColor; line-height: 1.5; }
-.m-spec { color: var(--violet); } .m-batch { color: var(--accent); } .m-idle { color: var(--faint); }
-.s-prefill { color: var(--warn); } .s-solo { color: var(--violet); } .s-batch { color: var(--accent); } .s-other { color: var(--dim); }
-.row2 { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 16px; }
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
-.panel h2 { font-size: 13.5px; margin: 0 0 8px; font-weight: 600; display: flex; align-items: baseline; gap: 10px; }
-.panel h2 .note { color: var(--dim); font-weight: 400; font-size: 12px; }
-.panel h2 > span:first-child { white-space: nowrap; flex-shrink: 0; }
-.legend { display: flex; gap: 14px; font-size: 12px; color: var(--dim); margin-left: auto; }
-.legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; background: var(--c); }
-.chartp { display: flex; flex-direction: column; }
-.cbox { position: relative; flex: 1; min-height: 170px; }
+.banner b { color: var(--bad); font-weight: 600; }
+.stale { opacity: .45; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 24px; margin-bottom: 28px; }
+.stat .lbl { color: var(--dim); font-size: 13px; }
+.stat .big { font-size: 38px; font-weight: 500; line-height: 1.15; margin: 4px 0 4px; letter-spacing: -.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat .big small { font-size: 14px; color: var(--dim); font-weight: 400; letter-spacing: 0; margin: 0 2px 0 4px; }
+.stat .big .sep { color: var(--faint); font-weight: 300; margin: 0 6px; }
+.stat .sub { color: var(--dim); font-size: 13px; min-height: 1.45em; }
+.big.is-ok { color: var(--ok); } .big.is-warn, .sub.is-warn { color: var(--warn); } .big.is-bad { color: var(--bad); }
+.big.zero { color: var(--faint); }
+.row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 24px; margin-bottom: 20px; }
+.panel { background: var(--panel); border-radius: 12px; padding: 14px 18px; min-width: 0; }
+.panel h2 { font-size: 13px; margin: 0 0 10px; font-weight: 500; color: var(--dim); display: flex; align-items: baseline; gap: 10px; }
+.panel h2 .r { margin-left: auto; font-size: 12px; color: var(--faint); }
+.cbox { position: relative; height: 240px; }
 .cbox canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.cv { display: grid; grid-template-columns: 6.5em minmax(0, 1fr) 4.5em; align-items: center; gap: 12px; padding: 6px 0; font-size: 13px; }
+.cv + .cv { border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }
+.cv .mid { display: flex; align-items: center; gap: 10px; color: var(--dim); min-width: 0; white-space: nowrap; }
+.cv .pc { width: 3.6em; text-align: right; }
+.cv .plen { text-align: right; color: var(--dim); }
+.chip { font-size: 12px; padding: 1px 8px; border-radius: 999px; justify-self: start; white-space: nowrap; }
+.c-gen { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.c-read { color: var(--fg); background: var(--panel2); }
+.c-wait { color: var(--dim); background: none; box-shadow: inset 0 0 0 1px var(--line); }
+.bar { flex: 1; height: 4px; background: var(--panel2); border-radius: 2px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width .4s; }
+.empty { color: var(--dim); text-align: center; padding: 22px 8px; font-size: 13px; }
+.costline { color: var(--dim); font-size: 13px; margin: 4px 0 28px; }
+.costline b { color: var(--fg); font-weight: 500; }
+details > summary { list-style: none; cursor: pointer; color: var(--dim); font-size: 13px; padding: 10px 0; border-top: 1px solid var(--line); user-select: none; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: "▸"; display: inline-block; width: 1.2em; }
+details[open] > summary::before { content: "▾"; }
+details > summary:hover { color: var(--fg); }
+.dbody { padding-top: 10px; }
+.dbody .row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.dbody .panel { margin-bottom: 20px; }
+.dbody .row .panel { margin-bottom: 0; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: right; color: var(--dim); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; font-family: var(--sans); }
+th { text-align: right; color: var(--dim); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 td { text-align: right; padding: 5px 8px; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); white-space: nowrap; }
-th:first-child, td:first-child, th.l, td.l { text-align: left; }
-tbody tr:hover { background: var(--panel2); }
-td.cache { width: 26%; }
-.cbar { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
-.cbar .bar { flex: 1; margin: 0; max-width: 220px; }
-.cbar .bar > span { background: var(--ok); }
-.cbar .pct { width: 4.2em; text-align: right; }
-.empty { color: var(--dim); text-align: center; padding: 18px; font-family: var(--sans); }
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+th:first-child, td:first-child { text-align: left; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 5px 14px; font-size: 13px; margin: 0; }
 .kv dt { color: var(--dim); }
-.kv dd { margin: 0; text-align: right; font-family: var(--mono); }
-.rates { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
-.rates .r { display: grid; grid-template-columns: max-content 1fr 4.5em; align-items: center; gap: 8px; font-size: 12px; margin: 3px 0; }
-.rates .r .bar { margin: 0; }
-.rates .r .v { text-align: right; font-family: var(--mono); }
+.kv dd { margin: 0; text-align: right; }
+.rates .r { display: grid; grid-template-columns: max-content 1fr 4.5em; align-items: center; gap: 10px; font-size: 12.5px; margin: 5px 0; }
+.rates .r .v { text-align: right; }
+.rates .r .k { color: var(--dim); white-space: nowrap; min-width: 6.5em; }
 .rates .r.cur .k { color: var(--fg); font-weight: 600; }
-.rates .r .k { color: var(--dim); font-family: var(--mono); white-space: nowrap; min-width: 6.5em; }
-.seg { display: inline-flex; margin-left: auto; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; font-size: 12px; font-weight: 400; }
+.seg { display: inline-flex; margin-left: auto; border-radius: 999px; background: var(--panel2); padding: 2px; font-weight: 400; }
 .seg[hidden] { display: none; }
-.seg button { font: inherit; color: var(--dim); background: var(--panel); border: 0; padding: 2px 10px; cursor: pointer; white-space: nowrap; }
-.seg button + button { border-left: 1px solid var(--line); }
-.seg button.on { color: var(--fg); background: var(--panel2); font-weight: 600; }
-#cost, #hist { margin-bottom: 16px; }
-#hist .cbox { min-height: 150px; margin-bottom: 8px; }
-#hist td.cur, #hist tr.cur td { font-weight: 650; }
-#hist tr.cur td:first-child { box-shadow: inset 3px 0 var(--accent); }
-#hist td:first-child { padding-left: 10px; font-family: var(--sans); }
-.costg { display: grid; grid-template-columns: 1fr 1fr minmax(250px, .85fr); gap: 0; }
-.costg > div { padding: 2px 16px; min-width: 0; }
+.seg button.on { background: var(--panel); }
+#hist .cbox { height: 150px; margin-bottom: 8px; }
+#hist tr.cur td { font-weight: 650; }
+.costg { display: grid; grid-template-columns: 1fr 1fr minmax(240px, .85fr); gap: 0; }
+.costg > div { padding: 2px 18px; min-width: 0; }
 .costg > div:first-child { padding-left: 0; }
 .costg > div + div { border-left: 1px solid var(--line); }
 .cs .lbl, .cp .lbl { color: var(--dim); font-size: 12.5px; }
-.cs .big { font-family: var(--mono); font-size: 28px; font-weight: 600; line-height: 1.2; margin: 2px 0 6px; white-space: nowrap; }
+.cs .big { font-size: 26px; font-weight: 500; line-height: 1.2; margin: 2px 0 6px; white-space: nowrap; }
 .ck { display: grid; grid-template-columns: auto 1fr auto; gap: 2px 12px; font-size: 13px; margin: 0; }
 .ck dt { color: var(--dim); }
-.ck dd { margin: 0; text-align: right; font-family: var(--mono); }
+.ck dd { margin: 0; text-align: right; }
 .ck dd.t { color: var(--faint); }
 .cs .sub { color: var(--dim); font-size: 12px; margin-top: 6px; }
 .cs .empty { text-align: left; padding: 8px 0; font-size: 12.5px; }
 .cp label { display: grid; grid-template-columns: 1fr 7.5em; align-items: center; gap: 8px; font-size: 13px; color: var(--dim); margin: 5px 0; }
-.cp input { font: 13px var(--mono); color: var(--fg); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; text-align: right; width: 100%; }
-.cp input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent); border-color: var(--accent); }
+.cp input { font: 13px var(--sans); font-variant-numeric: tabular-nums; color: var(--fg); background: var(--panel2); border: 1px solid transparent; border-radius: 6px; padding: 3px 6px; text-align: right; width: 100%; }
+.cp input:focus { outline: none; border-color: var(--accent); }
 .cp-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--dim); }
-.cp-foot button { margin-left: auto; font: inherit; color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; cursor: pointer; white-space: nowrap; }
+.cp-foot button { margin-left: auto; font: inherit; color: var(--accent); background: none; border: 0; padding: 2px 0; cursor: pointer; white-space: nowrap; }
 .cp-foot button:disabled { color: var(--faint); cursor: default; }
-footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; gap: 16px; flex-wrap: wrap; }
-@media (max-width: 1180px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 980px) { .row2 { grid-template-columns: 1fr; } }
+footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; gap: 16px; flex-wrap: wrap; }
+@media (max-width: 1100px) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .row, .dbody .row { grid-template-columns: 1fr; }
+  .costg { grid-template-columns: 1fr; }
+  .costg > div { padding: 10px 0; }
+  .costg > div + div { border-left: 0; border-top: 1px solid var(--line); }
+}
+@media (max-width: 560px) { .stats { grid-template-columns: 1fr; } .wrap { padding: 14px 16px 32px; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Qwental</h1>
-    <div class="meta">
-      <span><span data-i18n="ver"></span> <b id="h-ver">—</b></span>
-      <span><span data-i18n="prof"></span> <b id="h-prof">—</b></span>
-      <span><span data-i18n="up"></span> <b id="h-up">—</b></span>
-    </div>
     <div class="conn" id="conn"><span class="dot"></span><span id="conn-txt"></span></div>
+    <span id="h-ver">—</span>
+    <span id="h-up">—</span>
     <div class="lang" id="lang" role="group"></div>
   </header>
 
   <div class="banner" id="banner"></div>
 
   <div id="main">
-  <section class="grid">
-    <div class="card">
-      <div class="lbl" data-i18n="act" data-i18n-title="actT"></div>
-      <div class="big"><span id="k-act">—</span><small> / <span id="k-par">—</span></small></div>
-      <div class="bar"><span id="k-act-bar" style="width:0"></span></div>
-    </div>
-    <div class="card">
-      <div class="lbl" data-i18n="queued" data-i18n-title="queuedT"></div>
-      <div class="big" id="k-q">—</div>
-      <div class="hint" id="k-q-hint"></div>
-    </div>
-    <div class="card">
-      <div class="lbl" data-i18n="mode" data-i18n-title="modeT"></div>
-      <div class="big" style="font-size:22px;margin-top:8px"><span class="pill m-idle" id="k-mode">—</span></div>
-      <div class="hint" id="k-mode-hint">—</div>
-    </div>
-    <div class="card">
-      <div class="lbl" data-i18n="tps" data-i18n-title="tpsT"></div>
+  <section class="stats">
+    <div class="stat" data-i18n-title="tpsT">
+      <div class="lbl" data-i18n="tps"></div>
       <div class="big" id="k-tps">—</div>
       <div class="sub" id="k-tps-sub"></div>
     </div>
-    <div class="card">
-      <div class="lbl" data-i18n="hit" data-i18n-title="hitT"></div>
-      <div class="big" id="k-hit">—</div>
-      <div class="sub" id="k-hit-sub">—</div>
+    <div class="stat" data-i18n-title="convT">
+      <div class="lbl" data-i18n="conv"></div>
+      <div class="big" id="k-conv">—</div>
+      <div class="sub" id="k-conv-sub"></div>
     </div>
-    <div class="card" id="c-mem">
-      <div class="lbl" data-i18n="mem" data-i18n-title="memT"></div>
-      <div class="big"><span id="k-mem">—</span><small> GB</small></div>
-      <div class="bar" id="k-mem-barw"><span id="k-mem-bar" style="width:0"></span></div>
-      <div class="sub" id="k-mem-sub">—</div>
-      <div class="sub" id="k-sys" data-i18n-title="sysT" hidden></div>
+    <div class="stat" data-i18n-title="pfT">
+      <div class="lbl" data-i18n="pf"></div>
+      <div class="big" id="k-pf">—</div>
+      <div class="sub" id="k-pf-sub"></div>
+    </div>
+    <div class="stat" id="c-mem">
+      <div class="lbl" data-i18n="mem"></div>
+      <div class="big" id="k-mem">—</div>
+      <div class="sub" id="k-mem-sub"></div>
     </div>
   </section>
 
-  <section class="row2">
-    <div class="panel chartp">
-      <h2><span data-i18n="chart"></span> <span class="note" data-i18n="chartNote"></span>
-        <span class="legend"><span style="--c:var(--accent)" data-i18n="lgTps"></span><span style="--c:var(--violet)" data-i18n="lgAct"></span></span></h2>
+  <section class="row">
+    <div class="panel">
+      <h2><span data-i18n="chart"></span></h2>
       <div class="cbox"><canvas id="chart"></canvas></div>
     </div>
     <div class="panel">
-      <h2><span data-i18n="totals"></span> <span class="note" id="totals-note"></span>
-        <span class="seg" id="scope" role="group" hidden><button type="button" data-s="s" data-i18n="scopeS"></button><button type="button" data-s="l" data-i18n="scopeL" data-i18n-title="scopeLT"></button></span></h2>
-      <dl class="kv">
-        <dt data-i18n-title="tTotalT"><b data-i18n="tTotal"></b> <span class="note" data-i18n="tTotalNote"></span></dt><dd id="t-total"><b>—</b></dd>
-        <dt data-i18n-title="tGpuT"><b data-i18n="tGpu"></b> <span class="note" data-i18n="tGpuNote"></span></dt><dd id="t-gpu"><b>—</b></dd>
-        <dt data-i18n="tDone"></dt><dd id="t-done">—</dd>
-        <dt data-i18n="tIn"></dt><dd id="t-in">—</dd>
-        <dt data-i18n="tCached" data-i18n-title="tCachedT"></dt><dd id="t-cached">—</dd>
-        <dt data-i18n="tPf" data-i18n-title="tPfT"></dt><dd id="t-pf">—</dd>
-        <dt data-i18n="tOut"></dt><dd id="t-out">—</dd>
-        <dt data-i18n="tAvg"></dt><dd id="t-avg">—</dd>
-      </dl>
-      <div class="rates" id="rates" hidden>
-        <div class="lbl" style="color:var(--dim);font-size:12px;margin-bottom:4px" data-i18n="rates" data-i18n-title="ratesT"></div>
-        <div id="rates-list"></div>
-      </div>
+      <h2><span data-i18n="tbl"></span><span class="r" data-i18n="thPrompt"></span></h2>
+      <div id="list"><div class="empty" data-i18n="waiting"></div></div>
     </div>
   </section>
 
-  <section class="panel" id="cost">
-    <h2><span data-i18n="cost" data-i18n-title="costT"></span> <span class="note" data-i18n="costNote"></span></h2>
-    <div class="costg">
-      <div class="cs" id="cs-s"></div>
-      <div class="cs" id="cs-l"></div>
-      <div class="cp">
-        <div class="lbl" data-i18n="prices"></div>
-        <label><span data-i18n="pIn" data-i18n-title="pInT"></span><input id="p-in" type="number" min="0" step="any" inputmode="decimal"></label>
-        <label><span data-i18n="pCache"></span><input id="p-cache" type="number" min="0" step="any" inputmode="decimal"></label>
-        <label><span data-i18n="pOut"></span><input id="p-out" type="number" min="0" step="any" inputmode="decimal"></label>
-        <div class="cp-foot"><span id="p-src"></span><button type="button" id="p-reset" data-i18n="pReset"></button></div>
-      </div>
+  <div class="costline" id="costline"></div>
+
+  <details id="det">
+    <summary data-i18n="details"></summary>
+    <div class="dbody">
+      <section class="row" style="margin-bottom:20px">
+        <div class="panel">
+          <h2><span data-i18n="totals"></span> <span id="totals-note" style="color:var(--faint);font-size:12px"></span>
+            <span class="seg" id="scope" role="group" hidden><button type="button" data-s="s" data-i18n="scopeS"></button><button type="button" data-s="l" data-i18n="scopeL" data-i18n-title="scopeLT"></button></span></h2>
+          <dl class="kv">
+            <dt data-i18n-title="tTotalT"><span data-i18n="tTotal"></span></dt><dd id="t-total">—</dd>
+            <dt data-i18n-title="tGpuT"><span data-i18n="tGpu"></span></dt><dd id="t-gpu">—</dd>
+            <dt data-i18n="tDone"></dt><dd id="t-done">—</dd>
+            <dt data-i18n="tIn"></dt><dd id="t-in">—</dd>
+            <dt data-i18n="tCached" data-i18n-title="tCachedT"></dt><dd id="t-cached">—</dd>
+            <dt data-i18n="tPf" data-i18n-title="tPfT"></dt><dd id="t-pf">—</dd>
+            <dt data-i18n="tOut"></dt><dd id="t-out">—</dd>
+            <dt data-i18n="tAvg"></dt><dd id="t-avg">—</dd>
+            <dt data-i18n="tCancel"></dt><dd id="t-cancel">—</dd>
+          </dl>
+        </div>
+        <div class="panel rates">
+          <h2><span data-i18n="rates" data-i18n-title="ratesT"></span> <span class="r" id="mode-note"></span></h2>
+          <div id="rates-list"><div class="empty" data-i18n="noRates"></div></div>
+        </div>
+      </section>
+
+      <section class="panel" id="cost">
+        <h2><span data-i18n="cost" data-i18n-title="costT"></span> <span class="r" data-i18n="costNote"></span></h2>
+        <div class="costg">
+          <div class="cs" id="cs-s"></div>
+          <div class="cs" id="cs-l"></div>
+          <div class="cp">
+            <div class="lbl" data-i18n="prices"></div>
+            <label><span data-i18n="pIn" data-i18n-title="pInT"></span><input id="p-in" type="number" min="0" step="any" inputmode="decimal"></label>
+            <label><span data-i18n="pCache"></span><input id="p-cache" type="number" min="0" step="any" inputmode="decimal"></label>
+            <label><span data-i18n="pOut"></span><input id="p-out" type="number" min="0" step="any" inputmode="decimal"></label>
+            <div class="cp-foot"><span id="p-src"></span><button type="button" id="p-reset" data-i18n="pReset"></button></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="hist" hidden>
+        <h2><span data-i18n="hist"></span> <span data-i18n="histNote" style="color:var(--faint);font-size:12px"></span>
+          <span class="seg" id="per" role="group"><button type="button" data-p="d" data-i18n="pD"></button><button type="button" data-p="w" data-i18n="pW"></button><button type="button" data-p="m" data-i18n="pM"></button></span></h2>
+        <div class="cbox"><canvas id="hchart"></canvas></div>
+        <table>
+          <thead><tr><th data-i18n="hPer"></th><th data-i18n="tDone"></th><th data-i18n="tIn"></th><th data-i18n="tCached"></th><th data-i18n="tOut"></th><th data-i18n="cost"></th></tr></thead>
+          <tbody id="hbody"></tbody>
+        </table>
+      </section>
+
+      <footer>
+        <span id="f-prof"></span>
+        <span><span data-i18n="srcA"></span>GET /status<span data-i18n="srcB"></span></span>
+        <span id="f-last">—</span>
+      </footer>
     </div>
-  </section>
-
-  <section class="panel" id="hist" hidden>
-    <h2><span data-i18n="hist"></span> <span class="note" id="hist-note"></span>
-      <span class="seg" id="per" role="group"><button type="button" data-p="d" data-i18n="pD"></button><button type="button" data-p="w" data-i18n="pW"></button><button type="button" data-p="m" data-i18n="pM"></button></span></h2>
-    <div class="cbox"><canvas id="hchart"></canvas></div>
-    <table>
-      <thead><tr><th class="l" data-i18n="hPer"></th><th data-i18n="tDone"></th><th data-i18n="tIn"></th><th data-i18n="tCached"></th><th data-i18n="tOut"></th><th data-i18n="cost"></th></tr></thead>
-      <tbody id="hbody"></tbody>
-    </table>
-  </section>
-
-  <section class="panel">
-    <h2><span data-i18n="tbl"></span> <span class="note" id="tbl-note"></span></h2>
-    <table>
-      <thead><tr>
-        <th class="l">#</th><th class="l" data-i18n="thState"></th><th data-i18n="thPrompt"></th><th data-i18n="thCached"></th><th class="cache" data-i18n="thHit" data-i18n-title="thHitT"></th><th data-i18n="thNeed" data-i18n-title="thNeedT"></th><th data-i18n="thGen"></th><th data-i18n="thTps" data-i18n-title="thTpsT"></th>
-      </tr></thead>
-      <tbody id="tbody"><tr><td colspan="8" class="empty" data-i18n="waiting"></td></tr></tbody>
-    </table>
-  </section>
+  </details>
   </div>
-
-  <footer>
-    <span><span data-i18n="srcA"></span><span class="mono">GET /status</span><span data-i18n="srcB"></span></span>
-    <span id="f-last">—</span>
-    <span data-i18n="foot"></span>
-  </footer>
 </div>
 
 <script>
 "use strict";
 (() => {
   const $ = (id) => document.getElementById(id);
-  const POLL_MS = 1000, HIST_S = 300, TPS_WIN = 5, HIT_WIN = 60;
+  const POLL_MS = 1000, HIST_S = 300, TPS_WIN = 5;
   const num = (v) => (typeof v === "number" && isFinite(v) ? v : null);
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
@@ -254,45 +238,41 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
   const I18N = {
     en: {
       _name: "EN", _lang: "Language", title: "Qwental Dashboard",
-      ver: "Version", prof: "Profile", up: "Uptime",
+      ver: "v{v}", up: "up {d}",
       connecting: "Connecting…", live: "Live", offline: "Offline",
-      unreach: "Server unreachable", retry: ". Retrying every second", staleNote: "; showing the last data received below", end: ".",
+      unreach: "Server unreachable", retry: ". Retrying every second", staleNote: "; the numbers below are the last data received", end: ".",
       timeout: "timed out", net: "network error", notJson: "response is not a JSON object", agoOk: ", last success {d} ago",
-      act: "Active / parallel", actT: "Conversations being served now / maximum concurrent conversations (--parallel)",
-      queued: "Queued", queuedT: "Requests received but not started yet",
-      qLimit: "At the conversation limit; waiting for a conversation to finish", qBusy: "Starting at the next scheduling step",
-      qWait: "Waiting to start", qNone: "No requests waiting",
-      mode: "Decode mode", modeT: "How the server is decoding right now; it picks whichever measured rate is higher",
-      tps: "Output tok/s", tpsT: "Output tokens per second across all conversations, counted as they are generated",
-      tpsSub: "Last {n} s", perConv: " · ≈ {v} per generating conversation",
-      hit: "Cache hit rate", hitT: "Share of prompt tokens reused from the prefix cache since server start",
-      hitRecent: "Last {n} s: {p}", hitNone: "No requests completed recently",
-      mem: "Slot memory used / budget", memT: "KV-cache memory held by conversation slots, against the slot budget",
-      budget: "Budget {b} GB · {p}", budgetNone: "Budget —", over: " · over budget, idle slots will be released",
-      sys: "Free memory {l}% · swap {s} GB", sysL: "Free memory {l}%", sysS: "Swap {s} GB",
-      sysT: "Free system memory (macOS memory level) and swap in use; red when memory is low and generation may slow down", sysLow: " · low",
-      chart: "Last 5 minutes", chartNote: "Sampled every second, kept only in this tab",
-      lgTps: "Output tok/s", lgAct: "Active conversations", axNow: "now", axMin: "-{m}m",
-      totals: "Totals", totalsNote: "Since server start",
-      tTotal: "Total", tTotalNote: "prompt + output", tTotalT: "All prompt tokens plus all output tokens",
-      tGpu: "GPU computed", tGpuNote: "prefill + output", tGpuT: "Tokens the GPU actually computed: prompt tokens not served from cache, plus output",
+      tps: "Output", tpsT: "Output tokens per second across all conversations, counted as they are generated (last 5 s)", tpsU: "tok/s",
+      nGen: "{n} generating", nGen1: "1 generating", idle: "Idle",
+      conv: "Conversations", convT: "Conversations generating output vs. still reading their prompt",
+      gen: "generating", read: "reading", upTo: "Up to {p} at once", par1: "Single-conversation mode",
+      qLimit: "{n} queued · waiting for a conversation to finish", qBusy: "{n} queued · starting at the next step", qWait: "{n} queued",
+      pf: "Prompt reading", pfT: "Prompt tokens still to read (prefill) across all conversations", pfU: "tokens left",
+      eta: "about {t} to go", etaNone: "Rate not measured yet", etaT: "At the measured prefill rate of {r} tok/s",
+      mem: "Memory", memOk: "OK", memTight: "Tight", memLow: "Low",
+      memSub: "free {l}% · swap {s} GB", memSubL: "free {l}%", memSubS: "swap {s} GB",
+      memT: "Slot memory {m} / {b} GB", memOver: " (over budget: idle slots will be released)",
+      chart: "Output tok/s · last 5 minutes", axNow: "now", axMin: "-{m}m",
+      tbl: "Active conversations", thPrompt: "Prompt",
+      st: { gen: ["Generating", "Writing the answer"], read: ["Reading", "Reading the prompt (prefill)"], wait: ["Waiting", "Waiting to reuse the prompt prefix another conversation is reading"] },
+      genRow: "{g} tok · {r} tok/s", waitRow: "shares a prefix",
+      waiting: "Waiting for data…", par1L: "parallel = 1: the server does not report individual conversations",
+      noActive: "The server did not report active conversations", noneL: "No active conversations",
+      costToday: "API cost today {t} · all time {a}", costRun: "API cost this run {t}",
+      details: "Details",
+      du: { d: "d", h: "h", m: "m", s: "s" },
+      totals: "Totals", totalsNote: "since server start",
+      tTotal: "Total tokens", tTotalT: "All prompt tokens plus all output tokens",
+      tGpu: "GPU computed", tGpuT: "Prompt tokens not served from cache, plus output",
       tDone: "Requests completed", tIn: "Prompt tokens", tCached: "Reused from cache", tCachedT: "Prompt tokens served from the prefix cache",
       tPf: "Actual prefill", tPfT: "Prompt tokens minus cached tokens", tOut: "Output tokens", tAvg: "Avg output / request", tok: "tok",
-      rates: "Measured rates (EMA, used to pick the mode)", ratesT: "spec ×1 = speculative decoding of one conversation; batch ×N = N conversations decoded together; slice ×N = N conversations taking turns",
-      tbl: "Active conversations",
-      thState: "State", thPrompt: "Prompt", thCached: "Cached", thHit: "Hit", thHitT: "Share of this prompt served from cache",
-      thNeed: "To prefill", thNeedT: "prompt − cached: tokens that must still be computed", thGen: "Generated", thTps: "tok/s", thTpsT: "Output speed of this conversation", pfT: "Prompt tokens read so far / prompt length",
-      waiting: "Waiting for data…", par1: "parallel = 1: the server does not report individual conversations",
-      noActive: "The server did not report the active field", none: "No active conversations",
-      count: "{n} active", noId: " · no stable id; tok/s inferred by matching prompt + cached",
-      st: { prefill: ["prefill", "Reading the prompt (prefill)"], solo: ["solo", "Decoding on its own with speculative decoding"], batch: ["batch", "Decoding together with other conversations"] },
-      md: { spec: ["spec", "Speculative decoding; each conversation runs on its own"], batch: ["batch", "Conversations decode together for higher total throughput"],
-            idle: ["idle", "No active conversations"], single: ["single", "Single-conversation mode (parallel = 1)"] },
-      srcA: "Data from ", srcB: ", polled every second", lastUpd: "Last update {t}",
-      foot: "spec = each conversation decodes speculatively on its own; batch = several conversations decode together",
-      du: { d: "d", h: "h", m: "m", s: "s" },
+      tCancel: "Cancelled · errors · rejected",
+      rates: "Measured rates (tok/s)", ratesT: "spec ×1 = speculative decoding of one conversation; batch ×N = N conversations decoded together; slice ×N = N conversations taking turns; prefill = prompt reading",
+      noRates: "Not measured yet", modeNow: "now: {m}",
+      md: { spec: "spec", batch: "batch", idle: "idle", single: "single" },
+      srcA: "Data from ", srcB: ", polled every second", lastUpd: "Last update {t}", prof: "Profile {p}",
       scopeS: "This run", scopeL: "All time", scopeLT: "Kept across server restarts (stats.json)",
-      sinceL: "Since {d} · {u} of uptime", sinceD: "Since {d}",
+      sinceL: "Since {d} · {u} of uptime", sinceD: "since {d}",
       cost: "API cost", costT: "(prompt − cached) × input + cached × cache read + output × output, per 1M tokens",
       costNote: "Priced at OpenRouter qwen/qwen3.8-flash rates",
       cIn: "Input (uncached)", cCache: "Cache read", cOut: "Output",
@@ -305,44 +285,40 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     },
     "zh-TW": {
       _name: "中文", _lang: "語言", title: "Qwental 儀表板",
-      ver: "版本", prof: "格式", up: "已執行",
+      ver: "版本 {v}", up: "已執行 {d}",
       connecting: "連線中…", live: "已連線", offline: "離線",
-      unreach: "連不到伺服器", retry: "。每秒自動重試", staleNote: "；下方是最後一次成功取得的資料", end: "。",
+      unreach: "連不到伺服器", retry: "。每秒自動重試", staleNote: "；下方是最後一次取得的資料", end: "。",
       timeout: "逾時", net: "網路錯誤", notJson: "回應不是 JSON 物件", agoOk: "，上次成功是 {d}前",
-      act: "進行中對話 / 上限", actT: "目前正在處理的對話數 / 最多可同時處理的對話數（--parallel）",
-      queued: "排隊中", queuedT: "已收到、尚未開始處理的請求",
-      qLimit: "對話數已達上限，等其他對話結束", qBusy: "下一個排程點就開始",
-      qWait: "等待開始", qNone: "沒有等待中的請求",
-      mode: "解碼模式", modeT: "伺服器目前的解碼方式；會依實測速度選比較快的那種",
-      tps: "輸出速度 tok/s", tpsT: "所有對話合計每秒輸出的 token 數，邊生成邊計算",
-      tpsSub: "近 {n} 秒", perConv: " · 每個生成中對話 ≈ {v}",
-      hit: "快取命中率", hitT: "伺服器啟動以來，prompt token 從前綴快取重用的比例",
-      hitRecent: "近 {n} 秒 {p}", hitNone: "近期尚無完成請求",
-      mem: "Slot 記憶體 用量 / 預算", memT: "各對話 slot 佔用的 KV cache 記憶體，對照 slot 預算",
-      budget: "預算 {b} GB · {p}", budgetNone: "預算 —", over: " · 超過預算，會釋放閒置 slot",
-      sys: "可用記憶體 {l}% · swap {s} GB", sysL: "可用記憶體 {l}%", sysS: "Swap {s} GB",
-      sysT: "系統可用記憶體（macOS 記憶體水位）與已使用的 swap；記憶體不足時變紅，速度可能變慢", sysLow: " · 偏低",
-      chart: "近 5 分鐘", chartNote: "每秒取樣，只存在這個分頁",
-      lgTps: "輸出 tok/s", lgAct: "進行中對話", axNow: "現在", axMin: "-{m} 分",
+      tps: "輸出速度", tpsT: "所有對話合計每秒輸出的 token 數，邊生成邊計算（近 5 秒）", tpsU: "tok/s",
+      nGen: "{n} 個對話生成中", nGen1: "1 個對話生成中", idle: "閒置",
+      conv: "對話", convT: "正在生成回答的對話，與還在讀入 prompt 的對話",
+      gen: "生成中", read: "讀入中", upTo: "最多同時 {p} 個", par1: "單一對話模式",
+      qLimit: "{n} 個排隊 · 已達上限，等其他對話結束", qBusy: "{n} 個排隊 · 下一個排程點就開始", qWait: "{n} 個排隊",
+      pf: "讀入 prompt", pfT: "所有對話還沒讀入（prefill）的 prompt token", pfU: "token 待讀",
+      eta: "約 {t}後讀完", etaNone: "還沒量到讀入速度", etaT: "依實測讀入速度 {r} tok/s 估計",
+      mem: "記憶體", memOk: "充足", memTight: "偏緊", memLow: "不足",
+      memSub: "可用 {l}% · swap {s} GB", memSubL: "可用 {l}%", memSubS: "swap {s} GB",
+      memT: "Slot 記憶體 {m} / {b} GB", memOver: "（超過預算，會釋放閒置 slot）",
+      chart: "輸出 tok/s · 近 5 分鐘", axNow: "現在", axMin: "-{m} 分",
+      tbl: "進行中對話", thPrompt: "Prompt 長度",
+      st: { gen: ["生成中", "正在寫回答"], read: ["讀入中", "正在讀入 prompt（prefill）"], wait: ["等待中", "等另一個對話讀完相同的 prompt 前綴再重用"] },
+      genRow: "{g} tok · {r} tok/s", waitRow: "共用前綴",
+      waiting: "等待資料…", par1L: "parallel = 1：伺服器不回報個別對話",
+      noActive: "伺服器沒有回報進行中的對話", noneL: "目前沒有進行中的對話",
+      costToday: "API 計價 今天 {t} · 全部 {a}", costRun: "API 計價 這次啟動 {t}",
+      details: "詳細",
+      du: { d: " 天", h: " 小時", m: " 分", s: " 秒" },
       totals: "累計", totalsNote: "伺服器啟動以來",
-      tTotal: "總計", tTotalNote: "prompt + 輸出", tTotalT: "全部 prompt token 加上全部輸出 token",
-      tGpu: "GPU 實算", tGpuNote: "prefill + 輸出", tGpuT: "GPU 實際算過的 token：沒命中快取的 prompt token，加上輸出",
+      tTotal: "總 token", tTotalT: "全部 prompt token 加上全部輸出 token",
+      tGpu: "GPU 實算", tGpuT: "沒命中快取的 prompt token，加上輸出",
       tDone: "完成請求", tIn: "Prompt token", tCached: "快取重用", tCachedT: "從前綴快取直接取用的 prompt token",
       tPf: "實際 prefill", tPfT: "prompt token 扣掉快取重用的部分", tOut: "輸出 token", tAvg: "平均輸出 / 請求", tok: "tok",
-      rates: "實測速度（EMA，用來選模式）", ratesT: "spec ×1 = 單一對話推測解碼；batch ×N = N 個對話一起解碼；slice ×N = N 個對話輪流推測解碼",
-      tbl: "進行中對話",
-      thState: "狀態", thPrompt: "Prompt", thCached: "快取", thHit: "命中", thHitT: "這個 prompt 從快取取用的比例",
-      thNeed: "需 prefill", thNeedT: "prompt − 快取：還要實際計算的 token", thGen: "已生成", thTps: "tok/s", thTpsT: "這個對話的輸出速度", pfT: "已讀入的 prompt token / prompt 長度",
-      waiting: "等待資料…", par1: "parallel = 1：伺服器不回報個別對話",
-      noActive: "伺服器沒有回報 active 欄位", none: "目前沒有進行中的對話",
-      count: "{n} 個", noId: " · 無穩定 id，tok/s 以 prompt + 快取配對推算",
-      st: { prefill: ["讀入中", "正在讀入 prompt（prefill）"], solo: ["單獨推測", "單獨以推測解碼生成"], batch: ["一起解碼", "和其他對話一起解碼（batch）"] },
-      md: { spec: ["spec", "推測解碼：每個對話各自跑"], batch: ["batch", "多個對話一起解碼，總吞吐較高"],
-            idle: ["閒置", "沒有進行中的對話"], single: ["單一", "單一對話模式（parallel = 1）"] },
-      srcA: "資料來源 ", srcB: "，每秒輪詢", lastUpd: "最後更新 {t}",
-      foot: "spec = 每個對話各自推測解碼；batch = 多個對話一起解碼",
-      du: { d: " 天", h: " 小時", m: " 分", s: " 秒" },
-      scopeS: "當前啟動", scopeL: "全部", scopeLT: "伺服器重啟後仍保留（stats.json）",
+      tCancel: "取消 · 錯誤 · 拒絕",
+      rates: "實測速度（tok/s）", ratesT: "spec ×1 = 單一對話推測解碼；batch ×N = N 個對話一起解碼；slice ×N = N 個對話輪流推測解碼；prefill = 讀入 prompt",
+      noRates: "還沒量到", modeNow: "目前：{m}",
+      md: { spec: "spec", batch: "batch", idle: "閒置", single: "單一" },
+      srcA: "資料來源 ", srcB: "，每秒輪詢", lastUpd: "最後更新 {t}", prof: "格式 {p}",
+      scopeS: "這次啟動", scopeL: "全部", scopeLT: "伺服器重啟後仍保留（stats.json）",
       sinceL: "自 {d} 起 · 共執行 {u}", sinceD: "自 {d} 起",
       cost: "API 計價", costT: "（prompt − 快取）× 輸入價 + 快取 × 快取讀取價 + 輸出 × 輸出價，以每 100 萬 token 計",
       costNote: "依 OpenRouter qwen/qwen3.8-flash 價格計算",
@@ -365,7 +341,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     const navs = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
     return navs.some((l) => norm(l) === "zh-TW") ? "zh-TW" : "en";
   }
-  let L = pickLang(), S = I18N[L], NF0, NF1, NF2, PCT;
+  let L = pickLang(), S = I18N[L], NF0, NF1, NF2, PCT, USD;
   const tr = (k, v) => String(S[k] ?? k).replace(/\{(\w+)\}/g, (_, n) => (v && v[n] !== undefined ? v[n] : ""));
   function setFormats() {
     NF0 = new Intl.NumberFormat(L, { maximumFractionDigits: 0 });
@@ -376,7 +352,6 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     USD = [cur({ minimumFractionDigits: 2, maximumFractionDigits: 2 }), cur({ minimumFractionDigits: 3, maximumFractionDigits: 3 }),
       cur({ minimumFractionDigits: 4, maximumFractionDigits: 4 }), cur({ maximumSignificantDigits: 2 })];
   }
-  let USD;
   // USD: 2 decimals from $10, 3 from $1, 4 below (e.g. $0.0423), 2 significant digits for tiny non-zero amounts
   function money(v) {
     v = num(v); if (v === null) return "—";
@@ -392,7 +367,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     if (p && typeof p === "object") for (const k in DEF_PRICE) if (num(p[k]) !== null && p[k] >= 0) PRICE[k] = p[k];
   } catch (e) { /* storage blocked or bad JSON: defaults */ }
   const isDefPrice = () => Object.keys(DEF_PRICE).every((k) => PRICE[k] === DEF_PRICE[k]);
-  // T = /status or its "lifetime" object: same field names
+  // T = /status, its "lifetime" object or a day bucket: same field names
   function costOf(T) {
     const pin = num(T?.prompt_tokens), cch = num(T?.cached_tokens) ?? 0, out = num(T?.output_tokens);
     if (pin === null || out === null) return null;
@@ -401,8 +376,9 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     c.total = c.in + c.cache + c.out;
     return c;
   }
-  let scope = "s"; // totals panel: "s" = this session, "l" = all time
-  try { if (localStorage.getItem("qw-scope") === "l") scope = "l"; } catch (e) { /* ignore */ }
+  const store = (k, v) => { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) { /* storage blocked */ } };
+  const load = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+  let scope = load("qw-scope") === "l" ? "l" : "s"; // totals panel: "s" = this run, "l" = all time
 
   function human(n, d) {
     n = num(n); if (n === null) return "—";
@@ -418,7 +394,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     s = Math.floor(s);
     const u = S.du, d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
     const f = (...p) => p.map(([v, k]) => v + u[k]).join(" ");
-    if (d) return f([d, "d"], [h, "h"], [m, "m"]);
+    if (d) return f([d, "d"], [h, "h"]);
     if (h) return f([h, "h"], [m, "m"]);
     if (m) return f([m, "m"], [x, "s"]);
     return f([x, "s"]);
@@ -426,11 +402,10 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
   const fmtTps = (v) => (v === null ? "—" : v >= 100 ? NF0.format(v) : NF1.format(v));
 
   const STATE_ALIAS = { p: "prefill", s: "solo", b: "batch" };
-  const STATE_CLS = { prefill: "s-prefill", solo: "s-solo", batch: "s-batch" };
-  const MODE_CLS = { spec: "m-spec", batch: "m-batch", idle: "m-idle", single: "m-idle" };
+  const isGen = (r) => r.state === "batch" || r.state === "solo";
 
   // ---- state ----
-  let samples = [];     // {t, out, in, cached, act, prod, mono, tps}
+  let samples = [];     // {t, out, in, cached, prod, mono, tps}
   let prevRows = [];    // [{prompt, cached, gen, t, tps}]
   let last = null, lastOk = 0, inflight = false, connState = null, err = null;
   let view = null;      // last rendered snapshot, repainted on language switch
@@ -446,17 +421,17 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
           if (best < 0 || Math.abs(p.gen - r.gen) < Math.abs(pool[best].gen - r.gen)) best = i;
         }
       }
-      let tps = null, since = t, gen0 = r.gen, pgen = null;
+      let tps = null, pgen = null;
       if (best >= 0) {
         const p = pool[best]; pool[best] = null;
-        since = p.since; gen0 = p.gen0; pgen = p.gen;
+        pgen = p.gen;
         const dt = (t - p.t) / 1000;
         if (dt > 0) {
           const inst = (r.gen - p.gen) / dt;
           tps = p.tps === null ? inst : p.tps * 0.5 + inst * 0.5;
         }
       }
-      return { ...r, t, tps, since, gen0, pgen };
+      return { ...r, t, tps, pgen };
     });
   }
 
@@ -477,12 +452,11 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
   function render(d, t) {
     const out = num(d.output_tokens), pin = num(d.prompt_tokens), cch = num(d.cached_tokens);
     const active = Array.isArray(d.active) ? d.active : null;
-    const nAct = active ? active.length : null;
 
     const rows = (active || []).map((a) => ({
       prompt: num(a?.prompt) ?? 0, cached: num(a?.cached) ?? 0, gen: num(a?.generated) ?? 0,
       state: typeof a?.state === "string" ? (STATE_ALIAS[a.state] || a.state) : "?", id: a?.id,
-      stps: num(a?.tps), pf: num(a?.prefilled),
+      stps: num(a?.tps), pf: num(a?.prefilled), left: num(a?.prefill_left), follows: num(a?.follows) ?? 0,
     }));
     const live = num(d.live_output_tokens) ?? rows.reduce((acc, r) => acc + r.gen, 0);
     const prod = out === null ? null : out + live;
@@ -510,7 +484,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       const cont = matched.reduce((acc, r) => acc + (r.pgen === null ? 0 : Math.max(0, r.gen - r.pgen)), 0);
       mono += Math.max(0, prod - prevS.prod, cont);
     }
-    samples.push({ t, out, in: pin, cached: cch, act: nAct, prod, mono: prod === null ? null : mono, tps: null });
+    samples.push({ t, out, in: pin, cached: cch, prod, mono: prod === null ? null : mono, tps: null });
     while (samples.length && t - samples[0].t > HIST_S * 1000 + 2000) samples.shift();
 
     let tps = null;
@@ -523,69 +497,89 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       if (s > 0) tps = s;
     }
     samples[samples.length - 1].tps = tps;
-    view = { d, tps, matched, hasId, hw: windowed(HIT_WIN) };
+    view = { d, tps, matched };
     paint();
   }
+
+  const setBig = (id, html, cls) => { const e = $(id); e.innerHTML = html; e.className = "big" + (cls ? " " + cls : ""); };
+  const unit = (k) => `<small>${esc(tr(k))}</small>`;
 
   // Draw the current snapshot in the current language (no state changes)
   function paint() {
     if (!view) { drawChart(); return; }
-    const { d, tps, matched, hasId, hw } = view;
-    const out = num(d.output_tokens), pin = num(d.prompt_tokens), cch = num(d.cached_tokens);
+    const { d, tps, matched } = view;
     const active = Array.isArray(d.active) ? d.active : null;
     const par = num(d.parallel);
-    const nAct = active ? active.length : null;
+    const rt = d.rate && typeof d.rate === "object" ? d.rate : d.rates && typeof d.rates === "object" ? d.rates : null;
 
-    $("h-ver").textContent = d.version ?? "—";
-    $("h-prof").textContent = d.profile ?? "—";
-    $("h-up").textContent = dur(d.uptime_s);
+    $("h-ver").textContent = d.version ? tr("ver", { v: d.version }) : "—";
+    $("h-up").textContent = tr("up", { d: dur(d.uptime_s) });
+    $("f-prof").textContent = d.profile ? tr("prof", { p: d.profile }) : "";
 
-    $("k-act").textContent = nAct === null ? "—" : NF0.format(nAct);
-    $("k-par").textContent = par === null ? "—" : NF0.format(par);
-    $("k-act-bar").style.width = nAct !== null && par ? Math.min(100, (nAct / par) * 100) + "%" : "0";
-    const q = num(d.queued);
-    $("k-q").textContent = q === null ? "—" : NF0.format(q);
-    $("k-q").style.color = q ? "var(--warn)" : "";
-    const QR = { limit: "qLimit", busy: "qBusy" };
-    $("k-q-hint").textContent = tr(q ? QR[d.queue_reason] || "qWait" : "qNone");
+    // 1. output speed
+    const nGen = matched.filter(isGen).length, nRead = matched.length - nGen;
+    setBig("k-tps", esc(fmtTps(tps)) + unit("tpsU"), tps === 0 ? "zero" : "");
+    $("k-tps-sub").textContent = !active ? "" : nGen ? tr(nGen === 1 ? "nGen1" : "nGen", { n: NF0.format(nGen) }) : tr("idle");
 
-    const mode = typeof d.mode === "string" ? d.mode : (par === 1 ? "single" : null);
-    const mi = S.md[mode] || [mode ?? "—", "—"];
-    const mEl = $("k-mode"); mEl.textContent = mi[0]; mEl.className = "pill " + (MODE_CLS[mode] || "m-idle");
-    $("k-mode-hint").textContent = mi[1];
+    // 2. conversations
+    if (!active) setBig("k-conv", "—", "zero");
+    else if (!matched.length) setBig("k-conv", "0", "zero");
+    else setBig("k-conv", `${NF0.format(nGen)}${unit("gen")}<span class="sep">·</span>${NF0.format(nRead)}${unit("read")}`);
+    const q = num(d.queued), QR = { limit: "qLimit", busy: "qBusy" }, cs = $("k-conv-sub");
+    cs.textContent = q ? tr(QR[d.queue_reason] || "qWait", { n: NF0.format(q) }) : par === 1 ? tr("par1") : par ? tr("upTo", { p: NF0.format(par) }) : "";
+    cs.className = "sub" + (q ? " is-warn" : "");
 
-    $("k-tps").textContent = fmtTps(tps);
-    const nGen = matched.filter((r) => r.state === "batch" || r.state === "solo").length;
-    const perConv = tps !== null && nGen ? tps / nGen : null;
-    $("k-tps-sub").textContent = tr("tpsSub", { n: NF0.format(TPS_WIN) }) + (perConv !== null ? tr("perConv", { v: fmtTps(perConv) }) : "");
+    // 3. prompt reading: tokens still to prefill, ETA at the measured prefill rate
+    let back = num(d.prefill_backlog_tokens);
+    if (back === null && active) back = matched.reduce((a, r) => a + (r.state !== "prefill" ? 0 : r.left ?? Math.max(0, r.prompt - (r.pf ?? r.cached))), 0);
+    const pfr = num(rt?.prefill);
+    setBig("k-pf", back === null ? "—" : esc(human(back)) + (back ? unit("pfU") : ""), back ? "" : "zero");
+    const ps = $("k-pf-sub");
+    ps.textContent = back === null ? "" : !back ? tr("idle") : pfr > 0 ? tr("eta", { t: dur(Math.max(1, back / pfr)) }) : tr("etaNone");
+    ps.title = back && pfr > 0 ? tr("etaT", { r: NF0.format(pfr) }) : "";
 
-    const hit = pin ? (cch ?? 0) / pin : null;
-    $("k-hit").textContent = pct(hit);
-    let rhit = null;
-    if (hw && hw.a.in !== null && hw.b.in !== null) {
-      const rin = hw.b.in - hw.a.in;
-      if (rin > 0) rhit = ((hw.b.cached ?? 0) - (hw.a.cached ?? 0)) / rin;
-    }
-    $("k-hit-sub").textContent = rhit !== null ? tr("hitRecent", { n: NF0.format(Math.round(hw.dt)), p: pct(rhit) }) : tr("hitNone");
-
-    const mem = num(d.slot_mem_gb), bud = num(d.slot_budget_gb);
-    $("k-mem").textContent = mem === null ? "—" : NF1.format(mem);
-    const over = mem !== null && bud !== null && mem > bud;
-    $("k-mem-barw").classList.toggle("over", over);
-    $("k-mem").classList.toggle("over-txt", over);
-    $("k-mem-bar").style.width = mem !== null && bud ? Math.min(100, (mem / bud) * 100) + "%" : "0";
-    $("k-mem-sub").textContent = bud === null ? tr("budgetNone") :
-      tr("budget", { b: NF1.format(bud), p: pct(mem / bud) }) + (over ? tr("over") : "");
-    $("k-mem-sub").classList.toggle("over-txt", over);
-    const ml = num(d.mem_level), sw = num(d.swap_used_gb), sys = $("k-sys");
-    sys.hidden = ml === null && sw === null;
-    const low = (ml !== null && ml < 20) || (sw !== null && sw > 20);
+    // 4. memory: one word from free memory %, swap and slot memory vs budget
+    const ml = num(d.mem_level), sw = num(d.swap_used_gb), mem = num(d.slot_mem_gb), bud = num(d.slot_budget_gb);
+    const fill = mem !== null && bud ? mem / bud : null;
+    const lvl = ml === null && sw === null && fill === null ? null
+      : (ml !== null && ml < 15) || (sw !== null && sw > 20) ? "bad"
+      : (ml !== null && ml < 30) || (sw !== null && sw > 10) || (fill !== null && fill > 0.9) ? "warn" : "ok";
+    setBig("k-mem", lvl ? esc(tr({ ok: "memOk", warn: "memTight", bad: "memLow" }[lvl])) : "—", lvl ? "is-" + lvl : "zero");
     const mlT = ml === null ? "" : NF0.format(ml), swT = sw === null ? "" : NF1.format(sw);
-    sys.textContent = tr(ml === null ? "sysS" : sw === null ? "sysL" : "sys", { l: mlT, s: swT }) + (low ? tr("sysLow") : "");
-    sys.classList.toggle("over-txt", low);
+    $("k-mem-sub").textContent = ml === null && sw === null ? "" : tr(ml === null ? "memSubS" : sw === null ? "memSubL" : "memSub", { l: mlT, s: swT });
+    $("c-mem").title = mem !== null && bud !== null ? tr("memT", { m: NF1.format(mem), b: NF1.format(bud) }) + (fill > 1 ? tr("memOver") : "") : "";
 
-    // Totals: this session (top-level fields) or all time ("lifetime", only when the server keeps stats.json)
+    // conversation list: one row each
+    const list = $("list");
+    if (!active) list.innerHTML = `<div class="empty">${esc(tr(par === 1 ? "par1L" : "noActive"))}</div>`;
+    else if (!matched.length) list.innerHTML = `<div class="empty">${esc(tr("noneL"))}</div>`;
+    else list.innerHTML = matched.map((r) => {
+      const k = isGen(r) ? "gen" : r.follows > 0 ? "wait" : "read", st = S.st[k];
+      let mid;
+      if (k === "gen") {
+        const v = r.stps ?? r.tps;
+        mid = `<span>${esc(tr("genRow", { g: human(r.gen), r: fmtTps(v === null || v === undefined ? null : Math.max(0, v)) }))}</span>`;
+      } else {
+        const done = r.left !== null ? r.prompt - r.left : r.pf ?? r.cached, f = r.prompt ? Math.min(1, Math.max(0, done / r.prompt)) : 0;
+        mid = k === "wait" ? `<span>${esc(tr("waitRow"))}</span>` : `<div class="bar"><span style="width:${(f * 100).toFixed(1)}%"></span></div><span class="pc">${pct(f)}</span>`;
+      }
+      return `<div class="cv"><span class="chip c-${k}" title="${esc(st[1])}">${esc(st[0])}</span><div class="mid">${mid}</div><span class="plen">${human(r.prompt)}</span></div>`;
+    }).join("");
+
+    // cost line: today from the lifetime day bucket, all time from lifetime; this run when the server keeps no stats.json
     const life = d.lifetime && typeof d.lifetime === "object" ? d.lifetime : null;
+    const today = DAYS[dkey(new Date())] || life?.days?.[dkey(new Date())];
+    $("costline").innerHTML = life
+      ? esc(tr("costToday", { t: "\u0001", a: "\u0002" })).replace("\u0001", `<b>${money(today ? costOf(today)?.total : 0)}</b>`).replace("\u0002", `<b>${money(costOf(life)?.total)}</b>`)
+      : esc(tr("costRun", { t: "\u0001" })).replace("\u0001", `<b>${money(costOf(d)?.total)}</b>`);
+
+    paintDetails(d, life, rt, matched);
+    drawChart();
+  }
+
+  // ---- details (collapsed by default) ----
+  function paintDetails(d, life, rt, matched) {
+    // Totals: this run (top-level fields) or all time ("lifetime", only when the server keeps stats.json)
     $("scope").hidden = !life;
     for (const b of $("scope").children) { const on = b.dataset.s === (life ? scope : "s"); b.classList.toggle("on", on); b.setAttribute("aria-pressed", on); }
     const sinceD = life && num(life.since) ? new Date(life.since * 1000).toLocaleDateString(L, { year: "numeric", month: "short", day: "numeric" }) : "—";
@@ -593,8 +587,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     $("totals-note").textContent = life && scope === "l" ? tr("sinceD", { d: sinceD }) : tr("totalsNote");
     const T = life && scope === "l" ? life : d;
     const tin = num(T.prompt_tokens), tc = num(T.cached_tokens), to = num(T.output_tokens), thit = tin ? (tc ?? 0) / tin : null;
-    $("t-total").innerHTML = tin !== null && to !== null ? "<b>" + human(tin + to) + "</b>" : "—";
-    $("t-gpu").innerHTML = tin !== null && tc !== null && to !== null ? "<b>" + human(tin - tc + to) + "</b>" : "—";
+    $("t-total").textContent = tin !== null && to !== null ? human(tin + to) : "—";
+    $("t-gpu").textContent = tin !== null && tc !== null && to !== null ? human(tin - tc + to) : "—";
     $("t-done").textContent = human(T.done);
     $("t-in").textContent = human(tin);
     $("t-cached").textContent = human(tc) + (thit !== null ? `  (${pct(thit)})` : "");
@@ -602,6 +596,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     $("t-out").textContent = human(to);
     const dn = num(T.done);
     $("t-avg").textContent = dn && to !== null ? human(to / dn) + " " + tr("tok") : "—";
+    $("t-cancel").textContent = [T.cancelled, T.errors, T === d ? d.rejected : undefined].filter((v) => v !== undefined).map((v) => human(v)).join(" · ") || "—";
 
     // API cost: both scopes side by side
     const costCol = (name, note, T2, up, recent) => {
@@ -626,49 +621,24 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       : `<div class="lbl">${esc(tr("scopeL"))}</div><div class="empty">${esc(tr("cNoLife"))}</div>`;
 
     // Measured rates: the server sends "rate"; "rates" is accepted too
-    const rt = d.rate && typeof d.rate === "object" ? d.rate : d.rates && typeof d.rates === "object" ? d.rates : null;
-    if (rt) {
-      const ents = Object.entries(rt).filter(([, v]) => num(v) !== null && v > 0);
-      ents.sort((a, b) => (a[0] === "spec" ? -1 : b[0] === "spec" ? 1 : (parseInt(a[0].slice(5)) || 0) - (parseInt(b[0].slice(5)) || 0)));
-      const mx = Math.max(1, ...ents.map(([, v]) => v));
-      const curKey = mode === "spec" ? "spec" : mode === "batch" ? "batch" + (matched.filter((r) => r.state === "batch").length || nAct) : "";
-      $("rates").hidden = !ents.length;
-      $("rates-list").innerHTML = ents.map(([k, v]) =>
-        `<div class="r${k === curKey ? " cur" : ""}"><span class="k">${esc(k === "spec" ? "spec ×1" : k.replace(/^(batch|slice)/, "$1 ×"))}</span>` +
-        `<div class="bar"><span style="width:${(v / mx) * 100}%;background:${k === "spec" ? "var(--violet)" : "var(--accent)"}"></span></div>` +
-        `<span class="v">${fmtTps(v)}</span></div>`).join("");
-    } else $("rates").hidden = true;
-
-    const tb = $("tbody");
-    if (!active) {
-      tb.innerHTML = `<tr><td colspan="8" class="empty">${esc(tr(par === 1 ? "par1" : "noActive"))}</td></tr>`;
-    } else if (!matched.length) {
-      tb.innerHTML = `<tr><td colspan="8" class="empty">${esc(tr("none"))}</td></tr>`;
-    } else {
-      tb.innerHTML = matched.map((r, i) => {
-        const st = S.st[r.state] || [r.state, ""];
-        const h = r.prompt ? r.cached / r.prompt : 0;
-        const rt2 = r.stps ?? r.tps;
-        return `<tr><td class="l" style="color:var(--faint)">${hasId ? esc(r.id) : i + 1}</td>` +
-          `<td class="l"><span class="pill ${STATE_CLS[r.state] || "s-other"}"${st[1] ? ` title="${esc(st[1])}"` : ""}>${esc(st[0])}</span>` +
-          (r.state === "prefill" && r.pf !== null && r.prompt ? `<span class="pf" title="${esc(tr("pfT"))}"><span class="bar"><span style="width:${Math.min(100, (r.pf / r.prompt) * 100).toFixed(1)}%"></span></span>${human(r.pf)} / ${human(r.prompt)}</span>` : "") + `</td>` +
-          `<td>${human(r.prompt)}</td><td>${human(r.cached)}</td>` +
-          `<td class="cache"><div class="cbar"><div class="bar"><span style="width:${(h * 100).toFixed(1)}%"></span></div><span class="pct">${pct(h)}</span></div></td>` +
-          `<td>${human(Math.max(0, r.prompt - r.cached))}</td>` +
-          `<td>${human(r.gen)}</td>` +
-          `<td>${r.state === "prefill" ? '<span style="color:var(--faint)">—</span>' : fmtTps(rt2 === null || rt2 === undefined ? null : Math.max(0, rt2))}</td></tr>`;
-      }).join("");
-    }
-    $("tbl-note").textContent = active && matched.length
-      ? tr("count", { n: NF0.format(matched.length) }) + (hasId ? "" : tr("noId")) : "";
+    const mode = typeof d.mode === "string" ? d.mode : (num(d.parallel) === 1 ? "single" : null);
+    $("mode-note").textContent = mode ? tr("modeNow", { m: S.md[mode] || mode }) : "";
+    const ents = rt ? Object.entries(rt).filter(([, v]) => num(v) !== null && v > 0) : [];
+    const ord = (k) => (k === "prefill" ? -2 : k === "spec" ? -1 : (k.startsWith("slice") ? 1000 : 0) + (parseInt(k.replace(/\D/g, "")) || 0));
+    ents.sort((a, b) => ord(a[0]) - ord(b[0]));
+    const dec = ents.filter(([k]) => k !== "prefill"), mx = Math.max(1, ...dec.map(([, v]) => v));
+    const curKey = mode === "spec" ? "spec" : mode === "batch" ? "batch" + (matched.filter((r) => r.state === "batch").length || matched.length) : "";
+    $("rates-list").innerHTML = ents.length ? ents.map(([k, v]) =>
+      `<div class="r${k === curKey ? " cur" : ""}"><span class="k">${esc(k === "spec" ? "spec ×1" : k.replace(/^(batch|slice)/, "$1 ×"))}</span>` +
+      (k === "prefill" ? "<span></span>" : `<div class="bar"><span style="width:${(v / mx) * 100}%"></span></div>`) +
+      `<span class="v">${fmtTps(v)}</span></div>`).join("") : `<div class="empty">${esc(tr("noRates"))}</div>`;
 
     paintHist();
-    drawChart();
   }
 
   // ---- usage by period (from lifetime.days, summed in the page) ----
-  let DAYS = {}, daysAt = 0, per = "d", hrows = [];
-  try { if (/^[dwm]$/.test(localStorage.getItem("qw-per"))) per = localStorage.getItem("qw-per"); } catch (e) { /* ignore */ }
+  let DAYS = {}, daysAt = 0, hrows = [];
+  let per = /^[dwm]$/.test(load("qw-per") || "") ? load("qw-per") : "d";
   const p2 = (n) => String(n).padStart(2, "0");
   const dkey = (x) => `${x.getFullYear()}-${p2(x.getMonth() + 1)}-${p2(x.getDate())}`;
   function periods() {
@@ -694,39 +664,42 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
   function paintHist() {
     const on = !!view?.d?.lifetime;
     $("hist").hidden = !on;
-    if (!on) return;
+    if (!on || !$("det").open) return;
     for (const b of $("per").children) { const o = b.dataset.p === per; b.classList.toggle("on", o); b.setAttribute("aria-pressed", o); }
-    $("hist-note").textContent = tr("histNote");
     hrows = periods();
     const cur = hrows.length - 1;
     $("hbody").innerHTML = hrows.map((r, i) => i).reverse().map((i) => {
       const r = hrows[i];
-      return `<tr${i === cur ? ' class="cur"' : ""}><td class="l">${esc(r.label)}${i === cur ? ` <span class="pill s-batch">${esc(S.cur[per])}</span>` : ""}</td>` +
+      return `<tr${i === cur ? ' class="cur"' : ""}><td>${esc(r.label)}${i === cur ? ` <span class="chip c-gen">${esc(S.cur[per])}</span>` : ""}</td>` +
         `<td>${human(r.done)}</td><td>${human(r.prompt_tokens)}</td><td>${human(r.cached_tokens)}</td><td>${human(r.output_tokens)}</td><td>${money(r.cost)}</td></tr>`;
     }).join("");
     drawHist();
   }
-  function drawHist() {
-    const cv = $("hchart");
-    if ($("hist").hidden || !cv.clientWidth) return;
+  function canvas(cv) {
     const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
     if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
     const g = cv.getContext("2d");
     g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
-    const padL = 74, padR = 8, padT = 6, padB = 18, pw = W - padL - padR, ph = H - padT - padB, n = hrows.length;
+    return [g, W, H];
+  }
+  function drawHist() {
+    const cv = $("hchart");
+    if ($("hist").hidden || !cv.clientWidth) return;
+    const [g, W, H] = canvas(cv);
+    const padL = 64, padR = 8, padT = 6, padB = 18, pw = W - padL - padR, ph = H - padT - padB, n = hrows.length;
     const mx = niceMax(Math.max(0.01, ...hrows.map((r) => r.cost)));
-    g.font = `11px ${cssVar("--mono")}`; g.fillStyle = cssVar("--faint"); g.strokeStyle = cssVar("--line"); g.lineWidth = 1;
-    for (let k = 0; k <= 4; k++) {
-      const y = padT + ph * (1 - k / 4);
+    g.font = `11px ${cssVar("--sans")}`; g.fillStyle = cssVar("--faint"); g.strokeStyle = cssVar("--line"); g.lineWidth = 1;
+    for (let k = 0; k <= 2; k++) {
+      const y = padT + ph * (1 - k / 2);
       g.beginPath(); g.moveTo(padL, y + .5); g.lineTo(padL + pw, y + .5); g.stroke();
-      const v = (mx * k) / 4; g.textAlign = "right"; g.fillText(v >= 1 || !v ? USD[0].format(v) : money(v), padL - 6, y + 4);
+      const v = (mx * k) / 2; g.textAlign = "right"; g.fillText(v >= 1 || !v ? USD[0].format(v) : money(v), padL - 8, y + 4);
     }
     const bw = pw / n, acc = cssVar("--accent");
-    g.font = `11px ${cssVar("--sans")}`; g.textAlign = "center";
+    g.textAlign = "center";
     hrows.forEach((r, i) => {
-      const h = (r.cost / mx) * ph, x0 = padL + i * bw + bw * 0.18;
-      g.fillStyle = acc; g.globalAlpha = i === n - 1 ? 1 : 0.45;
-      g.fillRect(x0, padT + ph - h, bw * 0.64, h);
+      const h = (r.cost / mx) * ph, x0 = padL + i * bw + bw * 0.2;
+      g.fillStyle = acc; g.globalAlpha = i === n - 1 ? 1 : 0.4;
+      g.fillRect(x0, padT + ph - h, bw * 0.6, h);
       g.globalAlpha = 1; g.fillStyle = cssVar(i === n - 1 ? "--fg" : "--faint");
       g.fillText(r.short, padL + (i + 0.5) * bw, H - 4);
     });
@@ -734,63 +707,44 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
   $("per").addEventListener("click", (e) => {
     const k = e.target.closest("button")?.dataset.p;
     if (!k || k === per) return;
-    per = k;
-    try { localStorage.setItem("qw-per", k); } catch (er) { /* storage blocked */ }
+    per = k; store("qw-per", k);
     paintHist();
   });
 
-  // ---- chart ----
+  // ---- chart: output tok/s, last 5 minutes ----
   function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
   function drawChart() {
-    const cv = $("chart"), dpr = window.devicePixelRatio || 1;
-    const W = cv.clientWidth, H = cv.clientHeight;
-    if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
-    const g = cv.getContext("2d");
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, W, H);
-    const padL = 40, padR = 30, padT = 8, padB = 18, pw = W - padL - padR, ph = H - padT - padB;
+    const [g, W, H] = canvas($("chart"));
+    const padL = 44, padR = 8, padT = 8, padB = 20, pw = W - padL - padR, ph = H - padT - padB;
     const now = samples.length ? samples[samples.length - 1].t : Date.now();
     const x = (t) => padL + pw * (1 - (now - t) / (HIST_S * 1000));
-    const tv = samples.map((s) => s.tps).filter((v) => v !== null);
-    const av = samples.map((s) => s.act).filter((v) => v !== null);
-    const tmax = niceMax(Math.max(10, ...tv));
-    const amax = Math.max(1, num(last?.parallel) ?? 1, ...av);
-    const line = cssVar("--line"), dim = cssVar("--faint");
-    g.font = `11px ${cssVar("--mono")}`; g.fillStyle = dim; g.strokeStyle = line; g.lineWidth = 1;
-    for (let k = 0; k <= 5; k++) {
-      const y = padT + ph * (1 - k / 5);
-      g.beginPath(); g.moveTo(padL, y + .5); g.lineTo(padL + pw, y + .5); g.stroke();
-      g.textAlign = "right"; g.fillText(NF2.format(+((tmax * k) / 5).toPrecision(3)), padL - 6, y + 4);
+    const tmax = niceMax(Math.max(10, ...samples.map((s) => s.tps).filter((v) => v !== null)));
+    g.font = `11px ${cssVar("--sans")}`; g.fillStyle = cssVar("--faint"); g.strokeStyle = cssVar("--line"); g.lineWidth = 1;
+    for (let k = 0; k <= 4; k++) {
+      const y = Math.round(padT + ph * (1 - k / 4)) + .5;
+      g.setLineDash(k ? [2, 4] : []);
+      g.beginPath(); g.moveTo(padL, y); g.lineTo(padL + pw, y); g.stroke();
+      g.textAlign = "right"; g.fillText(NF2.format(+((tmax * k) / 4).toPrecision(3)), padL - 8, y + 4);
     }
-    g.textAlign = "left";
-    for (const f of [0, 0.5, 1]) {
-      const v = amax * f;
-      if (f === 0.5 && v % 1) continue;
-      g.fillText(NF0.format(v), padL + pw + 6, padT + ph * (1 - f) + 4);
-    }
-    g.font = `11px ${cssVar("--sans")}`;
+    g.setLineDash([]);
     g.textAlign = "center";
-    for (const m of [5, 4, 3, 2, 1, 0]) g.fillText(m ? tr("axMin", { m }) : tr("axNow"), padL + pw * (1 - m / 5), H - 4);
-
-    const series = (key, mx, color, fill) => {
-      // null samples (while disconnected) split the line into segments
-      const segs = [[]];
-      for (const s of samples) {
-        if (s[key] === null) { if (segs[segs.length - 1].length) segs.push([]); continue; }
-        segs[segs.length - 1].push([x(s.t), padT + ph * (1 - Math.min(1, s[key] / mx))]);
-      }
-      for (const pts of segs) {
-        if (pts.length < 2) continue;
-        g.beginPath(); pts.forEach(([px, py], i) => (i ? g.lineTo(px, py) : g.moveTo(px, py)));
-        g.strokeStyle = color; g.lineWidth = 1.8; g.lineJoin = "round"; g.stroke();
-        if (fill) {
-          g.lineTo(pts[pts.length - 1][0], padT + ph); g.lineTo(pts[0][0], padT + ph); g.closePath();
-          g.globalAlpha = .14; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
-        }
-      }
-    };
-    series("act", amax, cssVar("--violet"), false);
-    series("tps", tmax, cssVar("--accent"), true);
+    for (const m of [5, 4, 3, 2, 1, 0]) {
+      g.textAlign = m === 0 ? "right" : "center";
+      g.fillText(m ? tr("axMin", { m }) : tr("axNow"), padL + pw * (1 - m / 5), H - 4);
+    }
+    // null samples (while disconnected) split the line into segments
+    const segs = [[]], color = cssVar("--accent");
+    for (const s of samples) {
+      if (s.tps === null) { if (segs[segs.length - 1].length) segs.push([]); continue; }
+      segs[segs.length - 1].push([x(s.t), padT + ph * (1 - Math.min(1, s.tps / tmax))]);
+    }
+    for (const pts of segs) {
+      if (pts.length < 2) continue;
+      g.beginPath(); pts.forEach(([px, py], i) => (i ? g.lineTo(px, py) : g.moveTo(px, py)));
+      g.strokeStyle = color; g.lineWidth = 2; g.lineJoin = "round"; g.stroke();
+      g.lineTo(pts[pts.length - 1][0], padT + ph); g.lineTo(pts[0][0], padT + ph); g.closePath();
+      g.globalAlpha = .1; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
+    }
   }
   function niceMax(v) {
     const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p;
@@ -836,7 +790,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
       err = e.name === "AbortError" ? { kind: "timeout" } : e.kind ? { kind: e.kind } : e.name === "SyntaxError" ? { kind: "json" } : e.name === "TypeError" ? { kind: "net" } : { kind: "msg", msg: e.message || String(e) };
       paintConn();
       // Leave a gap in the chart: push a null sample
-      samples.push({ t: Date.now(), out: null, in: null, cached: null, act: null, prod: null, mono: null, tps: null });
+      samples.push({ t: Date.now(), out: null, in: null, cached: null, prod: null, mono: null, tps: null });
       while (samples.length && Date.now() - samples[0].t > HIST_S * 1000 + 2000) samples.shift();
       prevRows = [];
       drawChart();
@@ -845,7 +799,7 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     }
   }
 
-  // ---- language ----
+  // ---- language, prices, details ----
   function applyLang() {
     S = I18N[L]; setFormats();
     document.documentElement.lang = L;
@@ -870,31 +824,32 @@ footer { color: var(--faint); font-size: 12px; margin-top: 14px; display: flex; 
     const v = e.target.valueAsNumber;
     if (!isFinite(v) || v < 0) return; // keep the last valid price while typing
     PRICE[k] = v;
-    try { localStorage.setItem("qw-prices", JSON.stringify(PRICE)); } catch (er) { /* storage blocked */ }
+    store("qw-prices", JSON.stringify(PRICE));
     paintPrices(true); paint();
   });
   $("p-reset").addEventListener("click", () => {
     PRICE = { ...DEF_PRICE };
-    try { localStorage.removeItem("qw-prices"); } catch (er) { /* storage blocked */ }
+    store("qw-prices", null);
     paintPrices(); paint();
   });
   $("scope").addEventListener("click", (e) => {
     const s = e.target.closest("button")?.dataset.s;
     if (!s || s === scope) return;
-    scope = s;
-    try { localStorage.setItem("qw-scope", s); } catch (er) { /* storage blocked */ }
+    scope = s; store("qw-scope", s);
     paint();
   });
   $("lang").addEventListener("click", (e) => {
     const k = e.target.closest("button")?.dataset.l;
     if (!k || k === L || !I18N[k]) return;
-    L = k;
-    try { localStorage.setItem("qw-lang", k); } catch (er) { /* storage blocked: choice lasts for this tab only */ }
+    L = k; store("qw-lang", k); // storage blocked: the choice lasts for this tab only
     applyLang();
   });
+  const det = $("det");
+  det.open = load("qw-details") === "1";
+  det.addEventListener("toggle", () => { store("qw-details", det.open ? "1" : null); paintHist(); });
 
   window.addEventListener("resize", () => { drawChart(); drawHist(); });
-  matchMedia("(prefers-color-scheme: light)").addEventListener?.("change", drawChart);
+  matchMedia("(prefers-color-scheme: light)").addEventListener?.("change", () => { drawChart(); drawHist(); });
   applyLang();
   poll();
   setInterval(poll, POLL_MS);

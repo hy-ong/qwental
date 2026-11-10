@@ -8,6 +8,7 @@
 #include "requant.h"
 #include "dflash.h"
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -122,6 +123,10 @@ struct qw_engine {
     int nfiles;
     st_file *ngram; // ngram_table.bin（safetensors 格式）
     int max_ctx, pos;
+    // 即時狀態「與從 0 一次 prefill 逐位元相同」到哪個位置：只由起點在 GDN 分塊倍數上的 prefill 段算出時 = pos，decode 過就不是
+    // （decode 的 kernel 與 prefill 不同；從不在分塊倍數的位置接續，分塊的切法也不同）。快照記下 exact，跨請求只從這種快照接續
+    int st_exact;
+    bool seg_exact; // 目前這段 prefill 的起點符合上面的條件（段中檢查點用）
     // 段中檢查點：prefill 時在這些位置（絕對位置）順便存狀態，不必為了檢查點切段
     int pf_snap[16], npf_snap;
     uint32_t seg_q[4]; // 目前這段裡的檢查點（相對位置，GDN 分塊大小的倍數）
@@ -208,7 +213,7 @@ struct qw_engine {
     // prefix cache：KV 裡目前是哪些 token、兩個狀態快照（prompt 結束、生成結束）
     int32_t *kvtok;
     int kvlen;
-    struct qw_snap { int len; unsigned long long age; qw_buf S, conv, ple; } snap[CKMAX];
+    struct qw_snap { int len; unsigned long long age; qw_buf S, conv, ple; int why; bool exact; int tag; } snap[CKMAX]; // why：誰存的（SW_*，QW_VERIFY_REUSE 的紀錄用）
     // 多組 KV slot（不同對話 / 不同用途的請求各自保留快取）：目前用的那組放在上面的欄位，其他的存在這裡
     struct qw_slot {
         bool init;
@@ -219,7 +224,7 @@ struct qw_engine {
         struct qw_snap snap[CKMAX];
         unsigned long long used;
         double tuse; // 並發：最後一次用到的時間（qw_now 秒；選 slot / 釋放時估算對話還會不會回來）
-        qw_buf S, conv, ple; int pos; // 並發：這個對話自己的 DeltaNet / conv / PLE 狀態與位置（qw_engine_par_*）
+        qw_buf S, conv, ple; int pos, exact; // 並發：這個對話自己的 DeltaNet / conv / PLE 狀態與位置（qw_engine_par_*）、st_exact
         qw_buf dfK, dfV;  // 並發（GGUF）：這個對話自己的 DFlash2 環狀 KV
         int dflo, dfdone; // 環狀 KV 的有效範圍 [dflo, dfdone)（一起推測解碼用；dfdone ≤ 0 = 沒有）
     } slots[64]; // 平常最多 8 組（QW_SLOTS）；並發模式最多 64 組（每個同時進行的對話一組）
@@ -834,6 +839,11 @@ static void d1(qw_batch *b, unsigned n, unsigned tg) { qw_batch_dispatch(b, (n +
 // ---------------------------------------------------------------- 開啟
 
 static void snap_save(qw_engine *e, int len);
+// QW_VERIFY_REUSE（重用狀態的自我檢查，見 qw_engine_par_verify）
+static int vr_on(void);
+static void vr_note(int sid, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void vr_capture(qw_engine *e, int sid, const int32_t *ids, int n, const float *lg);
+static void vr_mark(int sid); // 這個 prompt 用到了別處來的狀態
 static qw_kernel *dn_kernel(qw_engine *e, const char *base, int nb);
 static void snap_save_from(qw_engine *e, int len, int stage);
 static int gdn_chunk(void);
@@ -915,6 +925,7 @@ static bool kv_reserve(qw_engine *e, int need) {
     if (cap <= e->kvcap) return need <= e->kvcap;
     if (!kv_resize(e, &e->Kc, &e->Vc, &e->rawk, &e->kblk, &e->kvcap, cap)) return false;
     if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[cache] KV 容量 %d → %d\n", old, cap);
+    if (vr_on()) vr_note(e->cur, "grow kv %d→%d; ", old, cap);
     return true;
 }
 
@@ -4494,6 +4505,7 @@ static double pf_segment(qw_engine *e, const int32_t *ids, uint32_t T, float *du
     if (mix_busy) { fprintf(stderr, "mixed step：decode 迴圈裡不能 prefill\n"); return -1; }
     const double tseg0 = qw_now();
     const uint32_t pos0 = (uint32_t)e->pos;
+    e->seg_exact = e->st_exact == (int)pos0 && pos0 % (uint32_t)gdn_chunk() == 0;
     const bool prof = getenv("QW_PF_PROF") && (int)pos0 + (int)T >= atoi(getenv("QW_PF_PROF"));
     if (prof) qw_profile_enable(e->g, true);
     int32_t *tk = e->tok.ptr;
@@ -4590,6 +4602,7 @@ static double pf_segment(qw_engine *e, const int32_t *ids, uint32_t T, float *du
         qw_profile_enable(e->g, false);
     }
     e->pos += (int)T;
+    e->st_exact = e->seg_exact ? e->pos : -1;
     for (uint32_t i = 0; i < T; i++) e->hist[pos0 + 2 + i] = ids[i];
     if (getenv("QW_UNION_CHECK") && pos0 + T > QW_IDX_BUDGET && e->pul.ptr) { // 除錯：GPU 的區塊聯集 vs CPU 重算（最後一層）
         const uint32_t *sel = e->psel.ptr, *nsel = e->pnsel.ptr, *ul = e->pul.ptr, *uc = e->puc.ptr;
@@ -6164,8 +6177,26 @@ static void snap_copy_k(qw_engine *e, struct qw_snap *c, bool to_snap, int stage
 // 存一個長度為 len 的檢查點：同長度的覆寫，否則用空的或最舊的
 static void snap_copy(qw_engine *e, struct qw_snap *c, bool to_snap) { snap_copy_k(e, c, to_snap, -1); }
 
+// 快照是誰存的（只給 QW_VERIFY_REUSE 的紀錄用，不影響數值）：呼叫 snap_save 前設 snap_why，存完回到 SW_CKPT
+enum { SW_CKPT, SW_PROMPT, SW_FINISH, SW_PARSNAP, SW_XS, SW_SSD, SW_YIELD };
+static const char *const SW_NAME[] = {"ckpt", "prompt-end", "finish", "par_snap", "xs_copy", "ssd", "yield"};
+static int snap_why;
+static int par_cur; // 定義在下面（並發模式目前載入的 slot）
+static int slot_tag[QW_PAR_MAX]; // 每組 slot 目前的請求編號（qw_engine_par_tag）：快照記下是哪個請求存的
+// 能不能從快照 s 接續長度 np 的 prompt（tag = 這個請求的編號，-1 = 不是並發模式）：
+//   跨請求：只用 exact 而且長度是 GDN 分塊倍數的快照 —— 接續的結果與從 0 一次 prefill 逐位元相同（不同分段點、或 decode 算出的狀態，
+//   最後 logits 的 KL 可到 0.01–0.4，greedy 常走不同的路）
+//   同一個請求接著生成（只差最後送出、還沒餵的那一個 token）：用 decode 算到的狀態（與沒中斷時逐位元相同）
+static bool snap_cross(const struct qw_snap *s) { return s->S.ptr && s->len > 0 && s->exact && s->len % gdn_chunk() == 0; }
+static bool snap_cont(const struct qw_snap *s, int np, int tag) { return s->S.ptr && tag >= 0 && s->tag == tag && s->len == np - 1; }
+static bool snap_ok(const struct qw_snap *s, int np, int tag) { return s->len > 0 && s->len <= np - 1 && (snap_cross(s) || snap_cont(s, np, tag)); }
+// 重用狀態的自我檢查（QW_VERIFY_REUSE=N，見 qw_engine_par_verify）：prompt 算完時記下最後位置的 logits，閒置時在空的 slot 從頭重算比對
+static bool vr_fresh; // 正在從頭重算（不接快照、不 xs_copy、不 dc_load）
+static bool no_reuse(void) { return vr_fresh || getenv("QW_NO_CACHE") || getenv("QW_NO_REUSE"); } // QW_NO_REUSE = QW_NO_CACHE：一律從 0 算
 static int snap_cap(qw_engine *e); // 每組 slot 最多幾份快照（並發模式較少：每份含 113 MB 的 DeltaNet 狀態，slot 多時會佔太多記憶體）
 static void snap_save_k(qw_engine *e, int len, int stage) {
+    const int why = snap_why;
+    snap_why = SW_CKPT;
     int k = -1;
     const int CK = snap_cap(e);
     for (int i = 0; i < CK && k < 0; i++) if (e->snap[i].len == len) k = i;
@@ -6182,6 +6213,9 @@ static void snap_save_k(qw_engine *e, int len, int stage) {
     snap_copy_k(e, &e->snap[k], true, stage);
     e->snap[k].len = len;
     e->snap[k].age = ++e->clock;
+    e->snap[k].why = why;
+    e->snap[k].exact = stage >= 0 ? e->seg_exact && len % gdn_chunk() == 0 : e->st_exact == len && e->pos == len;
+    e->snap[k].tag = par_cur >= 0 ? slot_tag[e->cur] : -1;
 }
 static void snap_save(qw_engine *e, int len) { snap_save_k(e, len, -1); }
 static void snap_save_from(qw_engine *e, int len, int stage) { snap_save_k(e, len, stage); }
@@ -6262,8 +6296,21 @@ static uint64_t tok_hash(const int32_t *t, int n) {
     return h;
 }
 
-static void dc_path(const qw_engine *e, uint64_t h, int len, char *out, size_t n) {
-    snprintf(out, n, "%s/%016llx_%d.qwc", e->cache_dir, (unsigned long long)h, len);
+// 檔案的指紋：模型（GGUF 目錄或 MLX 目錄）與影響數值的設定（QW_INT8 等）。換了模型 / 設定，舊檔案不會被讀進來
+static uint32_t dc_fp(void) {
+    static uint32_t fp;
+    if (!fp) {
+        char k[2048];
+        snprintf(k, sizeof k, "%s|%s|%s|%s|%s", getenv("QW_GGUF") ? getenv("QW_GGUF") : "mlx", getenv("QW_GGUF_PARTS") ? getenv("QW_GGUF_PARTS") : "",
+                 getenv("QW_INT8") ? getenv("QW_INT8") : "", getenv("QW_EXACT_SPEC") ? getenv("QW_EXACT_SPEC") : "", getenv("QW_DENSE4") ? getenv("QW_DENSE4") : "");
+        uint64_t h = 1469598103934665603ull;
+        for (const char *c = k; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+        fp = (uint32_t)(h ^ h >> 32) | 1;
+    }
+    return fp;
+}
+static void dc_path(const qw_engine *e, uint64_t h, int len, char *out, size_t n) { // QWC2：只存 exact 的狀態（snap_cross），檔名帶指紋
+    snprintf(out, n, "%s/%016llx_%08x_%d.qwc", e->cache_dir, (unsigned long long)h, dc_fp(), len);
 }
 
 // 各段資料：{目前 slot 的 buffer, 每份 attention 的位移, 每份的位元組數}
@@ -6290,7 +6337,8 @@ static void dc_write_from(qw_engine *e, const int32_t *toks, int len, const stru
     FILE *f = fopen(tmp, "wb");
     if (!f) return;
     const double t0 = qw_now();
-    dc_head hd = {{'Q', 'W', 'C', '1'}, (uint32_t)len, (uint32_t)e->last_eos, 0, h};
+    if (!snap_cross(src) || src->len != len) return; // 只存跨請求接得上的狀態（與從 0 一次 prefill 逐位元相同）
+    dc_head hd = {{'Q', 'W', 'C', '2'}, (uint32_t)len, (uint32_t)e->last_eos, dc_fp(), h};
     bool ok = fwrite(&hd, sizeof hd, 1, f) == 1 && fwrite(toks, 4, (size_t)len, f) == (size_t)len &&
               fwrite(e->hist, 4, (size_t)len + 2, f) == (size_t)len + 2 && fwrite(e->tok.ptr, 4, (size_t)len + 2, f) == (size_t)len + 2 &&
               fwrite(src->S.ptr, 1, e->S.size, f) == e->S.size && fwrite(src->conv.ptr, 1, e->conv_st.size, f) == e->conv_st.size &&
@@ -6334,7 +6382,7 @@ static void dc_trim_dir(qw_engine *e) { // 容量上限（QW_CACHE_GB，預設 2
 // 沒載入的 slot s 的前 len 個位置（快照 sn 的狀態；len ≤ s->kvlen）寫到 SSD，格式同 dc_write_from（dc_load 讀得回來）。
 // 只讀 CPU 看得到的 buffer：呼叫時這個 slot 不能是目前載入的、也不能有還沒完成的 GPU 工作（閒置的 slot）
 static bool dc_write_slot(qw_engine *e, const struct qw_slot *s, const struct qw_snap *sn, int len) {
-    if (!e->cache_dir[0] || len < 256 || len > s->kvlen || !sn->S.ptr || !s->hist || !s->kvtok || !s->tok.ptr) return false;
+    if (!e->cache_dir[0] || len < 256 || len > s->kvlen || !snap_cross(sn) || sn->len != len || !s->hist || !s->kvtok || !s->tok.ptr) return false;
     const uint64_t h = tok_hash(s->kvtok, len);
     char path[700], tmp[720];
     dc_path(e, h, len, path, sizeof path);
@@ -6345,7 +6393,7 @@ static bool dc_write_slot(qw_engine *e, const struct qw_slot *s, const struct qw
     const double t0 = qw_now();
     int last_eos = 1; // 同 xs_copy：照 token 歷史重算到 len 為止
     for (int p = 0; p < len; p++) if (s->hist[p + 2] == EOS_ID) last_eos = p + 1;
-    dc_head hd = {{'Q', 'W', 'C', '1'}, (uint32_t)len, (uint32_t)last_eos, 0, h};
+    dc_head hd = {{'Q', 'W', 'C', '2'}, (uint32_t)len, (uint32_t)last_eos, dc_fp(), h};
     bool ok = fwrite(&hd, sizeof hd, 1, f) == 1 && fwrite(s->kvtok, 4, (size_t)len, f) == (size_t)len &&
               fwrite(s->hist, 4, (size_t)len + 2, f) == (size_t)len + 2 && fwrite(s->tok.ptr, 4, (size_t)len + 2, f) == (size_t)len + 2 &&
               sn->S.size == e->S.size && sn->conv.size == e->conv_st.size && sn->ple.size == e->ple_st.size &&
@@ -6375,9 +6423,10 @@ static int dc_load(qw_engine *e, const int32_t *prompt, int np, int min_len) {
     struct dirent *de;
     while ((de = readdir(d))) {
         unsigned long long h;
+        unsigned fp;
         int len;
-        if (sscanf(de->d_name, "%16llx_%d.qwc", &h, &len) != 2 || !strstr(de->d_name, ".qwc") || strstr(de->d_name, ".tmp")) continue;
-        if (len <= min_len || len <= best || len > np - 1) continue;
+        if (sscanf(de->d_name, "%16llx_%8x_%d.qwc", &h, &fp, &len) != 3 || fp != dc_fp() || !strstr(de->d_name, ".qwc") || strstr(de->d_name, ".tmp")) continue;
+        if (len <= min_len || len <= best || len > np - 1 || len % gdn_chunk()) continue;
         if (tok_hash(prompt, len) != h) continue;
         best = len;
         dc_path(e, h, len, bpath, sizeof bpath);
@@ -6388,7 +6437,7 @@ static int dc_load(qw_engine *e, const int32_t *prompt, int np, int min_len) {
     FILE *f = fopen(bpath, "rb");
     if (!f) return 0;
     dc_head hd;
-    bool ok = fread(&hd, sizeof hd, 1, f) == 1 && !memcmp(hd.magic, "QWC1", 4) && (int)hd.len == best;
+    bool ok = fread(&hd, sizeof hd, 1, f) == 1 && !memcmp(hd.magic, "QWC2", 4) && (int)hd.len == best && hd.pad == dc_fp();
     int32_t *chk = malloc(sizeof(int32_t) * (size_t)best);
     ok = ok && fread(chk, 4, (size_t)best, f) == (size_t)best && !memcmp(chk, prompt, sizeof(int32_t) * (size_t)best);
     free(chk);
@@ -6402,14 +6451,20 @@ static int dc_load(qw_engine *e, const int32_t *prompt, int np, int min_len) {
         for (int k = 0; k < 4 && ok; k++) ok = fread((char *)b[k]->ptr + off[k], 1, by[k], f) == by[k];
     }
     fclose(f);
-    if (!ok) { qw_engine_reset(e); e->kvlen = 0; return 0; }
+    if (!ok) { // KV / 歷史可能已經讀了一半：這組 slot 的快照都不能再用
+        qw_engine_reset(e);
+        e->kvlen = 0;
+        for (int i = 0; i < CKMAX; i++) e->snap[i].len = 0;
+        return 0;
+    }
     e->last_eos = (int)hd.last_eos;
     e->pos = best;
+    e->st_exact = best; // 只存 exact 的（dc_write_from / dc_write_slot）
     e->pending = false;
     for (int i = 0; i < CKMAX; i++) e->snap[i].len = 0; // KV 被覆寫，記憶體裡的檢查點都失效
     memcpy(e->kvtok, prompt, sizeof(int32_t) * (size_t)best);
     e->kvlen = best;
-    snap_save(e, best);
+    snap_why = SW_SSD, snap_save(e, best);
     if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[cache] 從 SSD 載入：%d 個 token，%.0f ms\n", best, (qw_now() - t0) * 1e3);
     return best;
 }
@@ -6421,6 +6476,7 @@ void qw_engine_set_cache_dir(qw_engine *e, const char *dir) {
 
 void qw_engine_reset(qw_engine *e) {
     e->pos = 0;
+    e->st_exact = 0;
     e->dn_pmask = 0;
     memset(e->S.ptr, 0, e->S.size);
     memset(e->conv_st.ptr, 0, e->conv_st.size);
@@ -6456,30 +6512,38 @@ int qw_engine_generate_ex(qw_engine *e, const int32_t *prompt, int np, const qw_
     if (tdbg) fprintf(stderr, "[t] slot_pick %.1f ms\n", (qw_now() - tp0) * 1e3);
     int common = 0;
     while (common < e->kvlen && common < np && e->kvtok[common] == prompt[common]) common++;
+    const int tag = par_cur >= 0 ? slot_tag[e->cur] : -1; // 同一個請求接著生成時可以用 decode 的狀態（snap_ok）
     int best = -1;
     for (int i = 0; i < CKMAX; i++) {
         if (e->snap[i].len > common) e->snap[i].len = 0; // KV 會從 common 起被覆寫，比它長的快照失效
-        if (e->snap[i].len > 0 && e->snap[i].len <= np - 1 && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
+        if (snap_ok(&e->snap[i], np, tag) && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
     }
     // 記憶體裡的快取不夠長時，看 SSD 上有沒有更長的
-    if (!getenv("QW_NO_CACHE") && e->cache_dir[0]) {
+    if (!no_reuse() && e->cache_dir[0]) {
         const int have = best >= 0 ? e->snap[best].len : 0;
         if (have < np / 2 && dc_load(e, prompt, np, have) > 0) {
+            if (par_cur >= 0 && vr_on()) vr_note(e->cur, "solo: SSD %d; ", e->kvlen);
             common = e->kvlen;
             best = -1;
             for (int i = 0; i < CKMAX; i++)
-                if (e->snap[i].len > 0 && e->snap[i].len <= np - 1 && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
+                if (snap_ok(&e->snap[i], np, tag) && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
         }
     }
     if (tdbg) fprintf(stderr, "[t] dc_load %.1f ms\n", (qw_now() - tp0) * 1e3);
     int start = 0;
-    if (best >= 0 && !getenv("QW_NO_CACHE")) {
+    bool cont = false; // 同一個請求接著生成：剩下的 token 用 decode 餵（與沒中斷時相同）
+    if (best >= 0 && !no_reuse()) {
         start = e->snap[best].len;
+        cont = snap_cont(&e->snap[best], np, tag);
         snap_copy(e, &e->snap[best], false);
         e->pos = start;
+        e->st_exact = e->snap[best].exact ? start : -1;
         e->pending = false;
     } else
         qw_engine_reset(e);
+    if (par_cur >= 0 && vr_on())
+        vr_note(e->cur, "solo %d→%d (%s); ", start, np, start ? SW_NAME[e->snap[best].why] : "from 0");
+    if (par_cur >= 0 && start > 0) vr_mark(e->cur);
     st->cached = start;
     if (getenv("QW_CACHE_DBG"))
         fprintf(stderr, "[cache] slot %d：共同前綴 %d / %d，從 %d 開始\n", e->cur, common, np, start);
@@ -6507,6 +6571,7 @@ int qw_engine_generate_ex(qw_engine *e, const int32_t *prompt, int np, const qw_
     const int minnew[3] = {4096, 4096, 512};
     for (int k = 0; k < 3; k++)
         if (np - start > minnew[k] && np - back[k] > start + 64 && (nck == 0 || np - back[k] > cks[nck - 1] + 32)) cks[nck++] = np - back[k];
+    if (np / gdn_chunk() * gdn_chunk() > start && np % gdn_chunk()) cks[nck++] = np / gdn_chunk() * gdn_chunk(); // 下一輪能接續的最長位置（snap_ok）
     // 持久化點（例如 system 訊息結尾）：也切在這裡，處理完寫到 SSD
     for (int k = 0; k < g->npersist; k++) {
         const int pp = g->persist[k];
@@ -6528,7 +6593,7 @@ int qw_engine_generate_ex(qw_engine *e, const int32_t *prompt, int np, const qw_
     double pms = 0;
     e->pf_next = -1;
     const float *lg;
-    if (par_cur >= 0 && np - start <= 16) { // 並發模式從快照接續（切換單獨 / 一起）：剩幾個 token 用 decode 一步一步算，與沒中斷時逐位元相同
+    if (cont) { // 並發模式同一個請求接續（切換單獨 / 一起）：剩下的 token 用 decode 一步一步算，與沒中斷時逐位元相同
         e->npf_snap = 0;
         lg = NULL;
         for (int i = start; i < np; i++) if (!(lg = qw_engine_step(e, prompt[i], NULL))) break;
@@ -6549,7 +6614,7 @@ int qw_engine_generate_ex(qw_engine *e, const int32_t *prompt, int np, const qw_
                 e->pf_mtp = false;
                 e->mtp_T = 0;
                 e->kvlen = i;
-                snap_save(e, i);
+                snap_why = SW_YIELD, snap_save(e, i);
                 for (int q = 0; q < g->npersist; q++) {
                     const int pp = g->persist[q];
                     if (pp <= start || pp > i) continue;
@@ -6566,7 +6631,7 @@ int qw_engine_generate_ex(qw_engine *e, const int32_t *prompt, int np, const qw_
     e->npf_snap = 0;
     if (tdbg) fprintf(stderr, "[t] prefill %d..%d done %.1f ms (gpu %.1f)\n", start, np, (qw_now() - tp0) * 1e3, pms);
     if (lg) {
-        snap_save(e, np);
+        snap_why = SW_PROMPT, snap_save(e, np);
         // 持久化：從對齊後的檢查點寫到 SSD
         for (int q = 0; q < g->npersist; q++) {
             const int pp = g->persist[q];
@@ -6580,6 +6645,7 @@ int qw_engine_generate_ex(qw_engine *e, const int32_t *prompt, int np, const qw_
     e->pf_mtp = false;
     e->mtp_T = 0;
     if (!lg) return QW_FIN_ERROR;
+    if (par_cur >= 0) vr_capture(e, e->cur, prompt, np, lg);
     st->prefill_ms = (qw_now() - tp0) * 1e3;
     dist d;
     int32_t first;
@@ -6878,7 +6944,7 @@ done:
     if (e->pos > np && e->pos <= ns) {
         memcpy(e->kvtok, seq, sizeof(int32_t) * (size_t)e->pos);
         e->kvlen = e->pos;
-        snap_save(e, e->pos);
+        snap_why = SW_FINISH, snap_save(e, e->pos);
     }
     free(seq);
     st->gen = got;
@@ -7997,7 +8063,7 @@ static bool par_dfslot(const qw_engine *e) { return e->df_on && e->m->lin_tiled 
 static void par_save(qw_engine *e, int i) {
     struct qw_slot *s = &e->slots[i];
     slot_save(e, i);
-    s->S = e->S; s->conv = e->conv_st; s->ple = e->ple_st; s->pos = e->pos;
+    s->S = e->S; s->conv = e->conv_st; s->ple = e->ple_st; s->pos = e->pos; s->exact = e->st_exact;
     if (par_dfslot(e) && e->dfKr.ptr) { s->dfK = e->dfKr; s->dfV = e->dfVr; } // 環狀 KV 跟著對話走（GGUF）
 }
 static bool par_load(qw_engine *e, int i) {
@@ -8007,9 +8073,10 @@ static bool par_load(qw_engine *e, int i) {
         if (!alloc(e, &s->S, e->S.size) || !alloc(e, &s->conv, e->conv_st.size) || !alloc(e, &s->ple, e->ple_st.size)) return false;
         memset(s->S.ptr, 0, s->S.size); memset(s->conv.ptr, 0, s->conv.size); memset(s->ple.ptr, 0, s->ple.size);
         s->pos = 0;
+        s->exact = 0;
     }
     slot_load(e, i);
-    e->S = s->S; e->conv_st = s->conv; e->ple_st = s->ple; e->pos = s->pos;
+    e->S = s->S; e->conv_st = s->conv; e->ple_st = s->ple; e->pos = s->pos; e->st_exact = s->exact;
     e->pending = false;
     if (par_dfslot(e) && e->dfKr.ptr) { // 沒有自己的環狀 KV 時配一份（內容無效：dfdone = 0）
         if (!s->dfK.ptr && (!alloc(e, &s->dfK, e->dfKr.size) || !alloc(e, &s->dfV, e->dfVr.size))) return false;
@@ -8083,13 +8150,14 @@ static void slot_evict(qw_engine *e, int i) {
     free(s->kvtok);
     memset(s, 0, sizeof *s);
     if (e->df_slot == i) e->df_slot = -1;
+    if (vr_on()) vr_note(i, "slot evicted; ");
 }
 // ---- 選 slot / 釋放 slot 的成本（只決定用哪一組 slot，不影響數值：接續點一律是逐 token 比對過的快照）
 // keep(s)：這組 slot 能直接接續的 token 數（最長的有效快照；沒有快照的 KV 接不上 DeltaNet 狀態，不算）
 static int slot_keep(const struct qw_slot *s) {
     int k = 0;
     for (int i = 0; i < CKMAX; i++)
-        if (s->snap[i].len > k && s->snap[i].len <= s->kvlen && s->snap[i].S.ptr) k = s->snap[i].len;
+        if (s->snap[i].len > k && s->snap[i].len <= s->kvlen && snap_cross(&s->snap[i])) k = s->snap[i].len; // 別的請求能接的
     return k;
 }
 // 對話還會回來的權重：剛用過 = 1，閒置 H 秒 = 1/2，2H = 1/3…（H = QW_SLOT_AGE，預設 900 秒；
@@ -8118,10 +8186,10 @@ static size_t snap_prune(struct qw_snap *sn, int kvlen, int keep) {
     for (int k = 0; k < CKMAX; k++) { // 長度第 1…keep 名（有效的：0 < len ≤ kvlen）留下
         if (!sn[k].S.ptr) continue;
         int rank = 0;
-        const bool ok = sn[k].len > 0 && sn[k].len <= kvlen;
+        const bool ok = sn[k].len > 0 && sn[k].len <= kvlen && snap_cross(&sn[k]); // 閒置的 slot：之後只有別的請求會來接（snap_ok）
         if (ok)
             for (int q = 0; q < CKMAX; q++)
-                if (q != k && sn[q].S.ptr && sn[q].len > 0 && sn[q].len <= kvlen && (sn[q].len > sn[k].len || (sn[q].len == sn[k].len && q < k))) rank++;
+                if (q != k && sn[q].len > 0 && sn[q].len <= kvlen && snap_cross(&sn[q]) && (sn[q].len > sn[k].len || (sn[q].len == sn[k].len && q < k))) rank++;
         if (ok && rank < keep) continue;
         fr += sn[k].S.size + sn[k].conv.size + sn[k].ple.size;
         qw_buf_free(&sn[k].S); qw_buf_free(&sn[k].conv); qw_buf_free(&sn[k].ple);
@@ -8145,9 +8213,10 @@ size_t qw_engine_par_shrink(qw_engine *e, unsigned long long busy) {
         int want = (used + 2 * VBMAX + 8 + KV_STEP - 1) / KV_STEP * KV_STEP; // 同 kv_reserve 的餘量（驗證會寫到 pos + VBMAX 之後）
         if (want > e->max_ctx) want = e->max_ctx;
         const int old = *cap;
-        if (want < *cap && kv_resize(e, K, V, R, B, cap, want) && getenv("QW_CACHE_DBG"))
-            fprintf(stderr, "[mem] slot %d 的 KV 容量 %d → %d（用到 %d）\n", i, old, want, used);
-        snap_prune(cur ? e->snap : s->snap, kvlen, ks);
+        const bool rs = want < *cap && kv_resize(e, K, V, R, B, cap, want);
+        if (rs && getenv("QW_CACHE_DBG")) fprintf(stderr, "[mem] slot %d 的 KV 容量 %d → %d（用到 %d）\n", i, old, want, used);
+        const size_t pr = snap_prune(cur ? e->snap : s->snap, kvlen, ks);
+        if (vr_on() && (rs || pr)) vr_note(i, "shrink kv %d→%d%s (kvlen %d, pos %d); ", old, *cap, pr ? " + prune snaps" : "", kvlen, pos);
         if (cur) par_save(e, i); // slots[par_cur] 的副本跟著更新（buffer 換過）
     }
     const size_t m1 = qw_engine_par_mem(e), fr = m0 > m1 ? m0 - m1 : 0;
@@ -8167,10 +8236,11 @@ bool qw_engine_par_snap(qw_engine *e, int sid) {
     for (int k = 0; k < CKMAX; k++)
         if (sn[k].len == kvlen && sn[k].S.ptr) return true;
     if (!par_use(e, sid)) return false;
-    snap_save(e, kvlen); // 內含 dn_flush（延後寫回的 DeltaNet 狀態先補上）
+    snap_why = SW_PARSNAP, snap_save(e, kvlen); // 內含 dn_flush（延後寫回的 DeltaNet 狀態先補上）
     for (int k = 0; k < CKMAX; k++)
         if (e->snap[k].len == kvlen && e->snap[k].S.ptr) {
             if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[cache] slot %d 停在 %d：記快照\n", sid, kvlen);
+            if (vr_on()) vr_note(sid, "par_snap at %d; ", kvlen);
             return true;
         }
     return false;
@@ -8217,7 +8287,7 @@ int qw_engine_par_trim(qw_engine *e, unsigned long long busy, size_t budget, boo
         if (!one && e->cache_dir[0] && !getenv("QW_NO_CACHE") && !getenv("QW_NO_EVICT_PERSIST") && keep >= pmin && keep >= 256) {
             const double fb = (double)keep * (double)(kv_row(0) * 2 + kv_row(2) + kv_row(3) / 4) * (NATT + 1);
             for (int k = 0; k < CKMAX; k++)
-                if (s->snap[k].len == keep && s->snap[k].S.ptr) {
+                if (s->snap[k].len == keep && snap_cross(&s->snap[k])) {
                     if (fb <= dc_cap() / 2) dc_write_slot(e, s, &s->snap[k], keep);
                     break;
                 }
@@ -8251,7 +8321,7 @@ int qw_engine_par_pick(qw_engine *e, const int32_t *prompt, int np, unsigned lon
         while (c < s->kvlen && c < np && s->kvtok[c] == prompt[c]) c++;
         int g = 0;
         for (int k = 0; k < CKMAX; k++)
-            if (s->snap[k].len > g && s->snap[k].len <= c && s->snap[k].len <= np - 1 && s->snap[k].S.ptr) g = s->snap[k].len;
+            if (s->snap[k].len > g && s->snap[k].len <= c && s->snap[k].len <= np - 1 && snap_cross(&s->snap[k])) g = s->snap[k].len;
         const int keep = slot_keep(s);
         cs[i] = c;
         ls[i] = keep > c ? keep - g : 0;
@@ -8284,6 +8354,7 @@ int qw_engine_par_pick(qw_engine *e, const int32_t *prompt, int np, unsigned lon
 // 分段時照整段（第一段的起點 pf0）算，只留這一段 [start, end) 裡的
 // 跨 slot 共用前綴（例如多個 subagent 的 system prompt 與工具定義）：別的 slot（可能正在用）有更長的可用快照時，
 // 把前 len 個位置的 KV、token 歷史與快照的狀態複製到目前的 slot（KV 前 len 列只由這些 token 決定，與在那邊接續逐位元相同）
+static int xs_src, xs_why; // 上一次 xs_copy 的來源 slot 與那份快照是誰存的（QW_VERIFY_REUSE 的紀錄）
 static int xs_copy(qw_engine *e, int sid, const int32_t *prompt, int np, int have) {
     int bs = -1, bk = -1, bl = have;
     for (int i = 0; i < QW_PAR_MAX; i++) {
@@ -8293,10 +8364,12 @@ static int xs_copy(qw_engine *e, int sid, const int32_t *prompt, int np, int hav
         while (c < o->kvlen && c < np && o->kvtok[c] == prompt[c]) c++;
         for (int k = 0; k < CKMAX; k++) {
             const int L = o->snap[k].len;
-            if (L > bl && L <= c && L <= np - 1 && o->snap[k].S.ptr) { bl = L; bs = i; bk = k; }
+            if (L > bl && L <= c && L <= np - 1 && snap_cross(&o->snap[k])) { bl = L; bs = i; bk = k; }
         }
     }
     if (bs < 0 || bl - have < 256) return 0;
+    xs_src = bs;
+    xs_why = e->slots[bs].snap[bk].why;
     const double t0 = qw_now();
     if (!kv_reserve(e, np + 2 * VBMAX + 8 < e->max_ctx ? np + 2 * VBMAX + 8 : e->max_ctx)) return 0;
     struct qw_slot *o = &e->slots[bs];
@@ -8313,11 +8386,12 @@ static int xs_copy(qw_engine *e, int sid, const int32_t *prompt, int np, int hav
     for (int p = 0; p < bl; p++) if (e->hist[p + 2] == EOS_ID) e->last_eos = p + 1;
     snap_copy(e, &o->snap[bk], false);
     e->pos = bl;
+    e->st_exact = bl; // 來源快照是 exact（snap_cross）
     e->pending = false;
     for (int i = 0; i < CKMAX; i++) e->snap[i].len = 0; // KV 被覆寫，這個 slot 原本的檢查點都失效
     memcpy(e->kvtok, prompt, sizeof(int32_t) * (size_t)bl);
     e->kvlen = bl;
-    snap_save(e, bl);
+    snap_why = SW_XS, snap_save(e, bl);
     if (e->df_slot == sid) e->df_slot = -1;
     if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[cache] 從 slot %d 複製前綴：%d 個 token，%.1f ms\n", bs, bl, (qw_now() - t0) * 1e3);
     return bl;
@@ -8355,6 +8429,10 @@ static bool par_pf_plan(qw_engine *e, int sid, int np, int start, int end) { // 
     const int back[3] = {2048, 512, 128}, minnew[3] = {4096, 4096, 512};
     for (int k = 0; k < 3; k++)
         if (np - s0 > minnew[k] && np - back[k] > s0 + 64 && (nck == 0 || np - back[k] > cks[nck - 1] + 32)) cks[nck++] = np - back[k];
+    { // prompt 結尾往下對齊到 GDN 分塊：下一輪（不同請求）能接續的最長位置（結尾本身多半不在分塊倍數上，snap_ok）
+        const int CC = gdn_chunk(), a = np / CC * CC;
+        if (a > s0 && a < np && (nck == 0 || cks[nck - 1] != a)) cks[nck++] = a;
+    }
     for (int k = 0; k < par_npp + par_nsp; k++) { // 持久化點（例如 system 訊息結尾）與交接點：也存快照（持久化點算完寫到 SSD）
         const int pp = k < par_npp ? par_pp[k] : par_sp[k - par_npp];
         bool dup = pp <= s0 || pp >= np;
@@ -8409,45 +8487,56 @@ const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prom
         e->df_tapping = false;
         e->npf_snap = 0;
         if (!lg) return NULL;
-        if (end == np || ck) snap_save(e, end);
+        if (end == np || ck) { snap_why = end == np ? SW_PROMPT : SW_CKPT; snap_save(e, end); }
         par_pf_persist(e, sid, prompt, start, end);
         dn_flush(e);
         *done = end;
+        if (end == np) vr_capture(e, sid, prompt, np, lg);
         return lg;
     }
+    const int tag = slot_tag[sid];
     int common = 0;
     while (common < e->kvlen && common < np && e->kvtok[common] == prompt[common]) common++;
     int best = -1;
     for (int i = 0; i < CKMAX; i++) {
         if (e->snap[i].len > common) e->snap[i].len = 0;
-        if (e->snap[i].len > 0 && e->snap[i].len <= np - 1 && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
+        if (snap_ok(&e->snap[i], np, tag) && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
     }
     par_xs_n = 0;
-    if (!getenv("QW_NO_CACHE") && (par_xs_n = xs_copy(e, sid, prompt, np, best >= 0 ? e->snap[best].len : 0)) > 0) { // 別的 slot 有更長的前綴
+    if (!no_reuse() && (par_xs_n = xs_copy(e, sid, prompt, np, best >= 0 ? e->snap[best].len : 0)) > 0) { // 別的 slot 有更長的前綴
         best = -1;
         for (int i = 0; i < CKMAX; i++)
-            if (e->snap[i].len > 0 && e->snap[i].len <= np - 1 && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
+            if (snap_ok(&e->snap[i], np, tag) && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
     }
-    if (!getenv("QW_NO_CACHE") && e->cache_dir[0]) { // 記憶體裡的不夠長：看 SSD（同 qw_engine_generate_ex）
+    if (!no_reuse() && e->cache_dir[0]) { // 記憶體裡的不夠長：看 SSD（同 qw_engine_generate_ex）
         const int have = best >= 0 ? e->snap[best].len : 0;
         if (have < np / 2 && kv_reserve(e, np + 2 * VBMAX + 8 < e->max_ctx ? np + 2 * VBMAX + 8 : e->max_ctx) && dc_load(e, prompt, np, have) > 0) {
+            if (vr_on()) vr_note(sid, "SSD %d; ", e->kvlen);
             best = -1;
             for (int i = 0; i < CKMAX; i++)
-                if (e->snap[i].len > 0 && e->snap[i].len <= np - 1 && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
+                if (snap_ok(&e->snap[i], np, tag) && (best < 0 || e->snap[i].len > e->snap[best].len)) best = i;
         }
     }
     int start = 0;
-    if (best >= 0 && !getenv("QW_NO_CACHE")) {
+    bool cont = false; // 同一個請求接著生成（只差一個還沒餵的 token）：用 decode 餵（與沒中斷時相同）
+    if (best >= 0 && !no_reuse()) {
         start = e->snap[best].len;
+        cont = snap_cont(&e->snap[best], np, tag);
         snap_copy(e, &e->snap[best], false);
         e->pos = start;
+        e->st_exact = e->snap[best].exact ? start : -1;
         e->pending = false;
     } else qw_engine_reset(e);
     if (cached) *cached = start;
+    if (vr_on()) {
+        if (par_xs_n > 0) vr_note(sid, "xs_copy %d from slot %d (%s); ", par_xs_n, xs_src, SW_NAME[xs_why]);
+        vr_note(sid, "pf %d→%d (%s, kvcap %d); ", start, np, start ? SW_NAME[e->snap[best].why] : "from 0", e->kvcap);
+        if (start > 0) vr_mark(sid);
+    }
     // 分段時 qw_engine_prefill 每次只預留這一段：第一段就照整個 prompt 預留，KV 一次到位（1.25 倍成長下逐段擴大會多搬好幾次整份 KV）
     kv_reserve(e, np + 2 * VBMAX + 8 < e->max_ctx ? np + 2 * VBMAX + 8 : e->max_ctx);
     int end = chunk > 0 && np - start > chunk + 64 ? start + chunk : np;
-    if (end - start > 16) end = qw_engine_par_clip(start, start, end, par_sp, par_nsp, gdn_chunk()); // 交接點：段尾停在那裡
+    if (!cont) end = qw_engine_par_clip(start, start, end, par_sp, par_nsp, gdn_chunk()); // 交接點：段尾停在那裡
     memcpy(e->kvtok, prompt, sizeof(int32_t) * (size_t)end);
     e->kvlen = end;
     e->df_tapping = false;
@@ -8458,7 +8547,7 @@ const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prom
     e->pf_next = -1;
     double pms = 0;
     const float *lg;
-    if (np - start <= 16) { // 從快照接續、剩幾個 token：用 decode 一步一步算（切換單獨 / 一起時與沒中斷逐位元相同）
+    if (cont) { // 同一個請求接著生成：剩下的 token 用 decode 一步一步算（切換單獨 / 一起時與沒中斷逐位元相同）
         e->npf_snap = 0;
         lg = NULL;
         for (int i = start; i < np; i++) if (!(lg = qw_engine_step(e, prompt[i], NULL))) break;
@@ -8477,10 +8566,11 @@ const float *qw_engine_par_prefill_to(qw_engine *e, int sid, const int32_t *prom
     }
     e->npf_snap = 0;
     if (!lg) return NULL;
-    if (end == np || ck) snap_save(e, end);
+    if (end == np || ck) { snap_why = end == np ? SW_PROMPT : SW_CKPT; snap_save(e, end); }
     par_pf_persist(e, sid, prompt, start, end);
     dn_flush(e);
     *done = end;
+    if (end == np) vr_capture(e, sid, prompt, np, lg);
     return lg;
 }
 const float *qw_engine_par_prefill(qw_engine *e, int sid, const int32_t *prompt, int np, int *cached) {
@@ -8488,6 +8578,117 @@ const float *qw_engine_par_prefill(qw_engine *e, int sid, const int32_t *prompt,
     return qw_engine_par_prefill_to(e, sid, prompt, np, 0, &done, cached);
 }
 
+// ---- 重用狀態的自我檢查（QW_VERIFY_REUSE=N；沒設時這段完全不動）
+// 每次 prompt 算完（par_prefill_to 的最後一段、單獨跑 generate_ex 的 prefill）：這個 prompt 有用到別處來的狀態（從快照接續、xs_copy、
+// SSD）時，每 N 次記一次「token + 最後位置的 logits + 這組 slot 這段期間發生過的事（vr_note）」。引擎閒置時 serve 呼叫
+// qw_engine_par_verify：在沒用到的 slot（編號 ≥ par_slots）從 0 算同一段 token（不接任何快取），比對 logits，算完就釋放那組 slot。
+// 從快照接續的 prefill 分段位置不同，與從頭算不一定逐位元相同（浮點加法順序），所以看分佈差多少：KL(ref‖重算) 與 argmax。
+// QW_VERIFY_ALL=1：沒有重用的也抽（量正常的雜訊底線）；QW_VERIFY_KL：MISMATCH 的門檻（預設 1.0：沒有重用、只是分段位置不同時實測 KL 就到 0.01–0.4）；QW_VERIFY_MAXTOK：太長的不驗（預設 65536）
+enum { VR_QMAX = 32 };
+static struct vr_ev { int tag, sid, n, start; int32_t *ids; float *lg; char how[512]; } vr_q[VR_QMAX];
+static int vr_nq, vr_cnt, vr_stat[4]; // vr_stat：OK、TIE（argmax 不同但分佈幾乎一樣）、MISMATCH、跳過
+static char vr_how[QW_PAR_MAX][512];
+static int vr_reused[QW_PAR_MAX];
+static bool vr_running;
+static void vr_mark(int sid) { if (sid >= 0 && sid < QW_PAR_MAX && !vr_running) vr_reused[sid] = 1; }
+static int vr_on(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("QW_VERIFY_REUSE") ? atoi(getenv("QW_VERIFY_REUSE")) : 0;
+    return v > 0 ? v : 0;
+}
+static void vr_note(int sid, const char *fmt, ...) {
+    if (sid < 0 || sid >= QW_PAR_MAX || vr_running) return;
+    char *h = vr_how[sid];
+    const size_t l = strlen(h);
+    if (l + 1 >= sizeof vr_how[sid]) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(h + l, sizeof vr_how[sid] - l, fmt, ap);
+    va_end(ap);
+}
+void qw_engine_par_tag(qw_engine *e, int sid, int id) {
+    (void)e;
+    if (sid < 0 || sid >= QW_PAR_MAX) return;
+    slot_tag[sid] = id;
+}
+static void vr_capture(qw_engine *e, int sid, const int32_t *ids, int n, const float *lg) {
+    (void)e;
+    if (!vr_on() || vr_running || sid < 0 || sid >= QW_PAR_MAX) return;
+    static int vmax = -1, all = -1;
+    if (vmax < 0) { vmax = getenv("QW_VERIFY_MAXTOK") ? atoi(getenv("QW_VERIFY_MAXTOK")) : 65536; all = getenv("QW_VERIFY_ALL") != NULL; }
+    fprintf(stderr, "[reuse] #%d slot %d prompt %d%s：%s\n", slot_tag[sid], sid, n, vr_reused[sid] ? "" : "（沒有重用）", vr_how[sid][0] ? vr_how[sid] : "-");
+    const bool use = (vr_reused[sid] || all) && n <= vmax && vr_cnt++ % vr_on() == 0;
+    if (use && vr_nq < VR_QMAX) {
+        struct vr_ev *v = &vr_q[vr_nq];
+        v->ids = malloc(sizeof(int32_t) * (size_t)n);
+        v->lg = malloc(sizeof(float) * QW_VOCAB);
+        if (v->ids && v->lg) {
+            memcpy(v->ids, ids, sizeof(int32_t) * (size_t)n);
+            memcpy(v->lg, lg, sizeof(float) * QW_VOCAB);
+            v->tag = slot_tag[sid];
+            v->sid = sid;
+            v->n = n;
+            snprintf(v->how, sizeof v->how, "%s", vr_how[sid][0] ? vr_how[sid] : "(none) ");
+            vr_nq++;
+        } else { free(v->ids); free(v->lg); v->ids = NULL; v->lg = NULL; }
+    } else if (use) vr_stat[3]++;
+    vr_how[sid][0] = 0; // 下一個 prompt（例如同一個請求收尾後重新加入）重新記
+    vr_reused[sid] = 0;
+}
+int qw_engine_par_verify_pending(qw_engine *e) { (void)e; return vr_nq; }
+void qw_engine_par_verify_stats(qw_engine *e, int out[5]) { (void)e; for (int i = 0; i < 4; i++) out[i] = vr_stat[i]; out[4] = vr_nq; }
+// 跑一筆等著的檢查（引擎執行緒、GPU 閒置時）。回傳還剩幾筆；-1 = 沒有可以跑的
+int qw_engine_par_verify(qw_engine *e) {
+    if (!vr_nq || par_cur < 0) return -1;
+    struct vr_ev v = vr_q[0];
+    memmove(&vr_q[0], &vr_q[1], sizeof vr_q[0] * (size_t)(vr_nq - 1));
+    vr_nq--;
+    const int ns = qw_engine_par_slots(e), prev = par_cur;
+    int vs = -1;
+    for (int i = QW_PAR_MAX - 1; i >= ns && vs < 0; i--) if (!e->slots[i].init) vs = i;
+    if (vs < 0) {
+        fprintf(stderr, "[verify] 跳過 #%d：沒有多的 slot\n", v.tag);
+        vr_stat[3]++;
+        free(v.ids); free(v.lg);
+        return vr_nq;
+    }
+    const double t0 = qw_now();
+    vr_running = vr_fresh = true;
+    qw_engine_par_persist(e, NULL, 0); // 不寫 SSD、沒有交接點（serve 每次 prefill 前都會重設）
+    int done = 0, cached = 0;
+    const float *lg = qw_engine_par_prefill_to(e, vs, v.ids, v.n, 0, &done, &cached);
+    double kl = 0, mx = 0, num = 0, den = 0, pr_ref = 0, pr_new = 0;
+    int ar = 0, an = 0;
+    if (lg) {
+        for (int i = 1; i < QW_VOCAB; i++) { if (v.lg[i] > v.lg[ar]) ar = i; if (lg[i] > lg[an]) an = i; }
+        double zr = 0, zn = 0;
+        for (int i = 0; i < QW_VOCAB; i++) { zr += exp((double)v.lg[i] - v.lg[ar]); zn += exp((double)lg[i] - lg[an]); }
+        for (int i = 0; i < QW_VOCAB; i++) {
+            const double d = (double)v.lg[i] - lg[i];
+            if (fabs(d) > mx) mx = fabs(d);
+            num += d * d;
+            den += (double)v.lg[i] * v.lg[i];
+            const double lr = (double)v.lg[i] - v.lg[ar] - log(zr), ln = (double)lg[i] - lg[an] - log(zn);
+            kl += exp(lr) * (lr - ln);
+        }
+        pr_ref = exp((double)lg[ar] - lg[an]) / zn; // 原本選的 token 在重算的分佈裡的機率
+        pr_new = 1 / zn;                            // 重算的第一名的機率
+    }
+    vr_running = vr_fresh = false;
+    par_use(e, prev); // 換回原本的 slot，再放掉檢查用的
+    slot_evict(e, vs);
+    vr_how[vs][0] = 0;
+    static double tol = -1;
+    if (tol < 0) tol = getenv("QW_VERIFY_KL") ? atof(getenv("QW_VERIFY_KL")) : 1.0;
+    const int cls = !lg ? 3 : kl > tol ? 2 : ar != an ? 1 : 0;
+    vr_stat[cls]++;
+    static const char *const nm[] = {"OK", "TIE", "MISMATCH", "FAIL"};
+    fprintf(stderr, "[verify] %s #%d slot %d：prompt %d，重算 %.1f s；argmax %d/%d（重算的機率 %.3f/%.3f）、KL %.2e、max|Δ| %.3f、rel %.2e；reuse path = %s\n",
+            nm[cls], v.tag, v.sid, v.n, qw_now() - t0, ar, an, pr_ref, pr_new, kl, mx, den > 0 ? sqrt(num / den) : 0.0, v.how);
+    free(v.ids);
+    free(v.lg);
+    return vr_nq;
+}
 // 並發模式下只有一個請求時：在 slot sid 用一般的生成（含推測解碼）；cb 回傳 false 可中途停下（之後可用 par_prefill 接續）
 int qw_engine_par_solo(qw_engine *e, int sid, const int32_t *prompt, int np, const qw_gen *g, qw_tok_cb cb, void *ctx, qw_gen_stats *st) {
     if (!par_use(e, sid)) return QW_FIN_ERROR;
@@ -8508,7 +8709,7 @@ void qw_engine_par_finish(qw_engine *e, int sid, const int32_t *gen, int ngen) {
     if (fed > 0 && fed <= ngen && e->pos <= e->max_ctx) {
         memcpy(e->kvtok + np, gen, sizeof(int32_t) * (size_t)fed);
         e->kvlen = np + fed;
-        snap_save(e, e->kvlen);
+        snap_why = SW_FINISH, snap_save(e, e->kvlen);
     }
 }
 

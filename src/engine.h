@@ -1,7 +1,7 @@
 // Qwental 推論 engine（目前：decode 路徑，一次一個 token；prompt 也逐個 token 餵入）
 #pragma once
 
-#define QW_VERSION "1.7.1"
+#define QW_VERSION "1.7.2"
 #include <stdbool.h>
 #include <stdint.h>
 #include "gpu.h"
@@ -114,6 +114,12 @@ int qw_engine_par_draft(qw_engine *e, int sid, int32_t *dr, float *pr); // 這�
 // fn 只能做一次 qw_engine_par_step（不含正在 prefill 的 slot）、取樣與送出 token（含 qw_engine_par_finish），不能 prefill / 驗證 / 猜測；
 // 回傳 false = 沒有要 decode 的了。decode 走第二條 GPU 串流與 prefill 同時執行，兩邊結果都與分開跑逐位元相同（只支援 GGUF；
 // 其他情況照舊不重疊）。fn = NULL 關閉
+// 重用狀態的自我檢查（QW_VERIFY_REUSE=N，除錯；沒設時這些都不做事）：用到快照 / xs_copy / SSD 的 prompt 每 N 個記一個，
+// 閒置時 qw_engine_par_verify 在空的 slot 從頭重算、比對最後位置的 logits，結果寫到 stderr（[verify] OK / TIE / MISMATCH）
+void qw_engine_par_tag(qw_engine *e, int sid, int id); // 請求 id（紀錄用）：選好 slot 後呼叫
+int qw_engine_par_verify_pending(qw_engine *e);      // 等著檢查的筆數
+int qw_engine_par_verify(qw_engine *e);              // 跑一筆（GPU 閒置時）；回傳還剩幾筆，-1 = 沒有
+void qw_engine_par_verify_stats(qw_engine *e, int out[5]); // OK、TIE、MISMATCH、跳過、等著的
 typedef bool (*qw_mix_fn)(void *ctx);
 void qw_engine_par_mix(qw_engine *e, qw_mix_fn fn, void *ctx);
 int32_t qw_engine_sample(const float *logits, const qw_gen *g, unsigned long long *rng);

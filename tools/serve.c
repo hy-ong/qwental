@@ -901,6 +901,8 @@ static void chat_end(job *j) {
             openai ? "openai" : "anthropic", np, st.cached, st.prefill_ms, st.gen, st.gen_ms, st.gen && st.gen_ms > 0 ? st.gen / st.gen_ms * 1e3 : 0.0,
             st.rounds, st.accepted, st.ngram_rounds, fin, dead ? "；用戶端已斷線（取消）" : "", fin == QW_FIN_ERROR ? "；錯誤" : "",
             gg->parser.cut_call ? "；tool call 沒寫完（max_tokens）" : "", gg->think_tok, j->t0 > 0 ? (j->t0 - j->tc) * 1e3 : 0.0, j->pfc_ms);
+    if (getenv("QW_LOG_ID") || getenv("QW_VERIFY_REUSE")) // 除錯：請求編號（[par] #id、[verify] #id）↔ 回應的 id
+        fprintf(stderr, "[req] #%d %s slot %d prompt %d cached %d gen %d fin %d%s\n", j->id, gg->id, j->sid, np, st.cached, st.gen, fin, dead ? " cancelled" : "");
     if (gg->parser.rescued || gg->parser.unread)
         fprintf(stderr, "[%s] 從思考裡救出 %d 個 tool call；%d 個沒宣告的工具當成文字\n", openai ? "openai" : "anthropic", gg->parser.rescued, gg->parser.unread);
     const bool tool = gg->ncalls > 0;
@@ -1266,7 +1268,9 @@ static bool solo_cb(void *ctx, int32_t t) { // 要讓出時只設 yield：這一
     job *j = ctx;
     j->gen[j->got++] = t;
     if (!on_token(&j->g, t)) { j->cbstop = true; return false; }
-    if (j->g.wrap) j->yflag = true; // 思考到上限：這一輪送完就停、插入收尾
+    // 思考到上限：馬上停（同 serial_cb、一起 decode 的 par_emit）。以前是「這一輪送完才停」：推測解碼一輪接受的其餘 token 也送出，
+    // 思考超過上限、收尾插入的位置與單獨跑不同（cache_fuzz：開頭相同、第 100 個字元左右開始不同）
+    if (j->g.wrap) return false;
     const double ms = (qw_now() - seg_t0) * 1e3;
     if (!j->yflag && ms >= MIN_SLICE_MS && ((par_others && ms > (par_pfwait ? pf_gap_ms() : SLICE_MS)) || q_admit())) j->yflag = true;
     st_live(j);
@@ -1294,7 +1298,8 @@ static bool run_solo(job *j, int *ng_out, double *pf_out) {
     const int got0 = j->got;
     const bool first = !j->st.prompt;
     seg_t0 = qw_now();
-    const int fin = qw_engine_par_solo(E, j->sid, j->ids, j->np + j->got, &g2, solo_cb, j, &s2);
+    int fin = qw_engine_par_solo(E, j->sid, j->ids, j->np + j->got, &g2, solo_cb, j, &s2);
+    if (fin == QW_FIN_CALLBACK && !j->cbstop && j->g.wrap) fin = QW_FIN_YIELD; // 思考到上限停下（solo_cb）：當成讓出，下面插入收尾
     double ms = (qw_now() - seg_t0) * 1e3;
     *ng_out = 0;
     *pf_out = 0;
@@ -2075,6 +2080,11 @@ static void handle_status(conn *c, const char *qs) { // qs：查詢字串（days
                   "\"cached_tokens\":%lld,\"output_tokens\":%lld,\"queued\":%d,\"cancelled\":%lld,\"errors\":%lld",
               QW_VERSION, getenv("QW_GGUF") ? "gguf" : "mlx", qw_now() - T_START, PAR, st_done, st_in, st_cached, out, queued, st_cancel, st_err);
     // 系統記憶體（dashboard 顯示 swap 警告）：mem_level = kern.memorystatus_level（可用 %），swap_used_gb = vm.swapusage 的已用
+    if (getenv("QW_VERIFY_REUSE")) { // 重用狀態的自我檢查（QW_VERIFY_REUSE）的累計
+        int v[5];
+        qw_engine_par_verify_stats(E, v);
+        sb_printf(&o, ",\"verify\":{\"ok\":%d,\"tie\":%d,\"mismatch\":%d,\"skipped\":%d,\"pending\":%d}", v[0], v[1], v[2], v[3], v[4]);
+    }
     const int ml = mem_level();
     const double sw = swap_used_gb();
     if (ml >= 0) sb_printf(&o, ",\"mem_level\":%d", ml);
@@ -2159,6 +2169,12 @@ static void *par_loop(void *arg) {
         }
         par_na = na;
         if (!na) st_publish(act, 0, "idle");
+        if (!na && qw_engine_par_verify_pending(E) > 0) { // QW_VERIFY_REUSE：閒置時從頭重算一筆用過快取的 prompt 比對（一次一筆，之間看有沒有新請求）
+            pthread_mutex_lock(&q_mu);
+            const bool idle = !q_head;
+            pthread_mutex_unlock(&q_mu);
+            if (idle && qw_engine_par_verify(E) >= 0) continue;
+        }
         pthread_mutex_lock(&q_mu);
         while (!na && !q_head) pthread_cond_wait(&q_cv, &q_mu);
         job *adm[QW_PAR_MAX];
@@ -2181,6 +2197,7 @@ static void *par_loop(void *arg) {
             if (conn_dead(j->c)) { par_done(j, QW_FIN_CALLBACK); continue; } // 排隊時就斷線了
             j->sid = qw_engine_par_pick(E, j->ids, j->np, busy);
             if (j->sid < 0) { par_fail(j, 529, "overloaded: no free KV slot"); continue; }
+            qw_engine_par_tag(E, j->sid, j->id);
             if (j->gp.max_tokens <= 0) { par_done(j, QW_FIN_LENGTH); continue; }
             act[na++] = j;
         }
