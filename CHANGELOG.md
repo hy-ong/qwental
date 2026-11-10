@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.3 — 2026-11-10
+
+Dashboard layout only.
+
+- Measured-rate labels no longer wrap (`batch ×10` and up), card hints and sub-lines wrap evenly instead of leaving one character on a line or being cut off with "…".
+
 ## 1.5.2 — 2026-11-10
 
 Dashboard only; engine and server behavior unchanged.
