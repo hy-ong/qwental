@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.4 — 2026-11-11
+
+Keeps more of the prefix cache across requests. Engine output unchanged: default and INT8 outputs match the 1.7.2 references bit for bit, and cached / concurrent output still matches running alone (cache fuzz 0/40 mismatches).
+
+### Prefix cache
+- The shared prefix that several subagents coalesce on (system prompt + tools, ~15K tokens) is now kept when an idle slot shrinks, and kept last when snapshots are evicted. Before, it was dropped after 60 s idle and the next subagent re-read it. Repro (`bench/share_idle.py`: 3 subagents sharing a 14,976-token prefix, idle, then a 4th): 1.7.3 reused 6,784 tokens (5.6 s prefill), 1.7.4 reuses 14,976 (0.6 s). Idle memory grows by one snapshot (~0.1 GB); peak is unchanged.
+- The persist point written to SSD (end of the system part) can no longer be evicted before it is written.
+- Each conversation keeps at most one snapshot that cannot be resumed across requests, and such a snapshot never overwrites a resumable one of the same length; single-conversation mode no longer saves them at all (one ≥113 MB GPU copy less per request).
+
 ## 1.7.3 — 2026-11-11
 
 Fixes prefix-cache misses in long conversations while subagents run, and shows machine load on the dashboard. Engine output unchanged: default and INT8 outputs match the 1.7.2 references bit for bit, and cached / concurrent output still matches running alone (cache fuzz 0/40 mismatches).

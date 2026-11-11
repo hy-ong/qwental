@@ -213,7 +213,7 @@ struct qw_engine {
     // prefix cache：KV 裡目前是哪些 token、兩個狀態快照（prompt 結束、生成結束）
     int32_t *kvtok;
     int kvlen;
-    struct qw_snap { int len; unsigned long long age; qw_buf S, conv, ple; int why; bool exact; int tag; } snap[CKMAX]; // why：誰存的（SW_*，QW_VERIFY_REUSE 的紀錄用）
+    struct qw_snap { int len; unsigned long long age; qw_buf S, conv, ple; int why; bool exact; int tag; bool pin; } snap[CKMAX]; // why：誰存的（SW_*，QW_VERIFY_REUSE 的紀錄用）
     // 多組 KV slot（不同對話 / 不同用途的請求各自保留快取）：目前用的那組放在上面的欄位，其他的存在這裡
     struct qw_slot {
         bool init;
@@ -6194,12 +6194,29 @@ static bool snap_ok(const struct qw_snap *s, int np, int tag) { return s->len > 
 static bool vr_fresh; // 正在從頭重算（不接快照、不 xs_copy、不 dc_load）
 static bool no_reuse(void) { return vr_fresh || getenv("QW_NO_CACHE") || getenv("QW_NO_REUSE"); } // QW_NO_REUSE = QW_NO_CACHE：一律從 0 算
 static int snap_cap(qw_engine *e); // 每組 slot 最多幾份快照（並發模式較少：每份含 113 MB 的 DeltaNet 狀態，slot 多時會佔太多記憶體）
+// 共用前綴的點（持久化點、交接點；par_pf_plan 設定，已對齊到 GDN 分塊）：存在這些長度的 cross 快照標成 pin，
+// 淘汰與閒置縮減時優先留著（subagent 之後要從這裡 xs_copy；持久化點段尾才寫 SSD，先被擠掉就寫不出去）
+static int par_pin[24], par_npin;
 static void snap_save_k(qw_engine *e, int len, int stage) {
     const int why = snap_why;
     snap_why = SW_CKPT;
     int k = -1;
     const int CK = snap_cap(e);
-    for (int i = 0; i < CK && k < 0; i++) if (e->snap[i].len == len) k = i;
+    const bool ex_new = stage >= 0 ? e->seg_exact && len % gdn_chunk() == 0 : e->st_exact == len && e->pos == len;
+    const bool cross_new = len > 0 && ex_new && len % gdn_chunk() == 0;
+    // 接不上的快照（SW_PROMPT、SW_FINISH 等）只給同一個請求在 solo / batch 間切換時接續用（snap_cont：同 tag），
+    // 非並發模式（tag = -1）沒有人讀：不存，省一次 113 MB 以上的複製
+    if (!cross_new && par_cur < 0) return;
+    bool pin = false;
+    for (int i = 0; cross_new && par_cur >= 0 && i < par_npin; i++) pin |= par_pin[i] == len;
+    for (int i = 0; i < CK && k < 0; i++)
+        if (e->snap[i].len == len) {
+            if (snap_cross(&e->snap[i]) && !cross_new) return; // 同長度已有接得上的：不要用接不上的蓋掉
+            k = i;
+        }
+    // 接不上的每組最多一份（任何時候只需要最新那份；交接時讀完才會存下一份）：直接覆寫舊的
+    for (int i = 0; !cross_new && i < CK && k < 0; i++)
+        if (e->snap[i].S.ptr && e->snap[i].len > 0 && !snap_cross(&e->snap[i])) k = i;
     for (int i = 0; i < CK && k < 0; i++) if (e->snap[i].len == 0 && e->snap[i].S.ptr) k = i;
     for (int i = 0; i < CK && k < 0; i++)
         if (!e->snap[i].S.ptr) {
@@ -6216,17 +6233,19 @@ static void snap_save_k(qw_engine *e, int len, int stage) {
             if (snap_cross(&e->snap[i]) && (lk < 0 || e->snap[i].len > e->snap[lk].len)) lk = i;
         for (int i = 0; i < CK; i++)
             if (!snap_cross(&e->snap[i]) && (k < 0 || e->snap[i].age < e->snap[k].age)) k = i;
-        if (k < 0)
+        // 都是 cross：最短的先走，pin（共用前綴）的留到最後
+        for (int pass = 0; pass < 2 && k < 0; pass++)
             for (int i = 0; i < CK; i++)
-                if (i != lk && (k < 0 || e->snap[i].len < e->snap[k].len || (e->snap[i].len == e->snap[k].len && e->snap[i].age < e->snap[k].age))) k = i;
+                if (i != lk && (pass || !e->snap[i].pin) && (k < 0 || e->snap[i].len < e->snap[k].len || (e->snap[i].len == e->snap[k].len && e->snap[i].age < e->snap[k].age))) k = i;
         if (k < 0) k = 0;
     }
     snap_copy_k(e, &e->snap[k], true, stage);
     e->snap[k].len = len;
     e->snap[k].age = ++e->clock;
     e->snap[k].why = why;
-    e->snap[k].exact = stage >= 0 ? e->seg_exact && len % gdn_chunk() == 0 : e->st_exact == len && e->pos == len;
+    e->snap[k].exact = ex_new;
     e->snap[k].tag = par_cur >= 0 ? slot_tag[e->cur] : -1;
+    e->snap[k].pin = pin;
 }
 static void snap_save(qw_engine *e, int len) { snap_save_k(e, len, -1); }
 static void snap_save_from(qw_engine *e, int len, int stage) { snap_save_k(e, len, stage); }
@@ -8202,10 +8221,17 @@ static size_t snap_prune(struct qw_snap *sn, int kvlen, int keep) {
             for (int q = 0; q < CKMAX; q++)
                 if (q != k && sn[q].len > 0 && sn[q].len <= kvlen && snap_cross(&sn[q]) && (sn[q].len > sn[k].len || (sn[q].len == sn[k].len && q < k))) rank++;
         if (ok && rank < keep) continue;
+        if (ok && sn[k].pin) { // 共用前綴：另外留最長的一份 pin（subagent 之後從這裡 xs_copy）
+            bool longer = false;
+            for (int q = 0; q < CKMAX; q++)
+                longer |= q != k && sn[q].pin && sn[q].len > 0 && sn[q].len <= kvlen && snap_cross(&sn[q]) && (sn[q].len > sn[k].len || (sn[q].len == sn[k].len && q < k));
+            if (!longer) continue;
+        }
         fr += sn[k].S.size + sn[k].conv.size + sn[k].ple.size;
         qw_buf_free(&sn[k].S); qw_buf_free(&sn[k].conv); qw_buf_free(&sn[k].ple);
         sn[k].len = 0;
         sn[k].age = 0;
+        sn[k].pin = false;
     }
     return fr;
 }
@@ -8245,11 +8271,11 @@ bool qw_engine_par_snap(qw_engine *e, int sid) {
     if (kvlen <= 0 || pos != kvlen || kvlen > e->max_ctx) return false; // 生成中（pos > kvlen）或還沒算：不是一致的段界
     const struct qw_snap *sn = sid == par_cur ? e->snap : s->snap;
     for (int k = 0; k < CKMAX; k++)
-        if (sn[k].len == kvlen && sn[k].S.ptr) return true;
+        if (sn[k].len == kvlen && snap_cross(&sn[k])) return true; // 接不上的（同長度）不算：serve 會以為之後能從這裡接
     if (!par_use(e, sid)) return false;
     snap_why = SW_PARSNAP, snap_save(e, kvlen); // 內含 dn_flush（延後寫回的 DeltaNet 狀態先補上）
     for (int k = 0; k < CKMAX; k++)
-        if (e->snap[k].len == kvlen && e->snap[k].S.ptr) {
+        if (e->snap[k].len == kvlen && snap_cross(&e->snap[k])) {
             if (getenv("QW_CACHE_DBG")) fprintf(stderr, "[cache] slot %d 停在 %d：記快照\n", sid, kvlen);
             if (vr_on()) vr_note(sid, "par_snap at %d; ", kvlen);
             return true;
@@ -8456,6 +8482,11 @@ static bool par_pf_plan(qw_engine *e, int sid, int np, int start, int end) { // 
     const int CC = gdn_chunk();
     bool at_end = false;
     e->npf_snap = 0;
+    par_npin = 0;
+    for (int k = 0; k < par_npp + par_nsp && par_npin < (int)(sizeof par_pin / sizeof *par_pin); k++) {
+        const int pp = k < par_npp ? par_pp[k] : par_sp[k - par_npp];
+        if (pp > s0) par_pin[par_npin++] = s0 + (pp - s0) / CC * CC;
+    }
     for (int k = 0; k < nck; k++) {
         const int a = s0 + (cks[k] - s0) / CC * CC;
         if (a > start && a < end && e->npf_snap < (int)(sizeof e->pf_snap / sizeof *e->pf_snap) && (e->npf_snap == 0 || e->pf_snap[e->npf_snap - 1] != a))
