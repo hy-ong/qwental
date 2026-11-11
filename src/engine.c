@@ -6207,8 +6207,19 @@ static void snap_save_k(qw_engine *e, int len, int stage) {
             k = i;
         }
     if (k < 0) {
-        k = 0;
-        for (int i = 1; i < CK; i++) if (e->snap[i].age < e->snap[k].age) k = i;
+        // 滿了：先換掉跨請求接不上的（不 exact 或不對齊 64：SW_PROMPT、SW_FINISH 等），最舊的先走；
+        // 都是 cross 時換掉最短的 cross，最長的那份永遠留著（下一輪最可能從它接）。
+        // 原本只看 age：subagent 並發時主對話在 batch／solo 之間切換，每次都存一份接不上的快照，
+        // 把 prompt 結尾的對齊檢查點擠掉，下一輪 166K 從 0 重算
+        int lk = -1;
+        for (int i = 0; i < CK; i++)
+            if (snap_cross(&e->snap[i]) && (lk < 0 || e->snap[i].len > e->snap[lk].len)) lk = i;
+        for (int i = 0; i < CK; i++)
+            if (!snap_cross(&e->snap[i]) && (k < 0 || e->snap[i].age < e->snap[k].age)) k = i;
+        if (k < 0)
+            for (int i = 0; i < CK; i++)
+                if (i != lk && (k < 0 || e->snap[i].len < e->snap[k].len || (e->snap[i].len == e->snap[k].len && e->snap[i].age < e->snap[k].age))) k = i;
+        if (k < 0) k = 0;
     }
     snap_copy_k(e, &e->snap[k], true, stage);
     e->snap[k].len = len;
@@ -8084,7 +8095,7 @@ static bool par_load(qw_engine *e, int i) {
     }
     return true;
 }
-static int snap_cap(qw_engine *e) { // 並發模式每組 slot 的快照數：總共 24 份（= 原本 3 組 × 8）平分給用到的 slot，每組 3…8；QW_PAR_SNAPS 固定
+static int snap_cap(qw_engine *e) { // 並發模式每組 slot 的快照數：總共 24 份（= 原本 3 組 × 8）平分給用到的 slot，每組 4…8；QW_PAR_SNAPS 固定
     static int v = -1;
     if (v < 0) { v = getenv("QW_PAR_SNAPS") ? atoi(getenv("QW_PAR_SNAPS")) : 0; if (v > CKMAX) v = CKMAX; }
     if (par_cur < 0) return CKMAX;
@@ -8092,7 +8103,7 @@ static int snap_cap(qw_engine *e) { // 並發模式每組 slot 的快照數：�
     int used = 0;
     for (int i = 0; i < QW_PAR_MAX; i++) used += e->slots[i].init;
     int c = used > 0 ? 3 * CKMAX / used : CKMAX;
-    return c < 3 ? 3 : c > CKMAX ? CKMAX : c;
+    return c < 4 ? 4 : c > CKMAX ? CKMAX : c; // 至少 4：最長的對齊檢查點 + 生成時的快照 + 其他
 }
 static bool par_use(qw_engine *e, int i) {
     if (par_cur == i) return true;

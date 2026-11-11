@@ -49,17 +49,28 @@ header h1 { font-size: 16px; margin: 0; font-weight: 650; color: var(--fg); }
 .panel h2 .r { margin-left: auto; font-size: 12px; color: var(--faint); }
 .cbox { position: relative; height: 240px; }
 .cbox canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-.cv { display: grid; grid-template-columns: 6.5em minmax(0, 1fr) 4.5em; align-items: center; gap: 12px; padding: 6px 0; font-size: 13px; }
+.cv { display: grid; grid-template-columns: 7.5em minmax(0, 1fr) 4.5em 3.6em; align-items: center; gap: 12px; padding: 6px 0; font-size: 13px; }
 .cv + .cv { border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }
 .cv .mid { display: flex; align-items: center; gap: 10px; color: var(--dim); min-width: 0; white-space: nowrap; }
 .cv .pc { width: 3.6em; text-align: right; }
-.cv .plen { text-align: right; color: var(--dim); }
+.cv .plen, .cv .hit { text-align: right; color: var(--dim); }
+.cv .pc.wide { width: auto; }
+.cols { display: inline-grid; grid-template-columns: 4.5em 3.6em; gap: 12px; text-align: right; }
 .chip { font-size: 12px; padding: 1px 8px; border-radius: 999px; justify-self: start; white-space: nowrap; }
 .c-gen { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .c-read { color: var(--fg); background: var(--panel2); }
 .c-wait { color: var(--dim); background: none; box-shadow: inset 0 0 0 1px var(--line); }
 .bar { flex: 1; height: 4px; background: var(--panel2); border-radius: 2px; overflow: hidden; }
 .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width .4s; }
+.sys { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 24px; background: var(--panel); border-radius: 12px; padding: 12px 18px; margin: -8px 0 20px; }
+.sys[hidden] { display: none; }
+.sm .h { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.sm .h .k { color: var(--dim); }
+.sm .h .v { margin-left: auto; font-weight: 600; white-space: nowrap; }
+.sm .bar { margin: 6px 0 4px; height: 5px; }
+.sm .bar > span.w { background: var(--warn); } .sm .bar > span.b { background: var(--bad); }
+.sm .s { color: var(--faint); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cv .bar { min-width: 3em; }
 .empty { color: var(--dim); text-align: center; padding: 22px 8px; font-size: 13px; }
 .costline { color: var(--dim); font-size: 13px; margin: 4px 0 28px; }
 .costline b { color: var(--fg); font-weight: 500; }
@@ -109,6 +120,7 @@ th:first-child, td:first-child { text-align: left; }
 footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; gap: 16px; flex-wrap: wrap; }
 @media (max-width: 1100px) {
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sys { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 24px; }
   .row, .dbody .row { grid-template-columns: 1fr; }
   .costg { grid-template-columns: 1fr; }
   .costg > div { padding: 10px 0; }
@@ -141,8 +153,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; g
       <div class="big" id="k-conv">—</div>
       <div class="sub" id="k-conv-sub"></div>
     </div>
-    <div class="stat" data-i18n-title="pfT">
-      <div class="lbl" data-i18n="pf"></div>
+    <div class="stat" data-i18n-title="hitT">
+      <div class="lbl" data-i18n="hit"></div>
       <div class="big" id="k-pf">—</div>
       <div class="sub" id="k-pf-sub"></div>
     </div>
@@ -153,13 +165,20 @@ footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; g
     </div>
   </section>
 
+  <section class="sys" id="sys" hidden>
+    <div class="sm" data-i18n-title="cpuT"><div class="h"><span class="k" data-i18n="cpu"></span><span class="v" id="s-cpu">—</span></div><div class="bar"><span id="b-cpu"></span></div><div class="s" id="s-cpu-sub"></div></div>
+    <div class="sm" data-i18n-title="gpuT"><div class="h"><span class="k" data-i18n="gpu"></span><span class="v" id="s-gpu">—</span></div><div class="bar"><span id="b-gpu"></span></div><div class="s" id="s-gpu-sub"></div></div>
+    <div class="sm" data-i18n-title="ramT"><div class="h"><span class="k" data-i18n="ram"></span><span class="v" id="s-ram">—</span></div><div class="bar"><span id="b-ram"></span></div><div class="s" id="s-ram-sub"></div></div>
+    <div class="sm" data-i18n-title="diskT"><div class="h"><span class="k" data-i18n="disk"></span><span class="v" id="s-disk">—</span></div><div class="bar"><span id="b-disk"></span></div><div class="s" id="s-disk-sub"></div></div>
+  </section>
+
   <section class="row">
     <div class="panel">
       <h2><span data-i18n="chart"></span></h2>
       <div class="cbox"><canvas id="chart"></canvas></div>
     </div>
     <div class="panel">
-      <h2><span data-i18n="tbl"></span><span class="r" data-i18n="thPrompt"></span></h2>
+      <h2><span data-i18n="tbl"></span><span class="r cols"><span data-i18n="thPrompt"></span><span data-i18n="thCache"></span></span></h2>
       <div id="list"><div class="empty" data-i18n="waiting"></div></div>
     </div>
   </section>
@@ -245,16 +264,19 @@ footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; g
       tps: "Output", tpsT: "Output tokens per second across all conversations, counted as they are generated (last 5 s)", tpsU: "tok/s",
       nGen: "{n} generating", nGen1: "1 generating", idle: "Idle",
       conv: "Conversations", convT: "Conversations generating output vs. still reading their prompt",
-      gen: "generating", read: "reading", upTo: "Up to {p} at once", par1: "Single-conversation mode",
+      gen: "generating", read: "reading prompt", upTo: "Up to {p} at once", par1: "Single-conversation mode",
       qLimit: "{n} queued · waiting for a conversation to finish", qBusy: "{n} queued · starting at the next step", qWait: "{n} queued",
-      pf: "Prompt reading", pfT: "Prompt tokens still to read (prefill) across all conversations", pfU: "tokens left",
+      hit: "Cache hit", hitT: "Share of prompt tokens reused from the prefix cache instead of being read again", hitRun: "this run", hitLife: "all time {p}",
       eta: "about {t} to go", etaNone: "Rate not measured yet", etaT: "At the measured prefill rate of {r} tok/s",
+      cpu: "CPU", cpuT: "Whole-machine CPU busy, all cores", gpu: "GPU", gpuT: "GPU device utilization",
+      ram: "RAM", ramT: "Memory used by the whole machine (like Activity Monitor), and by this server", ramV: "{u} / {t} GB", ramSub: "Qwental {p} GB",
+      disk: "Disk", diskT: "Free space on the volume holding the prompt cache", diskV: "{f} GB free", diskSub: "of {t} GB · cache {c} GB", diskSubN: "of {t} GB",
       mem: "Memory", memOk: "OK", memTight: "Tight", memLow: "Low",
       memSub: "free {l}% · swap {s} GB", memSubL: "free {l}%", memSubS: "swap {s} GB",
       memT: "Slot memory {m} / {b} GB", memOver: " (over budget: idle slots will be released)",
       chart: "Output tok/s · last 5 minutes", axNow: "now", axMin: "-{m}m",
-      tbl: "Active conversations", thPrompt: "Prompt",
-      st: { gen: ["Generating", "Writing the answer"], read: ["Reading", "Reading the prompt (prefill)"], wait: ["Waiting", "Waiting to reuse the prompt prefix another conversation is reading"] },
+      tbl: "Active conversations", thPrompt: "Prompt", thCache: "Cached", readRow: "{d} / {t} read", readEta: " · about {t} left",
+      st: { gen: ["Generating", "Writing the answer"], read: ["Reading prompt", "Reading the prompt before answering (prefill); cached tokens are skipped"], wait: ["Waiting", "Waiting to reuse the prompt prefix another conversation is reading"] },
       genRow: "{g} tok · {r} tok/s", waitRow: "shares a prefix",
       waiting: "Waiting for data…", par1L: "parallel = 1: the server does not report individual conversations",
       noActive: "The server did not report active conversations", noneL: "No active conversations",
@@ -292,16 +314,19 @@ footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; g
       tps: "輸出速度", tpsT: "所有對話合計每秒輸出的 token 數，邊生成邊計算（近 5 秒）", tpsU: "tok/s",
       nGen: "{n} 個對話生成中", nGen1: "1 個對話生成中", idle: "閒置",
       conv: "對話", convT: "正在生成回答的對話，與還在讀入 prompt 的對話",
-      gen: "生成中", read: "讀入中", upTo: "最多同時 {p} 個", par1: "單一對話模式",
+      gen: "生成中", read: "讀 prompt 中", upTo: "最多同時 {p} 個", par1: "單一對話模式",
       qLimit: "{n} 個排隊 · 已達上限，等其他對話結束", qBusy: "{n} 個排隊 · 下一個排程點就開始", qWait: "{n} 個排隊",
-      pf: "讀入 prompt", pfT: "所有對話還沒讀入（prefill）的 prompt token", pfU: "token 待讀",
+      hit: "快取命中", hitT: "prompt token 中直接從前綴快取重用、不必重讀的比例", hitRun: "本次啟動", hitLife: "全部累計 {p}",
       eta: "約 {t}後讀完", etaNone: "還沒量到讀入速度", etaT: "依實測讀入速度 {r} tok/s 估計",
+      cpu: "CPU", cpuT: "整台機器的 CPU 使用率（所有核心）", gpu: "GPU", gpuT: "GPU 使用率",
+      ram: "RAM", ramT: "整台機器已用的記憶體（同活動監視器），以及這個伺服器用的", ramV: "{u} / {t} GB", ramSub: "Qwental {p} GB",
+      disk: "磁碟", diskT: "放 prompt 快取的磁碟剩餘空間", diskV: "剩 {f} GB", diskSub: "共 {t} GB · 快取 {c} GB", diskSubN: "共 {t} GB",
       mem: "記憶體", memOk: "充足", memTight: "偏緊", memLow: "不足",
       memSub: "可用 {l}% · swap {s} GB", memSubL: "可用 {l}%", memSubS: "swap {s} GB",
       memT: "Slot 記憶體 {m} / {b} GB", memOver: "（超過預算，會釋放閒置 slot）",
       chart: "輸出 tok/s · 近 5 分鐘", axNow: "現在", axMin: "-{m} 分",
-      tbl: "進行中對話", thPrompt: "Prompt 長度",
-      st: { gen: ["生成中", "正在寫回答"], read: ["讀入中", "正在讀入 prompt（prefill）"], wait: ["等待中", "等另一個對話讀完相同的 prompt 前綴再重用"] },
+      tbl: "進行中對話", thPrompt: "Prompt", thCache: "快取", readRow: "已讀 {d} / {t}", readEta: " · 約 {t}後讀完",
+      st: { gen: ["生成中", "正在寫回答"], read: ["讀 prompt", "回答前先讀完 prompt（prefill）；命中快取的部分直接跳過"], wait: ["等待中", "等另一個對話讀完相同的 prompt 前綴再重用"] },
       genRow: "{g} tok · {r} tok/s", waitRow: "共用前綴",
       waiting: "等待資料…", par1L: "parallel = 1：伺服器不回報個別對話",
       noActive: "伺服器沒有回報進行中的對話", noneL: "目前沒有進行中的對話",
@@ -518,7 +543,8 @@ footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; g
 
     // 1. output speed
     const nGen = matched.filter(isGen).length, nRead = matched.length - nGen;
-    setBig("k-tps", esc(fmtTps(tps)) + unit("tpsU"), tps === 0 ? "zero" : "");
+    const tpsV = active && !nGen ? 0 : tps;
+    setBig("k-tps", esc(fmtTps(tpsV)) + unit("tpsU"), tpsV === 0 ? "zero" : "");
     $("k-tps-sub").textContent = !active ? "" : nGen ? tr(nGen === 1 ? "nGen1" : "nGen", { n: NF0.format(nGen) }) : tr("idle");
 
     // 2. conversations
@@ -529,14 +555,13 @@ footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; g
     cs.textContent = q ? tr(QR[d.queue_reason] || "qWait", { n: NF0.format(q) }) : par === 1 ? tr("par1") : par ? tr("upTo", { p: NF0.format(par) }) : "";
     cs.className = "sub" + (q ? " is-warn" : "");
 
-    // 3. prompt reading: tokens still to prefill, ETA at the measured prefill rate
-    let back = num(d.prefill_backlog_tokens);
-    if (back === null && active) back = matched.reduce((a, r) => a + (r.state !== "prefill" ? 0 : r.left ?? Math.max(0, r.prompt - (r.pf ?? r.cached))), 0);
-    const pfr = num(rt?.prefill);
-    setBig("k-pf", back === null ? "—" : esc(human(back)) + (back ? unit("pfU") : ""), back ? "" : "zero");
-    const ps = $("k-pf-sub");
-    ps.textContent = back === null ? "" : !back ? tr("idle") : pfr > 0 ? tr("eta", { t: dur(Math.max(1, back / pfr)) }) : tr("etaNone");
-    ps.title = back && pfr > 0 ? tr("etaT", { r: NF0.format(pfr) }) : "";
+    // 3. cache hit: prompt tokens reused from the prefix cache, this run (big) and all time (sub)
+    const life0 = d.lifetime && typeof d.lifetime === "object" ? d.lifetime : null;
+    const hitOf = (o) => { const pi = num(o?.prompt_tokens), ci = num(o?.cached_tokens); return pi ? (ci ?? 0) / pi : null; };
+    const hRun = hitOf(d), hLife = hitOf(life0);
+    setBig("k-pf", hRun === null ? "—" : esc(pct(hRun)) + unit("hitRun"), hRun === null ? "zero" : "");
+    $("k-pf-sub").textContent = hLife === null ? "" : tr("hitLife", { p: pct(hLife) });
+    const pfr = num(rt?.prefill), nReadOnly = matched.filter((r) => !isGen(r) && !(r.follows > 0)).length;
 
     // 4. memory: one word from free memory %, swap and slot memory vs budget
     const ml = num(d.mem_level), sw = num(d.swap_used_gb), mem = num(d.slot_mem_gb), bud = num(d.slot_budget_gb);
@@ -548,6 +573,24 @@ footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; g
     const mlT = ml === null ? "" : NF0.format(ml), swT = sw === null ? "" : NF1.format(sw);
     $("k-mem-sub").textContent = ml === null && sw === null ? "" : tr(ml === null ? "memSubS" : sw === null ? "memSubL" : "memSub", { l: mlT, s: swT });
     $("c-mem").title = mem !== null && bud !== null ? tr("memT", { m: NF1.format(mem), b: NF1.format(bud) }) + (fill > 1 ? tr("memOver") : "") : "";
+
+    // system strip: cpu / gpu / ram / disk (sys object; hidden when the server does not report it)
+    const sy = d.sys && typeof d.sys === "object" ? d.sys : null;
+    $("sys").hidden = !sy;
+    if (sy) {
+      const meter = (k, frac, v, sub, warnAt, badAt) => {
+        $("s-" + k).textContent = v; $("s-" + k + "-sub").textContent = sub;
+        const b = $("b-" + k), f = frac === null || !isFinite(frac) ? 0 : Math.min(1, Math.max(0, frac));
+        b.style.width = (f * 100).toFixed(1) + "%"; b.className = warnAt && f >= badAt ? "b" : warnAt && f >= warnAt ? "w" : "";
+      };
+      const GI = (x) => (x === null ? null : x / 1.073741824); // RAM 以 GiB 顯示（同活動監視器：128 GB 的機器顯示 128，不是 137）
+      const cpu = num(sy.cpu_pct), gpu = num(sy.gpu_pct), ru = GI(num(sy.ram_used_gb)), rt0 = GI(num(sy.ram_total_gb)), pg = GI(num(sy.proc_gb));
+      const df = num(sy.disk_free_gb), dt = num(sy.disk_total_gb), cg = num(sy.cache_gb);
+      meter("cpu", cpu === null ? null : cpu / 100, cpu === null ? "—" : NF0.format(cpu) + "%", "", 0, 0);
+      meter("gpu", gpu === null ? null : gpu / 100, gpu === null ? "—" : NF0.format(gpu) + "%", "", 0, 0);
+      meter("ram", ru !== null && rt0 ? ru / rt0 : null, ru === null ? "—" : tr("ramV", { u: NF1.format(ru), t: NF0.format(rt0 ?? 0) }), pg === null ? "" : tr("ramSub", { p: NF1.format(pg) }), 0.85, 0.95);
+      meter("disk", df !== null && dt ? 1 - df / dt : null, df === null ? "—" : tr("diskV", { f: NF0.format(df) }), dt === null ? "" : tr(cg === null ? "diskSubN" : "diskSub", { t: NF0.format(dt), c: NF1.format(cg ?? 0) }), 0.9, 0.97);
+    }
 
     // conversation list: one row each
     const list = $("list");
@@ -561,9 +604,10 @@ footer { color: var(--faint); font-size: 12px; margin-top: 8px; display: flex; g
         mid = `<span>${esc(tr("genRow", { g: human(r.gen), r: fmtTps(v === null || v === undefined ? null : Math.max(0, v)) }))}</span>`;
       } else {
         const done = r.left !== null ? r.prompt - r.left : r.pf ?? r.cached, f = r.prompt ? Math.min(1, Math.max(0, done / r.prompt)) : 0;
-        mid = k === "wait" ? `<span>${esc(tr("waitRow"))}</span>` : `<div class="bar"><span style="width:${(f * 100).toFixed(1)}%"></span></div><span class="pc">${pct(f)}</span>`;
+        const left = Math.max(0, r.prompt - done), eta = nReadOnly === 1 && pfr > 0 && left ? tr("readEta", { t: dur(Math.max(1, left / pfr)) }) : "";
+        mid = k === "wait" ? `<span>${esc(tr("waitRow"))}</span>` : `<div class="bar"><span style="width:${(f * 100).toFixed(1)}%"></span></div><span class="pc wide">${esc(tr("readRow", { d: human(done), t: human(r.prompt) }) + eta)}</span>`;
       }
-      return `<div class="cv"><span class="chip c-${k}" title="${esc(st[1])}">${esc(st[0])}</span><div class="mid">${mid}</div><span class="plen">${human(r.prompt)}</span></div>`;
+      return `<div class="cv"><span class="chip c-${k}" title="${esc(st[1])}">${esc(st[0])}</span><div class="mid">${mid}</div><span class="plen">${human(r.prompt)}</span><span class="hit">${r.prompt ? pct(r.cached / r.prompt) : "—"}</span></div>`;
     }).join("");
 
     // cost line: today from the lifetime day bucket, all time from lifetime; this run when the server keeps no stats.json

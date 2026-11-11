@@ -1,7 +1,7 @@
 // Qwental 推論 engine（目前：decode 路徑，一次一個 token；prompt 也逐個 token 餵入）
 #pragma once
 
-#define QW_VERSION "1.7.2"
+#define QW_VERSION "1.7.3"
 #include <stdbool.h>
 #include <stdint.h>
 #include "gpu.h"

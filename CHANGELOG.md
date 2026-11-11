@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.7.3 — 2026-11-11
+
+Fixes prefix-cache misses in long conversations while subagents run, and shows machine load on the dashboard. Engine output unchanged: default and INT8 outputs match the 1.7.2 references bit for bit, and cached / concurrent output still matches running alone (cache fuzz 0/40 mismatches).
+
+### Prefix cache
+- Each conversation keeps a limited number of state snapshots. Switching between batched and solo speculative decoding saved snapshots that cannot be resumed by another request, and these evicted the aligned checkpoint at the prompt end; a 166K-token Claude Code conversation then re-read its whole prompt (≈4 min) on the next turn.
+- Snapshots that cannot be resumed across requests are now evicted first, the longest resumable one is always kept, and each slot keeps at least 4 snapshots (was 3).
+- Repro (`bench/snap_evict.py`: a 49K-token conversation generating while 7 subagent requests run, then its next turn): 1.7.2 reused **0** tokens and re-read 50.8K in 18.5 s; 1.7.3 reuses **49,216** and answers in 0.7 s. Same result with the snapshot limit pinned to 3, so the eviction order alone fixes it.
+- 1.7.1 SSD cache files (old format) are ignored since 1.7.2 and can be deleted.
+
+### `/status`
+- New `sys` object: `cpu_pct`, `gpu_pct`, `ram_used_gb` / `ram_total_gb` (Activity Monitor "Memory Used" and physical memory), `proc_gb` (server footprint), `disk_free_gb` / `disk_total_gb` (volume of `--cache-dir`) and `cache_gb` (size of the cache dir, recomputed at most every 30 s). GB = 10⁹ bytes; fields are `null` when unavailable.
+
+### Dashboard
+- A cache hit card (this run / all time) replaces "tokens left".
+- Active rows read "Reading prompt · 110K / 167K read · about 50s left", with a cached-tokens column per conversation.
+- Output shows 0 while nothing is generating.
+- A system strip shows CPU, GPU, RAM used / total (GiB, like Activity Monitor) with Qwental's own footprint, and free disk on the cache volume with the cache size; hidden when the server does not report `sys`.
+
 ## 1.7.2 — 2026-11-11
 
 Fixes answers that went off track in long Claude Code sessions, and a simpler dashboard. On the original IQ3_S GGUF, default, INT8 and speculative outputs are bit-identical to 1.7.1 (and so to 1.0.0); concurrent output is bit-identical to running alone.

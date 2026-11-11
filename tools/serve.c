@@ -45,6 +45,7 @@
 #include "tok.h"
 // ---- diag（遺言 / 記憶體紀錄；tools/diag.h）
 #include "diag.h"
+#include "sysstat.h"
 
 static const char dashboard_html[] = { // GET /dashboard（與 /）：即時狀態頁（讀 /status）
 #embed "dashboard.html"
@@ -2064,6 +2065,7 @@ static void lt_start(void) {
         dispatch_resume(s);
     }
 }
+static const char *SYS_CACHE_DIR = ""; // --cache-dir（/status 的 sys.disk_* 與 sys.cache_gb）
 static void handle_status(conn *c, const char *qs) { // qs：查詢字串（days=N：lifetime 加上最近 N 天的 bucket）
     sbuf o = {0};
     int queued = 0;
@@ -2091,6 +2093,11 @@ static void handle_status(conn *c, const char *qs) { // qs：查詢字串（days
     else sb_puts(&o, ",\"mem_level\":null");
     if (sw >= 0) sb_printf(&o, ",\"swap_used_gb\":%.2f", sw);
     else sb_puts(&o, ",\"swap_used_gb\":null");
+    { // 系統即時數字（dashboard 的 CPU / GPU / RAM / 磁碟）：見 tools/sysstat.h；cache_gb 最多 30 秒重算一次
+        char sj[512];
+        sys_json(sj, sizeof sj, SYS_CACHE_DIR);
+        sb_puts(&o, sj);
+    }
     sb_printf(&o, ",\"rejected\":%lld", st_rejected);
     if (LT_PATH) { // 跨重啟的累計（含這次）；沒有保留時不送
         const char *dq = qs ? strstr(qs, "days=") : NULL;
@@ -2599,6 +2606,7 @@ int main(int argc, char **argv) {
     E = qw_engine_open(MODEL_DIR, ctx, err, sizeof err);
     if (!E) { fprintf(stderr, "❌ %s\n", err); return 1; }
     qw_engine_set_cache_dir(E, cache_dir);
+    SYS_CACHE_DIR = cache_dir;
     { // slot 的記憶體預算：QW_SLOT_MEM_GB，或「實體記憶體 − 權重檔 − 24 GB」（至少 4 GB；16 GB 時實測 swap 用滿）
         unsigned long long mem = 0;
         size_t len = sizeof mem;
