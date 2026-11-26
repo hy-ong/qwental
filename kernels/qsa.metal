@@ -402,6 +402,155 @@ kernel void qsa_topk2b(device const float *score0 [[buffer(0)]],
     if (tid == 0) *nsel = SEL;
 }
 
+// 選取 v4（prefill，多個 query）：門檻改用基數選擇（radix select），取代 qsa_topk2b 最多 31 輪的二分搜尋（每輪 2 個 barrier）。
+// 門檻 thr = 第 SEL 大的分數（float 位元當 uint）。三層 threadgroup 直方圖，每層找出第 need 個落在哪一格：
+//   第 30…19 位元（4096 格）→ 同格的再看 18…7 位元（4096 格）→ 再看 6…0 位元（128 格），三格接起來就是 thr 的 31 個位元。
+// 第 SEL 大的值就是二分搜尋的結果（count(≥ t) ≥ SEL 的最大 t），所以選中的集合相同；寫出也照抄 qsa_topk2b
+// （先依位置寫所有 > thr 的，再依位置補 == thr 的），sel 逐位元相同，attention 的加總順序不變。
+// 分數 ≥ 0，符號位元是 0；若有符號位元是 1 的值（負數 / NaN，正常不會有），第一層的總數 ≠ nv，改走 qsa_topk2b 的二分搜尋。
+// 其餘同 qsa_topk2b：threadgroup z 處理第 z 個 query；分數列間距 sstride、參數 aa[z]；1024 個執行緒，每個 MAXPER 個分數
+kernel void qsa_topk4b(device const float *score0 [[buffer(0)]],
+                       device uint *sel0 [[buffer(1)]],
+                       device uint *nsel0 [[buffer(2)]],
+                       device const qsa_args *aa [[buffer(3)]],
+                       constant uint &sstride [[buffer(4)]],
+                       uint z [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]],
+                       uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    device const float *score = score0 + (ulong)z * sstride;
+    device uint *sel = sel0 + (ulong)z * SEL;
+    device uint *nsel = nsel0 + z;
+    const qsa_args a = aa[z];
+    constexpr uint NT = 1024, NSG = NT / 32, NBH = 4096, BPT = NBH / NT; // 直方圖格數、每個執行緒管幾格
+    static_assert(NBH % NT == 0 && 12 + 12 + 7 == 31, "qsa_topk4b：三層共 31 個位元（符號位元另外檢查）");
+    const uint nv = a.nvis;
+    if (nv <= SEL) {
+        for (uint i = tid; i < nv; i += NT) sel[i] = i;
+        if (tid == 0) *nsel = nv;
+        return;
+    }
+    threadgroup uint red[NSG];
+    threadgroup atomic_uint h[NBH];
+    threadgroup uint s_bin, s_above, s_tot;
+    const uint b0 = tid * MAXPER;
+    uint v[MAXPER];
+#pragma unroll
+    for (uint j = 0; j < MAXPER; j++) {
+        const uint i = b0 + j;
+        v[j] = i < nv ? as_type<uint>(score[i]) : 0u;
+    }
+    for (uint j = 0; j < BPT; j++) atomic_store_explicit(&h[tid * BPT + j], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint key = 0, need = SEL; // 已確定的高位元、在目前這格裡還要選幾個（≥ 1）
+    bool ok = true;
+    for (uint lv = 0; lv < 3; lv++) {
+        const uint sh = lv == 0 ? 19u : lv == 1 ? 7u : 0u, msk = lv == 2 ? 127u : 4095u;
+        const uint psh = lv == 0 ? 31u : lv == 1 ? 19u : 7u; // 前綴比對：第 0 層要求符號位元 = 0（key = 0）
+#pragma unroll
+        for (uint j = 0; j < MAXPER; j++)
+            if (b0 + j < nv && (v[j] >> psh) == key) atomic_fetch_add_explicit(&h[(v[j] >> sh) & msk], 1u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // 由高往低的前綴和：這個執行緒管第 NBH − 1 − tid·BPT 格起往下 BPT 格
+        uint hc[BPT], hsum = 0;
+        for (uint j = 0; j < BPT; j++) {
+            hc[j] = atomic_load_explicit(&h[NBH - 1 - (tid * BPT + j)], memory_order_relaxed);
+            hsum += hc[j];
+        }
+        const uint xs = simd_prefix_exclusive_sum(hsum);
+        if (lane == 31) red[sg] = xs + hsum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0; j < BPT; j++) atomic_store_explicit(&h[tid * BPT + j], 0u, memory_order_relaxed); // 給下一層（大家都讀完了）
+        if (sg == 0) {
+            const uint r = lane < NSG ? red[lane] : 0u;
+            const uint rx = simd_prefix_exclusive_sum(r);
+            if (lane < NSG) red[lane] = rx;
+            if (lane == NSG - 1) s_tot = rx + r;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lv == 0 && s_tot != nv) { ok = false; break; } // 有符號位元是 1 的值（整個 threadgroup 一致）
+        uint above = red[sg] + xs;
+        for (uint j = 0; j < BPT; j++) {
+            if (above < need && above + hc[j] >= need) { // 恰好一個執行緒的一格成立
+                s_bin = NBH - 1 - (tid * BPT + j);
+                s_above = above;
+            }
+            above += hc[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        key = (key << (lv == 2 ? 7u : 12u)) | s_bin; // 12 → 24 → 31 個位元（第 0 層的 key 原本是 0 = 符號位元）
+        need -= s_above;
+    }
+    uint thr;
+    if (ok) thr = key;
+    else { // 同 qsa_topk2b 的二分搜尋
+        uint hi = 0;
+#pragma unroll
+        for (uint j = 0; j < MAXPER; j++) hi = max(hi, b0 + j < nv ? v[j] : 0u);
+        auto count_ge = [&](uint t) -> uint {
+            uint c = 0;
+#pragma unroll
+            for (uint j = 0; j < MAXPER; j++) c += (b0 + j < nv && v[j] >= t) ? 1u : 0u;
+            c = simd_sum(c);
+            if (lane == 0) red[sg] = c;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint tot = lane < NSG ? red[lane] : 0u;
+            tot = simd_sum(tot);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            return tot;
+        };
+        hi = simd_max(hi);
+        if (lane == 0) red[sg] = hi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        hi = simd_max(lane < NSG ? red[lane] : 0u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint lo = 0, top = hi;
+        while (lo < top) {
+            const uint mid = lo + (top - lo + 1) / 2;
+            if (count_ge(mid) >= SEL) lo = mid;
+            else top = mid - 1;
+        }
+        thr = lo;
+    }
+    // 寫出（照抄 qsa_topk2b）：先所有 > thr 的，再補等於 thr 的（依位置順序，用前綴和決定寫入位置）
+    uint ngt = 0, neq = 0;
+#pragma unroll
+    for (uint j = 0; j < MAXPER; j++)
+        if (b0 + j < nv) {
+            ngt += v[j] > thr;
+            neq += v[j] == thr;
+        }
+    threadgroup uint pre_gt[NSG], pre_eq[NSG];
+    uint xg = simd_prefix_exclusive_sum(ngt), xe = simd_prefix_exclusive_sum(neq);
+    if (lane == 31) {
+        pre_gt[sg] = xg + ngt;
+        pre_eq[sg] = xe + neq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint a1 = lane < NSG ? pre_gt[lane] : 0, a2 = lane < NSG ? pre_eq[lane] : 0;
+        uint s1 = simd_prefix_exclusive_sum(a1), s2 = simd_prefix_exclusive_sum(a2);
+        if (lane < NSG) {
+            pre_gt[lane] = s1;
+            pre_eq[lane] = s2;
+        }
+        if (lane == NSG - 1) red[0] = s1 + a1; // 大於門檻的總數
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint total_gt = red[0];
+    uint og = pre_gt[sg] + xg, oe = pre_eq[sg] + xe;
+#pragma unroll
+    for (uint j = 0; j < MAXPER; j++)
+        if (b0 + j < nv) {
+            if (v[j] > thr) sel[og++] = b0 + j;
+            else if (v[j] == thr) {
+                if (total_gt + oe < SEL) sel[total_gt + oe] = b0 + j;
+                oe++;
+            }
+        }
+    if (tid == 0) *nsel = SEL;
+}
+
 // attention v2：每次 4 個 token，讀取與加總可以重疊
 inline void attn2_body(device const half *q, device const half *K, device const half *V, device const uint *sel,
                        device const uint *nsel_p, device float *part, constant qsa_args &a, uint2 tg, uint2 ntg, uint sg, uint lane) {

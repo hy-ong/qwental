@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.8.0 — 2026-11-26
+
+Faster idle follow-ups, cold long prefills and greedy prose, and a guard against NaN / inf. Engine output unchanged: default and INT8 outputs (greedy and seeded sampling, `build/run` and serve) match 1.7.4 bit for bit, and cached / concurrent output still matches running alone (cache fuzz 0 mismatches).
+
+### Prefill
+- PLE rows for the next segment are now prefetched across `pf_yield` segments too (serve splits a long prompt into segments so other conversations can run in between; each segment used to start with a synchronous `ng_gather`). The prefetched rows are kept only when nothing ran in between on another slot. SC117, a 47,312-token prompt through serve with the PLE table out of page cache: prefill 22.3 s → 18.8 s (synchronous gather 5.4 s → 0.86 s), second run 17.6 → 16.1 s; no visible change when the table is cached.
+- QSA prefill block threshold by 3-level radix select (`qsa_topk4b`) instead of a bit-by-bit binary search: 1.33 → 0.62 ms per layer at 4K queries, same selected blocks bit for bit. `QW_PF_TOPK=0` restores the old kernel.
+- FP16 MoE prefill decodes two IQ units per thread (`pfq2` for IQ2_S / IQ3_XXS / IQ3_S), reading the shared scale / sign bytes once: routed gate+up −2% (paired median). `QW_PFG_PAIR=0` restores the old path.
+
+### NaN / inf guard
+- FP16 stores of prefill MoE intermediates and FP16-output `qmm` / `qmm_i8` saturate to ±65504 instead of overflowing to inf (`hsat`, identical to `half()` below 65520).
+- Every lm_head output (decode, verify, prefill, batch) is scanned for non-finite values, and so are the live DeltaNet / conv / PLE state and the residual stream after each prefill segment, and the input of every INT8 activation quantization (whose fast-math max dropped NaN, so the NaN became finite garbage). On a hit only that conversation is reset: its state and snapshots are discarded, nothing is written to the SSD cache, and serve answers 500 / an SSE error "non-finite logits (NaN/inf); conversation state discarded, retry the request". The SSD cache never writes or loads a file with non-finite values. Cost ≤0.1% of prefill and decode.
+- `QW_FAULT_NAN=k` injects a NaN on the k-th prefill segment (testing only); `build/nfcheck` tests the kernels.
+
+### Speculative decoding
+- New default `QW_SPEC_POLICY=auto`: for greedy requests whose verification is exact (GGUF without `--fast-head`, MLX with `--exact-spec`), the DFlash2 window (how many drafted tokens one round verifies) maximizes expected tokens minus λ × round cost, where the hit rate per confidence bin starts from a table measured offline and is updated from the request's own verified positions, the cost is the measured relative GPU time per verify width, and λ is the request's running tokens per cost. It only acts while λ is below 2.2 width-2 rounds' worth (about 140 tok/s, `QW_SW_LMAX`); faster content keeps the 0.8 confidence cutoff, because there the rule mostly moved tokens between rounds without saving rounds or GPU time. Sampling (temperature > 0) and non-exact verification keep the cutoff, so their output and RNG use are unchanged; greedy output is identical by construction.
+- SC117, alternating A/B against `QW_SPEC_POLICY=conf` (High Power, medians): `build/run` greedy 400 tokens, 8 runs each: prose +2.9%, code +0.2%, edits +0.1%, JSON −0.2%; `bench/vs_server.py`, 16 each: prose +4.0%, code +1.7%, edits −0.2%, JSON +1.7% (code / JSON / edits take the same windows as conf in almost every round, so those are noise).
+- `QW_SPEC_POLICY=conf` restores the cutoff everywhere; `cost` applies the rule also when sampling (sampled output changes).
+- Measurement: per-width round cost on SC117 is close to linear (about 2.3 ms per verified token, with an extra 1 ms step from 4 to 5 and more at 4K+ context), so rounding the window up to the MoE kernel bucket (5–7 → 8) is slower. `QW_SPEC_DUMP=file` writes every round (drafts, confidences, GPU / wall ms) and `tools/spec_width_sim.py` replays the round loop over a greedy sequence with the drafter's output at every position (`QW_TAPS` + `QW_DF_TEST`); a per-round simulation over a recorded trajectory overestimated the gains because a different window moves every later round.
+
+### Serve
+- Startup also warms every speculative verify width (2–8) once, so the first speculative request after a kernel change no longer compiles pipelines mid-request (+0.2 s at startup; `QW_NO_VB_WARM=1` skips it).
+- GPU keep-alive (idea from Strata #6078). macOS drops the process's GPU allocations after about a second with no command buffer, and the next command buffer waits for them. While idle, `qwental-serve` now submits a one-thread kernel with `useResource` on every buffer every 250 ms on its own command queue (`QW_GPU_KEEPALIVE_MS`, 0 disables), for up to 120 s after the last real work (`QW_GPU_KEEPALIVE_WINDOW_S`). It is skipped while work is in flight, and stops for the rest of the idle period under memory pressure (VM pressure above normal or `kern.memorystatus_level` below `QW_MEM_LEVEL_MIN`). `QW_GPU_KEEPALIVE_DBG=1` logs start / stop.
+- M5 Max, SC117, a 21-token request with `max_tokens` 1 after an idle gap: 0.5–1 s gaps 150–160 ms either way; 2 s and 4 s gaps 640–1005 ms → 155 ms. A residency set alone (`requestResidency` + `addResidencySet` on both queues) did not help (470–1090 ms).
+- Cost: ~0.3% of one CPU core during the window; footprint flat (14.8 GB over 165 s idle); the weights stay wired (~76 GB) for the window, then are released as before. Engine output unchanged (the CLI tools never start it).
+
 ## 1.7.4 — 2026-11-11
 
 Keeps more of the prefix cache across requests. Engine output unchanged: default and INT8 outputs match the 1.7.2 references bit for bit, and cached / concurrent output still matches running alone (cache fuzz 0/40 mismatches).

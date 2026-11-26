@@ -19,6 +19,7 @@ PROMPTS = [
     ("prose", "Write a detailed essay about the history of the printing press and its effect on Europe.", 400),
     ("code", "Write a complete Python implementation of an LRU cache class with get, put, delete and resize methods, with docstrings and type hints, followed by unittest tests.", 400),
     ("edit", open(os.path.join(ROOT, "prompts/code_edit.txt"), encoding="utf-8").read() + "\nOutput the full modified module.", 400),
+    ("json", "Generate a JSON array of 12 fictional employee records. Each record must have the fields id (integer), name, email, department, title, salary (integer), start_date (YYYY-MM-DD), skills (array of strings) and manager_id (integer or null). Output only the JSON, pretty-printed with 2-space indentation.", 400),
     ("long8k", src(["kernels/qsa.metal", "src/chat.c"], 30000) + "\n\nSummarize what this code does in 5 bullet points.", 200),
     ("long32k", src(["src/engine.c", "kernels/engine.metal", "tools/serve.c"], 110000) + "\n\nSummarize what this code does in 5 bullet points.", 200),
 ]

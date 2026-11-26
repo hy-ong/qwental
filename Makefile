@@ -88,6 +88,10 @@ $(BUILD)/qwental-serve: tools/serve.c tools/diag.h tools/sysstat.h tools/dashboa
 $(BUILD)/diagcheck: tools/diagcheck.c tools/diag.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/diagcheck.c -o $@
 
+# 非有限值防護的 GPU 單元測試（hsat 的飽和存值、k_nfscan 的 logits 檢查、i8_quant 的輸入檢查；fast math 編譯；不用模型）
+$(BUILD)/nfcheck: tools/nfcheck.c kernels/prefill.metal kernels/engine.metal kernels/qmm_i8.metal $(BUILD)/gpu_metal.o src/gpu.h | $(BUILD)
+	$(CC) $(CFLAGS) tools/nfcheck.c $(BUILD)/gpu_metal.o -o $@ $(LDLIBS)
+
 # tools/sysstat.h 的測試（/status 的 cpu / gpu / ram / disk；印兩次並連續呼叫看有沒有漏；不用 GPU / 模型）
 $(BUILD)/sysstatcheck: tools/sysstatcheck.c tools/sysstat.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/sysstatcheck.c -o $@ -framework IOKit -framework CoreFoundation

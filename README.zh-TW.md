@@ -97,6 +97,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 - OpenAI Chat Completions：`/v1/chat/completions`
 - Prefix cache：多組 KV slot，並把快照存到 SSD；同時進行的對話之間共用前綴
 - 同時多個請求（預設開，最多 16 個；`--parallel N` 改上限，最多 64，`--parallel 1` 一次一個）：只有一個請求時走推測解碼，多個時一起 decode，依實測速度自動選。新的長 prompt 分段 prefill，正在生成的對話不會停住；之後才到的請求也不必等它跑完（即使它是單獨進來的）。slot 的記憶體有上限（實體記憶體 − 權重 − 24 GB，或 `QW_SLOT_MEM_GB`）；閒置的 slot 會縮到實際用量，系統可用記憶體偏低時（`QW_MEM_LEVEL_MIN`，預設 20%）先縮小閒置 slot 或寫到 SSD 快取。前面的請求會讓 prompt 處理等超過 90 秒時回 529 並附 `retry-after`（`QW_MAX_WAIT_S`，0 表示關閉）；被取消的 prompt 會保留已算的進度給重試接續。同時在 prefill、共用至少 2,048 個 token 前綴的 prompt，共用的部分只算一次（`QW_COAL_MIN`）。
+- GPU keep-alive：macOS 在約 1 秒沒有 GPU 工作之後放掉 server 的 GPU 配置，下一個請求要多等約 0.5 秒。閒置時每 250 ms 送一個列出所有 buffer 的 1 thread kernel（`QW_GPU_KEEPALIVE_MS`，0 表示關閉），最多到上次工作後 120 秒（`QW_GPU_KEEPALIVE_WINDOW_S`）；這段期間記憶體和工作時一樣保持 wired。macOS 回報記憶體壓力或可用記憶體低於 `QW_MEM_LEVEL_MIN` 時，這段閒置就不再送。停 2–4 秒之後的短請求：650 → 155 ms（M5 Max、SC117）
 - `GET /status`：版本、profile、執行時間、請求與 token 的累計、排隊數，同時多個請求時另有目前的模式、slot 記憶體、實測速度與每個進行中的對話；`sys` 是機器的即時數字（`cpu_pct`、`gpu_pct`、`ram_used_gb`／`ram_total_gb`、`proc_gb` = 伺服器本身的記憶體、快取目錄的 `disk_free_gb`／`disk_total_gb` 與 `cache_gb`；GB = 10⁹ bytes，讀不到時為 `null`）；`--help` 列出所有選項
 - `GET /dashboard`（也可以用 `/`）：根據 `/status` 即時更新的網頁，顯示進行中的對話、模式、tok/s、快取命中率、slot 記憶體、CPU／GPU／RAM／磁碟、近 5 分鐘的走勢圖、API 計價（OpenRouter `qwen/qwen3.8-flash` 價格，可自訂）以及依日／週／月的用量；英文或繁體中文
 - `--stats-file PATH`：累計數字與每日用量跨重啟保存的位置（預設 `<cache-dir>/stats.json`，`""` 表示不保存）；`GET /status` 以 `lifetime` 回報，加 `?days=N` 附每日資料
@@ -111,7 +112,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=dummy claude --model 
 ## 功能
 
 - 直接讀 GGUF 量化權重（IQ2_S、IQ3_XXS、IQ3_S、IQ4_XS、IQ4_NL、Q4_K、Q5_K、Q6_K、Q8_0、Q5_1、BF16），解碼結果與參考實作逐位元相同
-- 推測解碼：DFlash2 區塊猜測模型，加上照抄前文的猜測
+- 推測解碼：DFlash2 區塊猜測模型，加上照抄前文的猜測。greedy 請求（驗證結果逐位元正確時）在這個請求的速度偏低時（prose、中文），每輪驗證幾個猜測依猜測模型的信心與各驗證數的實測成本來選；速度快的內容（code、JSON、改程式碼）維持信心門檻。`QW_SPEC_POLICY=conf` 一律用信心門檻，`cost` 一律用成本規則（取樣時也用，取樣輸出會跟著變）
 - 批次 prefill，長 context 用稀疏 attention
 
 ## 限制

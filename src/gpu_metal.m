@@ -7,6 +7,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/sysctl.h>
 #include "gpu.h"
 
 #define QW_MAX_LIBS 1024 // GGUF profile 每部分依格式 / token 數各編一份 library
@@ -44,6 +47,15 @@ struct qw_gpu {
     int nprof;
     const char *prof_name[QW_PROF_MAX];
     double prof_us[QW_PROF_MAX];
+    // keep-alive（qw_gpu_keepalive_start）
+    pthread_t ka_th;
+    bool ka_on;
+    _Atomic bool ka_stop;
+    id<MTLCommandQueue> ka_q;
+    id<MTLComputePipelineState> ka_pso;
+    id<MTLBuffer> ka_buf;
+    double ka_ms, ka_win;
+    int ka_lvl_min;
 };
 
 enum { QW_FLUSH_MAX = 8 };
@@ -54,6 +66,7 @@ struct qw_batch {
     int ndone;
     bool conc;
     int stream; // 這個 batch 在哪條串流（queue 與 event 鏈）
+    bool ka; // 已算進 ka_inflight（第一次 commit 時；qw_batch_end / qw_batch_wait 扣回）
     // profiling：綁定先記下來，dispatch 時才開 encoder
     qw_gpu *g;
     bool prof;
@@ -72,6 +85,41 @@ double qw_now(void) {
     return (double)mach_absolute_time() * tb.numer / tb.denom * 1e-9;
 }
 
+// ---- GPU keep-alive（qw_gpu_keepalive_start；想法來自 Strata #6078，MIT）
+// macOS 在約 1 秒沒有 command buffer 之後放掉這個 process 的 GPU 配置，下一個 command buffer 要先等它們回來：
+// M5 Max、SC117、21 token 的短請求，間隔 ≤ 1 秒 150 ms，間隔 2–4 秒 650 ms。閒置時每 QW_GPU_KEEPALIVE_MS 送一個
+// 1 thread 的 kernel，useResource 列出所有登記的 buffer（qw_buf_new / qw_buf_wrap），配置就一直留著。
+// 只在沒有工作在跑、距上次工作至少一個週期、且不超過 QW_GPU_KEEPALIVE_WINDOW_S 時送；系統記憶體吃緊時暫停（wired 的記憶體還給系統）。
+// 用自己的 command queue：不排在真正的工作前面，也不碰 event 鏈；kernel 只寫自己的 16 bytes，數值完全不受影響。
+// 只用 MTLResidencySet（requestResidency、addResidencySet 到兩條 queue）實測沒用：間隔 2–4 秒仍是 470–1090 ms（同 Strata 的結果）
+static pthread_mutex_t reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static void **reg; // 登記的 MTLBuffer（不 retain；送 keep-alive 時在鎖裡 retain 一份，qw_buf_free 先移除再 release）
+static size_t nreg, capreg;
+static void reg_add(void *h) {
+    pthread_mutex_lock(&reg_mu);
+    if (nreg == capreg) {
+        size_t c = capreg ? capreg * 2 : 1024;
+        void **n = realloc(reg, c * sizeof *n);
+        if (!n) { pthread_mutex_unlock(&reg_mu); return; } // 登記不了：只是 keep-alive 少列一個
+        reg = n, capreg = c;
+    }
+    reg[nreg++] = h;
+    pthread_mutex_unlock(&reg_mu);
+}
+static void reg_del(void *h) {
+    pthread_mutex_lock(&reg_mu);
+    for (size_t i = nreg; i-- > 0;)
+        if (reg[i] == h) { reg[i] = reg[--nreg]; break; }
+    pthread_mutex_unlock(&reg_mu);
+}
+static _Atomic int ka_inflight;      // 已 commit、還沒等完的 batch 數
+static _Atomic uint64_t ka_last;     // 上次 commit 或完成的 mach_absolute_time
+static void ka_touch(void) { atomic_store_explicit(&ka_last, mach_absolute_time(), memory_order_relaxed); }
+static void ka_begin(void) { atomic_fetch_add_explicit(&ka_inflight, 1, memory_order_relaxed); ka_touch(); }
+static void ka_end(void) { atomic_fetch_sub_explicit(&ka_inflight, 1, memory_order_relaxed); ka_touch(); }
+// batch 的第一個 command buffer commit 時算一次（qw_batch_flush 先送出的那段也算在跑）
+#define KA_COMMIT(b) do { if (!(b)->ka) { (b)->ka = true; ka_begin(); } else ka_touch(); } while (0)
+
 qw_gpu *qw_gpu_open(void) {
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -88,6 +136,14 @@ qw_gpu *qw_gpu_open(void) {
 
 void qw_gpu_close(qw_gpu *g) {
     if (!g) return;
+    if (g->ka_on) {
+        atomic_store(&g->ka_stop, true);
+        pthread_join(g->ka_th, NULL);
+        g->ka_on = false;
+        g->ka_q = nil;
+        g->ka_pso = nil;
+        g->ka_buf = nil;
+    }
     for (int i = 0; i < g->nkernels; i++) g->kernels[i].pso = nil;
     for (int i = 0; i < g->nlibs; i++) g->libs[i] = nil;
     g->queue = nil;
@@ -165,6 +221,7 @@ bool qw_buf_new(qw_gpu *g, size_t size, qw_buf *out) {
     tot += size;
     if (getenv("QW_ALLOC_DBG") && size >= (64u << 20)) fprintf(stderr, "[alloc] %.2f GB（累計 %.2f GB）\n", size / 1e9, tot / 1e9);
     out->handle = (__bridge_retained void *)b;
+    reg_add(out->handle);
     out->ptr = b.contents;
     out->size = size;
     return true;
@@ -183,6 +240,7 @@ bool qw_buf_wrap(qw_gpu *g, void *ptr, size_t len, qw_buf *out) {
     }
     if (!b) return false;
     out->handle = (__bridge_retained void *)b;
+    reg_add(out->handle);
     out->ptr = ptr;
     out->size = len;
     return true;
@@ -190,6 +248,7 @@ bool qw_buf_wrap(qw_gpu *g, void *ptr, size_t len, qw_buf *out) {
 
 void qw_buf_free(qw_buf *b) {
     if (b && b->handle) {
+        reg_del(b->handle);
         @autoreleasepool {
             CFRelease(b->handle); // 對應 qw_buf_new 的 __bridge_retained
         }
@@ -266,6 +325,7 @@ void qw_batch_flush(qw_batch *b) {
         qw_gpu *g = b->g;
         [b->enc endEncoding];
         [b->cb encodeSignalEvent:st_event(g, b->stream) value:++*st_evv(g, b->stream)];
+        KA_COMMIT(b);
         [b->cb commit];
         b->done[b->ndone++] = b->cb;
         b->cb = [st_queue(g, b->stream) commandBufferWithUnretainedReferences];
@@ -358,8 +418,10 @@ double qw_batch_end(qw_batch *b) {
         [b->cb encodeSignalEvent:st_event(b->g, b->stream) value:++*st_evv(b->g, b->stream)];
         MTLTimestamp c0 = 0, g0 = 0, c1 = 0, g1 = 0;
         if (b->prof) [b->cb.device sampleTimestamps:&c0 gpuTimestamp:&g0];
+        KA_COMMIT(b);
         [b->cb commit];
         [b->cb waitUntilCompleted];
+        ka_end();
         if (b->cb.status == MTLCommandBufferStatusCompleted)
             t = b->cb.GPUEndTime - b->cb.GPUStartTime;
         else
@@ -389,6 +451,7 @@ void qw_batch_submit(qw_batch *b) {
         [b->enc endEncoding];
         b->enc = nil;
         [b->cb encodeSignalEvent:st_event(b->g, b->stream) value:++*st_evv(b->g, b->stream)];
+        KA_COMMIT(b); // 對應 qw_batch_wait 的 ka_end
         [b->cb commit];
     }
 }
@@ -402,6 +465,7 @@ double qw_batch_wait(qw_batch *b) {
     double t = -1;
     @autoreleasepool {
         [b->cb waitUntilCompleted];
+        ka_end();
         if (b->cb.status == MTLCommandBufferStatusCompleted) t = b->cb.GPUEndTime - b->cb.GPUStartTime;
         else fprintf(stderr, "command buffer error: %s\n", b->cb.error.localizedDescription.UTF8String);
         if (b->ndone) {
@@ -423,11 +487,98 @@ double qw_gpu_empty_commit_latency(qw_gpu *g, qw_kernel *k, int n) {
             [enc setComputePipelineState:k->pso];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             [enc endEncoding];
+            ka_begin();
             [cb commit];
             [cb waitUntilCompleted];
+            ka_end();
         }
     }
     return (qw_now() - t0) / n;
+}
+
+// 系統記憶體吃緊：VM pressure 高於 normal，或可用記憶體 %（kern.memorystatus_level，同 serve 的 mem_guard）低於下限
+static bool ka_pressure(int lvl_min) {
+    int v = 0;
+    size_t len = sizeof v;
+    if (!sysctlbyname("kern.memorystatus_vm_pressure_level", &v, &len, NULL, 0) && v > 1) return true;
+    len = sizeof v;
+    return !sysctlbyname("kern.memorystatus_level", &v, &len, NULL, 0) && v >= 0 && v < lvl_min;
+}
+
+static void *ka_loop(void *arg) {
+    qw_gpu *g = arg;
+    static mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    const useconds_t us = (useconds_t)(g->ka_ms * 1e3);
+    const bool dbg = getenv("QW_GPU_KEEPALIVE_DBG") != NULL;
+    bool live = false; // 目前在送（除錯 log 只印狀態變化）
+    long ticks = 0;
+    uint64_t held = 0; // 因為記憶體吃緊停下時的 ka_last：直到它變了（有新的工作）才再送
+    while (!atomic_load(&g->ka_stop)) {
+        usleep(us);
+        if (atomic_load(&g->ka_stop)) break;
+        const uint64_t last = atomic_load_explicit(&ka_last, memory_order_relaxed);
+        const double idle = (double)(mach_absolute_time() - last) * tb.numer / tb.denom * 1e-6;
+        const bool busy = atomic_load_explicit(&ka_inflight, memory_order_relaxed) > 0;
+        bool go = !busy && idle >= g->ka_ms && idle <= g->ka_win * 1e3 && last != held;
+        // 記憶體吃緊：這段閒置就不再送（直到下一次真正的工作）。不這樣的話放掉之後可用記憶體回升、又開始送、又 wire 回來，來回擺盪
+        const bool pres = go && ka_pressure(g->ka_lvl_min);
+        if (pres) {
+            if (dbg && live) fprintf(stderr, "[keepalive] 系統記憶體吃緊：停到下一次工作（已送 %ld 次）\n", ticks);
+            else if (dbg) fprintf(stderr, "[keepalive] 系統記憶體吃緊：這段閒置不送\n");
+            held = last, go = false, live = false;
+        }
+        if (dbg && go != live) fprintf(stderr, "[keepalive] %s（閒置 %.1f 秒%s，已送 %ld 次）\n", go ? "開始" : "停止", idle / 1e3,
+                                       busy ? "，有工作在跑" : "", ticks);
+        live = go;
+        if (!go) continue;
+        @autoreleasepool { // 每一輪自己的 pool：command buffer、encoder、retain 的 buffer 清單這一輪就放掉
+            NSMutableArray *bufs = [NSMutableArray new];
+            pthread_mutex_lock(&reg_mu); // 在鎖裡 retain：qw_buf_free 先移除再 release，這一輪送完前 buffer 都還在
+            for (size_t i = 0; i < nreg; i++) [bufs addObject:(__bridge id)reg[i]];
+            pthread_mutex_unlock(&reg_mu);
+            id<MTLCommandBuffer> cb = [g->ka_q commandBuffer];
+            id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+            [en setComputePipelineState:g->ka_pso];
+            [en setBuffer:g->ka_buf offset:0 atIndex:0];
+            for (id<MTLBuffer> x in bufs) [en useResource:x usage:MTLResourceUsageRead];
+            [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [en endEncoding];
+            [cb commit]; // 不算真正的工作：ka_last 不動
+            [cb waitUntilCompleted];
+            ticks++;
+        }
+    }
+    return NULL;
+}
+
+int qw_gpu_keepalive_start(qw_gpu *g) {
+    if (g->ka_on) return 1;
+    const char *e = getenv("QW_GPU_KEEPALIVE_MS");
+    g->ka_ms = e && *e ? atof(e) : 250;
+    e = getenv("QW_GPU_KEEPALIVE_WINDOW_S");
+    g->ka_win = e && *e ? atof(e) : 120;
+    e = getenv("QW_MEM_LEVEL_MIN");
+    g->ka_lvl_min = e && *e ? atoi(e) : 20;
+    if (!(g->ka_ms > 0) || !(g->ka_win > 0)) return 0;
+    if (g->ka_ms < 10) g->ka_ms = 10; // 再短沒有意義，只是忙等
+    @autoreleasepool {
+        NSError *err = nil;
+        id<MTLLibrary> l = [g->dev newLibraryWithSource:@"kernel void qw_keepalive(device uint *b [[buffer(0)]]) { b[0] += 1u; }" options:nil error:&err];
+        id<MTLFunction> f = l ? [l newFunctionWithName:@"qw_keepalive"] : nil;
+        g->ka_pso = f ? [g->dev newComputePipelineStateWithFunction:f error:&err] : nil;
+        g->ka_buf = [g->dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        g->ka_q = [g->dev newCommandQueue];
+    }
+    if (!g->ka_pso || !g->ka_buf || !g->ka_q) {
+        fprintf(stderr, "GPU keep-alive 的 kernel 建立失敗：關閉\n");
+        return 0;
+    }
+    ka_touch();
+    atomic_store(&g->ka_stop, false);
+    if (pthread_create(&g->ka_th, NULL, ka_loop, g)) return 0;
+    g->ka_on = true;
+    return 1;
 }
 
 bool qw_on_battery(void) {

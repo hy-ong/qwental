@@ -12,6 +12,16 @@
 // 驗證時每個不重複的 expert 只讀、只解一次，再跟選到它的每個 token 相乘；每個 token 的算式與加總順序都和 decode 相同，
 // 所以推測解碼與一般解碼的結果逐位元一致。
 
+#ifndef QW_HSAT // 同一份定義也在 prefill.metal、moe_gg.metal、qmm.metal、qmm_i8.metal（可能串在一起編譯）
+#define QW_HSAT
+// 存成 FP16 之前夾到 ±65504（FP16 最大的有限值）：超出範圍的不會變成 inf（inf × 0 權重 = NaN，會毒害 DeltaNet 狀態與之後每一輪）。
+// 範圍內的有限值結果逐位元不變（65504…65520 本來就捨入成 65504）；輸出型別是 float 時 ysat 不動
+inline half hsat(float x) { return half(clamp(x, -65504.0f, 65504.0f)); }
+inline half4 hsat(float4 x) { return half4(clamp(x, float4(-65504.0f), float4(65504.0f))); }
+template <typename T> inline T ysat(float x) { return T(x); }
+template <> inline half ysat<half>(float x) { return hsat(x); }
+#endif
+
 #ifdef GG_ROUTER
 // ---------------------------------------------------------------- BF16 router（FP32 累加）。decode、驗證、prefill 第二階段用同一個算式：
 // lane 負責第 lane、lane + 32… 個 bfloat4，最後 simd_sum（三者的 logit 逐位元相同）
@@ -689,6 +699,9 @@ struct gg_qmm_args {
 #ifndef PFDBG
 #define PFDBG 0 // 量測用：1 = 不解碼（權重寫常數，看 tensor 運算本身的時間）
 #endif
+#ifndef PFPAIR
+#define PFPAIR 0 // 1：PFT 格式每個執行緒一次解 2 個相鄰單位（pfq2，主程式注入 QW_PFG_PAIR）
+#endif
 
 // threadgroup memory 的 grid 表：無號 grid（每個值一個 byte），符號另外用 xor 設定。值與 dqf 的查表完全相同
 // （帶符號表的負值就是把 half 的符號位元設起來）。表小（1 KB、2 KB、IQ2_S 8 KB），隨機查表比 constant 快
@@ -756,9 +769,89 @@ template <> struct pfq<21> { // IQ3_S（同 dqf<21>）
     }
 };
 
+// PFPAIR：pf_dq 的 PFT 版改成每個執行緒一次 2 個相鄰單位（u 偶數、u + 1 = 同一個 32 值 sub-block 的 hh = 0 / 1）：
+// 超區塊 d、qh / scale / aux 位元組與列位址只讀一次（pfq 每個單位都重讀），32 個連續的 half 用 4 個 16-byte 寫入。
+// 每個值的算式與 pfq 完全相同（Wt 的內容逐位元相同，tensor 運算的輸入不變）
+template <int F> struct pfq2 {
+    static inline void run(DP, uint, threadgroup const uint *, thread half4 *, thread float *) {}
+};
+template <> struct pfq2<22> { // IQ2_S（同 pfq<22>，hh = 0、1）
+    static inline void run(DP W, uint u, threadgroup const uint *g, thread half4 *w, thread float *d) {
+        DP b = W + (u >> 4) * 82;
+        const uint ib = (u >> 1) & 7;
+        const uint qs0 = ldu16(b + 2 + 4 * ib), qs1 = ldu16(b + 4 + 4 * ib), sg0 = ldu16(b + 34 + 4 * ib), sg1 = ldu16(b + 36 + 4 * ib);
+        const uint qh = b[66 + ib], scb = b[74 + ib];
+        const float db = ldf16(b);
+        d[0] = db * (0.5f + float(scb & 15)) * 0.25f;
+        d[1] = db * (0.5f + float((scb >> 4) & 15)) * 0.25f;
+        threadgroup const uint2 *g2 = (threadgroup const uint2 *)g;
+        const uint2 e0 = g2[(qs0 & 255) | ((qh << 8) & 0x300)], e1 = g2[(qs0 >> 8) | ((qh << 6) & 0x300)];
+        const uint2 e2 = g2[(qs1 & 255) | ((qh << 4) & 0x300)], e3 = g2[(qs1 >> 8) | ((qh << 2) & 0x300)];
+        w[0] = hx(pft_h4(e0.x) ^ sgn4(sg0));
+        w[1] = hx(pft_h4(e0.y) ^ sgn4(sg0 >> 4));
+        w[2] = hx(pft_h4(e1.x) ^ sgn4(sg0 >> 8));
+        w[3] = hx(pft_h4(e1.y) ^ sgn4(sg0 >> 12));
+        w[4] = hx(pft_h4(e2.x) ^ sgn4(sg1));
+        w[5] = hx(pft_h4(e2.y) ^ sgn4(sg1 >> 4));
+        w[6] = hx(pft_h4(e3.x) ^ sgn4(sg1 >> 8));
+        w[7] = hx(pft_h4(e3.y) ^ sgn4(sg1 >> 12));
+    }
+};
+template <> struct pfq2<18> { // IQ3_XXS（同 pfq<18>，hh = 0、1）
+    static inline void run(DP W, uint u, threadgroup const uint *g, thread half4 *w, thread float *d) {
+        DP b = W + (u >> 4) * 98;
+        const uint ib = (u >> 1) & 7;
+        const uint q0 = ldu16(b + 2 + 8 * ib), q1 = ldu16(b + 4 + 8 * ib), q2 = ldu16(b + 6 + 8 * ib), q3 = ldu16(b + 8 + 8 * ib);
+        const uint aux = ldu16(b + 66 + 4 * ib) | (ldu16(b + 68 + 4 * ib) << 16);
+        d[0] = d[1] = ldf16(b) * (0.5f + float(aux >> 28)) * 0.5f;
+        const uint a0 = aux & 127, a1 = (aux >> 7) & 127, a2 = (aux >> 14) & 127, a3 = (aux >> 21) & 127;
+        const uint s0 = a0 | ((popcount(a0) & 1) << 7), s1 = a1 | ((popcount(a1) & 1) << 7);
+        const uint s2 = a2 | ((popcount(a2) & 1) << 7), s3 = a3 | ((popcount(a3) & 1) << 7);
+        w[0] = hx(pft_h4(g[q0 & 255]) ^ sgn4(s0));
+        w[1] = hx(pft_h4(g[q0 >> 8]) ^ sgn4(s0 >> 4));
+        w[2] = hx(pft_h4(g[q1 & 255]) ^ sgn4(s1));
+        w[3] = hx(pft_h4(g[q1 >> 8]) ^ sgn4(s1 >> 4));
+        w[4] = hx(pft_h4(g[q2 & 255]) ^ sgn4(s2));
+        w[5] = hx(pft_h4(g[q2 >> 8]) ^ sgn4(s2 >> 4));
+        w[6] = hx(pft_h4(g[q3 & 255]) ^ sgn4(s3));
+        w[7] = hx(pft_h4(g[q3 >> 8]) ^ sgn4(s3 >> 4));
+    }
+};
+template <> struct pfq2<21> { // IQ3_S（同 pfq<21>，hh = 0、1）
+    static inline void run(DP W, uint u, threadgroup const uint *g, thread half4 *w, thread float *d) {
+        DP b = W + (u >> 4) * 110;
+        const uint ib = (u >> 1) & 7;
+        const uint q0 = ldu16(b + 2 + 8 * ib), q1 = ldu16(b + 4 + 8 * ib), q2 = ldu16(b + 6 + 8 * ib), q3 = ldu16(b + 8 + 8 * ib);
+        const uint qa = uint(b[66 + ib]), qb = qa >> 4, sg0 = ldu16(b + 74 + 4 * ib), sg1 = ldu16(b + 76 + 4 * ib);
+        d[0] = d[1] = ldf16(b) * float(1 + 2 * ((b[106 + ib / 2] >> (4 * (ib & 1))) & 15));
+        w[0] = hx(pft_h4(g[(q0 & 255) | ((qa << 8) & 256)]) ^ sgn4(sg0));
+        w[1] = hx(pft_h4(g[(q0 >> 8) | ((qa << 7) & 256)]) ^ sgn4(sg0 >> 4));
+        w[2] = hx(pft_h4(g[(q1 & 255) | ((qa << 6) & 256)]) ^ sgn4(sg0 >> 8));
+        w[3] = hx(pft_h4(g[(q1 >> 8) | ((qa << 5) & 256)]) ^ sgn4(sg0 >> 12));
+        w[4] = hx(pft_h4(g[(q2 & 255) | ((qb << 8) & 256)]) ^ sgn4(sg1));
+        w[5] = hx(pft_h4(g[(q2 >> 8) | ((qb << 7) & 256)]) ^ sgn4(sg1 >> 4));
+        w[6] = hx(pft_h4(g[(q3 & 255) | ((qb << 6) & 256)]) ^ sgn4(sg1 >> 8));
+        w[7] = hx(pft_h4(g[(q3 >> 8) | ((qb << 5) & 256)]) ^ sgn4(sg1 >> 12));
+    }
+};
+
 #if GG_PART == 5 // （GG_PART 6 的 MLX 格式沒有 dqf）
 // 權重 tile 的 TN 列 × KC 個值（從第 k0 個起）解碼成 half（已乘 scale）放進 Wt [TN][KC]：每個執行緒一次一個單位（16 個值）
 template <uint NT> inline void pf_dq(DP W, uint RB, uint n0, uint k0, uint tid, threadgroup half *Wt, TABP tab, threadgroup const uint *gt) {
+#if PFPAIR && PFT_ON && PFDBG == 0
+    static_assert(KC % 32 == 0, "pf_dq：PFPAIR 一次 32 個值");
+    for (uint q = tid; q < TN * (KC / 32); q += NT) {
+        const uint n = q / (KC / 32), u = k0 / 16 + 2 * (q % (KC / 32)); // k0 是 32 的倍數：u 是偶數（hh = 0）
+        half4 w[8];
+        float d[2];
+        const float m = 0;
+        pfq2<PFF>::run(W + (ulong)(n0 + n) * RB, u, gt, w, d);
+        threadgroup half4 *dst = (threadgroup half4 *)(Wt + n * KC + 16 * u - k0); // 單位 u、u + 1 的 32 個值（IQ 格式沒有 gf_spl 的交錯）
+#pragma unroll
+        for (uint i = 0; i < 8; i++) dst[i] = half4(float4(w[i]) * d[i / 4] - m);
+    }
+    return;
+#endif
     for (uint q = tid; q < TN * (KC / 16); q += NT) {
         const uint n = q / (KC / 16), u = k0 / 16 + q % (KC / 16);
         half4 w[4];
@@ -833,7 +926,7 @@ kernel void moe_pf_gg(device half *X [[buffer(0)]], device const uchar *W [[buff
         if (acc.is_valid_element(i)) {
             auto ix = acc.get_multidimensional_index(i);
             const uint n = n0 + ix[0], mm = r0 + ix[1];
-            if (mm < m_end) Y[(ulong)mm * a.N + n] = half(acc[i]);
+            if (mm < m_end) Y[(ulong)mm * a.N + n] = hsat(acc[i]);
         }
 }
 #else // GG_PART == 6
@@ -1265,7 +1358,7 @@ kernel void moe_pf_i8(device const char *Xq [[buffer(0)]], device const uchar *W
         if (acc.is_valid_element(i)) {
             auto ix = acc.get_multidimensional_index(i);
             const uint n = n0 + ix[0], mm = r0 + ix[1];
-            if (mm < m_end) Y[(ulong)mm * a.N + n] = half(c[i] * sx[mm]);
+            if (mm < m_end) Y[(ulong)mm * a.N + n] = hsat(c[i] * sx[mm]);
         }
 }
 #else // I8_MLX
@@ -1398,7 +1491,7 @@ kernel void moe_pf_i8m(device const char *Xq [[buffer(0)]], device const uint *W
         if (acc.is_valid_element(i)) {
             auto ix = acc.get_multidimensional_index(i);
             const uint n = n0 + ix[0], mm = r0 + ix[1];
-            if (mm < m_end) Y[(ulong)mm * a.N + n] = half(c[i] * sx[mm]);
+            if (mm < m_end) Y[(ulong)mm * a.N + n] = hsat(c[i] * sx[mm]);
         }
 }
 #endif // I8_MLX

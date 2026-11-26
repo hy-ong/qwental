@@ -56,6 +56,9 @@ static pthread_mutex_t tok_mu = PTHREAD_MUTEX_INITIALIZER; // --parallel：連�
 static void tok_lock(void) { pthread_mutex_lock(&tok_mu); }
 static void tok_unlock(void) { pthread_mutex_unlock(&tok_mu); }
 static qw_engine *E;
+// engine 失敗的原因：logits 出現非有限值（NaN / inf）時 engine 已經把那個對話的狀態丟掉，重送會從頭算
+static const char NF_MSG[] = "non-finite logits (NaN/inf); conversation state discarded, retry the request";
+static const char *eng_err(int sid, const char *msg) { return qw_engine_par_bad(E, sid) ? NF_MSG : msg; }
 static qw_tok *TK;
 static int32_t IM_END, EOT;
 static int CTX;
@@ -1046,7 +1049,7 @@ static void handle_chat(conn *c, const char *body, size_t blen, bool openai) {
     }
     j->fin = fin;
     j->st.gen = j->got;
-    if (fin == QW_FIN_ERROR) { j->ecode = 500; j->emsg = "inference engine error"; }
+    if (fin == QW_FIN_ERROR) { j->ecode = 500; j->emsg = eng_err(-1, "inference engine error"); }
     if (pumping) {
         pthread_mutex_lock(&c->mu);
         atomic_store(&pa.stop, true);
@@ -1341,7 +1344,7 @@ static bool run_solo(job *j, int *ng_out, double *pf_out) {
             return true;
         }
     }
-    if (fin == QW_FIN_ERROR) { par_fail(j, 500, "inference engine error (solo decode)"); return false; }
+    if (fin == QW_FIN_ERROR) { par_fail(j, 500, eng_err(j->sid, "inference engine error (solo decode)")); return false; }
     if (fin != QW_FIN_YIELD) { par_done(j, fin); return false; }
     if (j->got >= j->gp.max_tokens) { par_done(j, QW_FIN_LENGTH); return false; }
     return true;
@@ -1353,7 +1356,7 @@ static bool join_batch(job *j) {
     qw_engine_par_persist(E, j->gp.persist, j->gp.npersist);
     const float *lg = qw_engine_par_prefill(E, j->sid, j->ids, j->np + j->got, &cached);
     j->base = j->np + j->got;
-    if (!lg) { par_fail(j, 500, "inference engine error (prefill)"); return false; }
+    if (!lg) { par_fail(j, 500, eng_err(j->sid, "inference engine error (prefill)")); return false; }
     if (!j->st.prompt) {
         j->st.prompt = j->np;
         j->st.cached = cached;
@@ -1515,7 +1518,7 @@ static bool pf_chunk(job *j) {
     j->pfc_ms += dt;
     pf_seg_ms = dt;
     if (lg) pf_rate_note(j->pfd - (first ? cached : d0), dt);
-    if (!lg) { par_fail(j, 500, "inference engine error (chunked prefill)"); return false; }
+    if (!lg) { par_fail(j, 500, eng_err(j->sid, "inference engine error (chunked prefill)")); return false; }
     if (first && !j->pfy) j->st.cached = cached;
     if (j->pfd < j->np) return true;
     j->pfing = false;
@@ -1555,7 +1558,8 @@ static bool mix_round(void *ctx) {
     for (int i = 0; i < nb; i++) { // 同 par_loop 的一起 decode
         job *j = bj[i];
         bool alive;
-        if (j->np + j->got + 2 >= CTX) { par_done(j, QW_FIN_CTX); alive = false; }
+        if (qw_engine_par_bad(E, j->sid)) { par_fail(j, 500, NF_MSG); alive = false; }
+        else if (j->np + j->got + 2 >= CTX) { par_done(j, QW_FIN_CTX); alive = false; }
         else alive = par_emit(j, nx[i]);
         if (alive) continue;
         int keep = 0; // 結束（或等著收尾後重新加入）：之後不能再碰
@@ -1649,6 +1653,7 @@ static int vspec_round(job **bj, int nb, job **out) {
     if (prof) { static int c = 0; if (++c % 20 == 0) fprintf(stderr, "[parv] B=%d %d 列：%.1f ms、%d 個 token（%.0f tok/s，GPU 驗證 %.1f ms）\n", nb, r, dt, ntok, ntok * 1e3 / dt, gms); }
     for (int i = 0; i < nb; i++) {
         job *j = bj[i];
+        if (qw_engine_par_bad(E, j->sid)) { par_fail(j, 500, NF_MSG); continue; }
         bool alive = true;
         for (int t = 0; t < acc[i] && alive; t++) alive = par_emit(j, dr[i][t]);
         if (alive) alive = par_emit(j, nx[i]);
@@ -2341,6 +2346,7 @@ static void *par_loop(void *arg) {
         for (int i = 0; i < nb; i++) {
             job *j = bj[i];
             if (!lg) { par_fail(j, 500, "inference engine error (batch decode)"); continue; }
+            if (qw_engine_par_bad(E, j->sid)) { par_fail(j, 500, NF_MSG); continue; }
             if (j->np + j->got + 2 >= CTX) { par_done(j, QW_FIN_CTX); continue; }
             if (par_emit(j, nx[i])) act[na++] = j;
         }
@@ -2620,6 +2626,18 @@ int main(int argc, char **argv) {
         const int32_t w[4] = {760, 6511, 314, 9338};
         qw_gen g = {.temperature = 0, .max_tokens = 4, .stop = NULL, .nstop = 0, .spec = !getenv("QW_NO_SPEC")};
         qw_engine_generate_ex(E, w, 4, &g, NULL, NULL, NULL);
+        // 驗證 k 個 token 的 kernel 依 k（2…8）分別編譯（vk、dn / gh kernel、router），上面的短生成只用到其中幾個：
+        // 每個寬度各驗證一次（同 run 的 QW_VB_BENCH 暖機），第一個推測解碼的請求就不必在中途編譯。QW_NO_VB_WARM=1 跳過。
+        // qw_engine_vb_bench 會改動目前位置之後的 KV / tok、DeltaNet / conv 的暫存狀態：之後 qw_engine_reset，
+        // 下一個請求不是從快照恢復（快照是另存的）就是從 0 開始，輸出不受影響
+        if (g.spec && !getenv("QW_NO_VB_WARM")) {
+            const double tw = qw_now();
+            const int32_t vt[8] = {760, 6511, 314, 9338, 760, 6511, 314, 9338};
+            int nk = 0;
+            for (int k = 2; k <= 8; k++) nk += qw_engine_vb_bench(E, vt, k, 1) > 0;
+            qw_engine_reset(E);
+            fprintf(stderr, "推測解碼驗證 kernel 預熱（%d 種寬度）%.1f 秒\n", nk, qw_now() - tw);
+        }
     }
     // INT8 prefill（--int8 等）的 kernel 依段長（< 128 或 ≥ 128 個 token）與 context（> 2048 才走稀疏 attention 與 INT8 Q·Kᵀ）
     // 分別在第一次用到時編譯：再跑一段 WN 個 token 的 prefill 與接在後面的 WC 個 token（同一個 slot、從快照接續），
@@ -2654,6 +2672,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "並發最多 %d 個（自動選推測解碼或一起 decode）：kernel 預熱 %.1f 秒；一步 B=1 %.1f ms、B=%d %.1f ms；slot 記憶體上限 %.0f GB\n", PAR,
                 qw_now() - tw, qw_engine_par_cost(E, 1), WB, qw_engine_par_cost(E, WB), SLOT_BUDGET / 1e9);
     }
+    if (qw_gpu_keepalive_start(qw_engine_gpu(E))) // 預熱之後才開（載入期間一直有工作）
+        fprintf(stderr, "GPU keep-alive：閒置時每 %s ms，最多 %s 秒（QW_GPU_KEEPALIVE_MS=0 關掉）\n",
+                getenv("QW_GPU_KEEPALIVE_MS") ? getenv("QW_GPU_KEEPALIVE_MS") : "250", getenv("QW_GPU_KEEPALIVE_WINDOW_S") ? getenv("QW_GPU_KEEPALIVE_WINDOW_S") : "120");
     fprintf(stderr, "Qwental %s：模型載入與預熱 %.1f 秒，context %d%s%s%s，監聽 http://%s:%d\n", QW_VERSION, qw_now() - t0, ctx,
             getenv("QW_GGUF") ? "，GGUF " : "", getenv("QW_GGUF") ? getenv("QW_GGUF") : "",
             getenv("QW_INT8") && strcmp(getenv("QW_INT8"), "0") ? "，INT8 prefill" : "", host, port);

@@ -11,6 +11,15 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp::tensor_ops;
+#ifndef QW_HSAT // 同一份定義也在 prefill.metal、moe_gg.metal、qmm.metal、qmm_i8.metal（可能串在一起編譯）
+#define QW_HSAT
+// 存成 FP16 之前夾到 ±65504（FP16 最大的有限值）：超出範圍的不會變成 inf（inf × 0 權重 = NaN，會毒害 DeltaNet 狀態與之後每一輪）。
+// 範圍內的有限值結果逐位元不變（65504…65520 本來就捨入成 65504）；輸出型別是 float 時 ysat 不動
+inline half hsat(float x) { return half(clamp(x, -65504.0f, 65504.0f)); }
+inline half4 hsat(float4 x) { return half4(clamp(x, float4(-65504.0f), float4(65504.0f))); }
+template <typename T> inline T ysat(float x) { return T(x); }
+template <> inline half ysat<half>(float x) { return hsat(x); }
+#endif
 #ifndef WT
 #define WT 0
 #endif
@@ -18,26 +27,33 @@ using namespace mpp::tensor_ops;
 
 // 每列一個 threadgroup（I8Q_NT 個執行緒）：x [T][KD] half → xu [T][KD] uint8、sa [T]、asum [T]（ΣQa）
 // half4 一次讀進暫存器（每個執行緒 I8Q_V 組），max 與量化共用，不重讀 x。max、整數和與順序無關：結果與逐值版逐位元相同
+// nf：輸入有非有限值（NaN / ±inf，FP16 指數全 1，用位元判斷）時設 nf[0] = 1（只設不清，host 讀完清）。量化本身會把 NaN
+// 變成有限值（fast math 的 max 丟掉 NaN、clamp 把 NaN 夾成 ±127，sa 也是有限的），之後的 GEMM、DeltaNet 狀態、KV 全是
+// 有限的垃圾，k_nfscan 看不到，所以要在這裡看。只多讀暫存器裡的位元、找到時寫一次：xu / sa / asum 逐位元不變
 #ifndef I8Q_NT
 #define I8Q_NT 256
 #endif
 static_assert(KD % 4 == 0 && I8Q_NT % 32 == 0 && I8Q_NT <= 256, "i8_quant：KD / I8Q_NT");
 #define I8Q_V ((KD / 4 + I8Q_NT - 1) / I8Q_NT)
 kernel void i8_quant(device const half *x [[buffer(0)]], device uint8_t *xu [[buffer(1)]], device float *sa [[buffer(2)]],
-                     device int *asum [[buffer(3)]], uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     device int *asum [[buffer(3)]], device uint *nf [[buffer(4)]], uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float part[I8Q_NT / 32];
     threadgroup int ipart[I8Q_NT / 32];
     device const half4 *xr = (device const half4 *)(x + (ulong)r * KD);
     float4 v[I8Q_V];
     float m = 0;
+    bool bad = false;
 #pragma unroll
     for (uint j = 0; j < I8Q_V; j++) {
         const uint i = tid + j * I8Q_NT;
-        v[j] = i < KD / 4 ? float4(xr[i]) : float4(0);
+        const half4 h = i < KD / 4 ? xr[i] : half4(0);
+        bad = bad || any((as_type<ushort4>(h) & ushort(0x7c00)) == ushort(0x7c00));
+        v[j] = float4(h);
         const float4 a = fabs(v[j]);
         m = max(m, max(max(a.x, a.y), max(a.z, a.w)));
     }
+    if (simd_any(bad) && lane == 0) nf[0] = 1;
     m = simd_max(m);
     if (lane == 0) part[sg] = m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -109,7 +125,7 @@ kernel void qmm_i8(device const uint8_t *xu [[buffer(0)]], device const uint8_t 
             const uint n = n0 + ix[0], m = m0 + ix[1];
             if (m < a.M) {
                 const int v = acc[i] - 128 * asum[m] - 128 * rsum[n] - (int)KD * 16384;
-                Y[(ulong)m * a.N + n] = YT(float(v) * sa[m] * float(S[(ulong)n * (KD / 64)]));
+                Y[(ulong)m * a.N + n] = ysat<YT>(float(v) * sa[m] * float(S[(ulong)n * (KD / 64)]));
             }
         }
 }

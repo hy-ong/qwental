@@ -4,6 +4,15 @@
 
 #include <metal_stdlib>
 using namespace metal;
+#ifndef QW_HSAT // 同一份定義也在 prefill.metal、moe_gg.metal、qmm.metal、qmm_i8.metal（可能串在一起編譯）
+#define QW_HSAT
+// 存成 FP16 之前夾到 ±65504（FP16 最大的有限值）：超出範圍的不會變成 inf（inf × 0 權重 = NaN，會毒害 DeltaNet 狀態與之後每一輪）。
+// 範圍內的有限值結果逐位元不變（65504…65520 本來就捨入成 65504）；輸出型別是 float 時 ysat 不動
+inline half hsat(float x) { return half(clamp(x, -65504.0f, 65504.0f)); }
+inline half4 hsat(float4 x) { return half4(clamp(x, float4(-65504.0f), float4(65504.0f))); }
+template <typename T> inline T ysat(float x) { return T(x); }
+template <> inline half ysat<half>(float x) { return hsat(x); }
+#endif
 
 #define EPS 1e-6f
 #define HCD (HC * D)
@@ -484,7 +493,7 @@ kernel void p_router_refine(device const uint *W [[buffer(0)]], device const bfl
 // H = silu(G) · U（gate 與 up 分開的兩個 buffer），n 個元素
 kernel void p_act2(device const half *G [[buffer(0)]], device const half *U [[buffer(1)]], device half *H [[buffer(2)]],
                    constant uint &n [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-    if (i < n) H[i] = half(silu(float(G[i])) * float(U[i]));
+    if (i < n) H[i] = hsat(silu(float(G[i])) * float(U[i]));
 }
 
 // out[t, c] = Σ_s w[t,s] · Dm[pos_of[t,s], c] + sgate[t] · Ds[t, c]。grid：(D / 4, T)
@@ -499,7 +508,7 @@ kernel void p_moe_combine(device const half *Dm [[buffer(0)]], device const uint
         acc += w[p] * float4(((device const half4 *)(Dm + (ulong)pos_of[p] * D))[c4]);
     }
     acc += sgate[t] * float4(((device const half4 *)(Ds + (ulong)t * D))[c4]);
-    ((device half4 *)(out + (ulong)t * D))[c4] = half4(acc);
+    ((device half4 *)(out + (ulong)t * D))[c4] = hsat(acc);
 }
 
 // ---------------------------------------------------------------- PLE

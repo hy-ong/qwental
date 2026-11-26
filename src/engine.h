@@ -1,7 +1,7 @@
 // Qwental 推論 engine（目前：decode 路徑，一次一個 token；prompt 也逐個 token 餵入）
 #pragma once
 
-#define QW_VERSION "1.7.4"
+#define QW_VERSION "1.8.0"
 #include <stdbool.h>
 #include <stdint.h>
 #include "gpu.h"
@@ -103,6 +103,10 @@ size_t qw_engine_par_shrink(qw_engine *e, unsigned long long busy);
 // 同一個 prompt 重送時 par_pick 會選回這組、par_prefill_to（*done = 0）從這裡接續，結果與一次算完逐位元相同。
 // 沒載入的 slot 也可以。回傳 true = 這組現在有長度 kvlen 的快照；false = 不在段界（例如已在生成，改用 par_finish）或 sid 無效
 bool qw_engine_par_snap(qw_engine *e, int sid);
+// 非有限值（NaN / inf）的 logits：engine 在每個 lm_head 之後檢查，找到時那個 slot 的狀態與快照全部丟掉（不存快照、不寫 SSD），
+// 這次呼叫失敗（prefill / 單獨生成回傳 NULL / QW_FIN_ERROR）；一起 decode / 驗證時只丟那個對話、它的 logits 列換成 0。
+// true = slot sid 這樣丟掉過、之後還沒有新的 prefill（sid < 0：非並發模式目前的 slot）。serve 用來結束那個請求、回報原因
+bool qw_engine_par_bad(qw_engine *e, int sid);
 const float *qw_engine_par_vstep(qw_engine *e, const int *sids, const int *n, const int32_t *toks, int B,
                                  double *gpu_ms); // 並發推測解碼：對話 i 驗證 n[i] 個 token（toks 依序排，Σn ≤ 8；GGUF）；回傳 [Σn][vocab] logits
 int qw_engine_par_vaccept(qw_engine *e, const int *acc, const int32_t *nx); // 上一次 vstep 之後：對話 i 接受了 acc[i] 個猜測（狀態寫回、位置前進）；

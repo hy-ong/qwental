@@ -647,6 +647,21 @@ kernel void k_argmax2(device const float *pv [[buffer(0)]], device const uint *p
     }
 }
 
+// logits 的非有限值檢查（NaN、±inf）：第 y 列（n 個 float，n 是 4 的倍數）有任何一個指數全 1 就把 flag[y] 設成 1（只設不清，host 讀完清）。
+// 用位元判斷，不用 isfinite / isnan（fast math 下編譯器可以當成恆真 / 恆假）。掃描本身沒有分支，只有找到時寫一次。grid：(n / 4 / 1024, 列數) × 1024
+kernel void k_nfscan(device const uint4 *lg [[buffer(0)]], device uint *flag [[buffer(1)]], constant uint &n [[buffer(2)]],
+                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint i = tg.x * 1024 + tid, n4 = n / 4;
+    const uint4 v = i < n4 ? lg[(ulong)tg.y * n4 + i] : uint4(0);
+    const bool bad = any((v & 0x7f800000u) == 0x7f800000u);
+    if (simd_any(bad) && simd_is_first()) flag[tg.y] = 1;
+}
+
+// 除錯（QW_FAULT_NAN）：x[0] = v（例如 NaN 的位元），故意弄壞一個值看非有限值檢查會不會動作。grid：1 × 1
+kernel void k_poke(device uint *x [[buffer(0)]], constant uint &v [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i == 0) x[0] = v;
+}
+
 // ---------------------------------------------------------------- MTP
 
 // 單一向量的 RMSNorm（n 個元素一起算，FP32 進、FP16 出）。grid：1 × 1024

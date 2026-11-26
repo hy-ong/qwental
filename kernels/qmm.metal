@@ -23,6 +23,15 @@ using namespace mpp::tensor_ops;
 #ifndef YT
 #define YT half // 輸出型別（router logits 用 float）
 #endif
+#ifndef QW_HSAT // 同一份定義也在 prefill.metal、moe_gg.metal、qmm.metal、qmm_i8.metal（可能串在一起編譯）
+#define QW_HSAT
+// 存成 FP16 之前夾到 ±65504（FP16 最大的有限值）：超出範圍的不會變成 inf（inf × 0 權重 = NaN，會毒害 DeltaNet 狀態與之後每一輪）。
+// 範圍內的有限值結果逐位元不變（65504…65520 本來就捨入成 65504）；輸出型別是 float 時 ysat 不動
+inline half hsat(float x) { return half(clamp(x, -65504.0f, 65504.0f)); }
+inline half4 hsat(float4 x) { return half4(clamp(x, float4(-65504.0f), float4(65504.0f))); }
+template <typename T> inline T ysat(float x) { return T(x); }
+template <> inline half ysat<half>(float x) { return hsat(x); }
+#endif
 #define GS 64
 #define NG (KD / GS)
 #define ROWW (KD * BITS / 32)   // 每列幾個 uint32
@@ -152,7 +161,7 @@ kernel void qmm(device half *X [[buffer(0)]],
             // 同 p_act2：gate、up 先轉成 half（和分開算時寫進 buffer 一樣），再 silu(g) · u
             if (m < m_end) Y[(ulong)m * a.N + n] = half(float(half(acc[i])) / (1.0f + exp(-float(half(acc[i])))) * float(half(acc2[i])));
 #else
-            if (m < m_end) Y[(ulong)m * a.N + n] = YT(acc[i]);
+            if (m < m_end) Y[(ulong)m * a.N + n] = ysat<YT>(acc[i]);
 #endif
         }
 }
@@ -204,7 +213,7 @@ kernel void qmm_reg(device half *X [[buffer(0)]], device const uint *W [[buffer(
         if (acc.is_valid_element(i)) {
             const auto ix = acc.get_multidimensional_index(i);
             const uint n = n0 + ix[0], m = m0 + ix[1];
-            if (m < m_end) Y[(ulong)m * a.N + n] = YT(acc[i]);
+            if (m < m_end) Y[(ulong)m * a.N + n] = ysat<YT>(acc[i]);
         }
 }
 #endif

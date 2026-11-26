@@ -74,6 +74,11 @@ const char *qw_profile_get(const qw_gpu *g, int i, double *us);
 // 一次送出 n 個空的 command buffer 並等待，回傳每個的平均牆鐘時間（秒）。
 double qw_gpu_empty_commit_latency(qw_gpu *g, qw_kernel *k, int n);
 
+// GPU keep-alive（serve 用）：閒置時每 QW_GPU_KEEPALIVE_MS（預設 250，0 = 關）送一個 useResource 列出所有 buffer 的小 kernel，
+// 免得 macOS 約 1 秒沒有工作就放掉 GPU 配置、下一個請求多等約 0.5 秒；距上次工作超過 QW_GPU_KEEPALIVE_WINDOW_S（預設 120）
+// 或系統記憶體吃緊（VM pressure、可用記憶體 < QW_MEM_LEVEL_MIN %）時不送。開了回傳 1
+int qw_gpu_keepalive_start(qw_gpu *g);
+
 // 電源與散熱狀態（寫進每份量測報告；電池供電時 GPU 可能降速）
 // 例如「電源：電池（58%）、低耗電模式：關、散熱：正常」
 void qw_power_desc(char *out, size_t len);
